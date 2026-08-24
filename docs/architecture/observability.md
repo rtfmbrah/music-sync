@@ -11,6 +11,10 @@ The one-job workflow emits structured idle/committed JSON including durable job,
 attempt, provider item, final path, filesystem effect, recording, and artifact IDs.
 Bounded batch output reports selected, committed, skipped, and per-job failure
 diagnostics in both text and JSON.
+`sync run` reports per-source outcomes plus aggregate acquisition and playlist phase
+results. It returns a nonzero status for isolated failures only after all safe phases
+have completed, making timer alerts truthful without turning one failure into global
+work starvation.
 
 ## PLANNED
 
@@ -25,6 +29,5 @@ safe retry commands after crashes. Candidate and discovery logs explain both sco
 and final decisions, for example metadata compatibility followed by fingerprint
 mismatch and rejection. This is one local application, not a distributed queue.
 
-External systemd timers or cron invoke deterministic `sync`/`run` commands first; an
-internal scheduler is deferred. One failing job is recorded and isolated rather than
-terminating unrelated work.
+An internal scheduler remains deferred. One failing job is recorded and isolated
+rather than terminating unrelated work.

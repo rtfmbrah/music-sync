@@ -689,3 +689,96 @@ fn playlist_materialization_preserves_unknown_existing_output()
     assert_eq!(fs::read(output_path)?, b"user-owned\n");
     Ok(())
 }
+
+#[test]
+fn sync_run_completes_all_phases_and_isolates_one_source_failure()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = tempfile::tempdir()?;
+    let state = root.path().join("state");
+    let library = root.path().join("library");
+    let playlists = root.path().join("playlists");
+    fs::create_dir_all(&state)?;
+    fs::create_dir_all(&library)?;
+    fs::create_dir_all(&playlists)?;
+    let config = root.path().join("music-sync.toml");
+    fs::write(
+        &config,
+        format!(
+            "state_directory = {:?}\nlibrary_directory = {:?}\nplaylist_directory = {:?}\n",
+            state, library, playlists
+        ),
+    )?;
+    let database = state.join("music-sync.sqlite3");
+    let marker = root.path().join("fail-source-two");
+    let yt_dlp = root.path().join("yt-dlp");
+    let ffprobe = root.path().join("ffprobe");
+    fs::write(
+        &yt_dlp,
+        format!(
+            "#!/bin/sh\ncase \" $* \" in\n  *' --dump-single-json '*) case \" $* \" in *source-two*) if test -f {:?}; then printf '%s' 'temporary failure' >&2; exit 1; fi; printf '%s' '{{\"id\":\"two\",\"webpage_url\":\"https://youtu.be/two\",\"title\":\"Two\"}}' ;; *) printf '%s' '{{\"id\":\"one\",\"webpage_url\":\"https://youtu.be/one\",\"title\":\"One\"}}' ;; esac ;;\n  *) while test \"$1\" != '--paths'; do shift; done; output=$2; printf '%s' 'fixture audio' > \"$output/media.opus\"; printf '%s\\n' \"$output/media.opus\" ;;\nesac\n",
+            marker
+        ),
+    )?;
+    fs::write(
+        &ffprobe,
+        "#!/bin/sh\nprintf '%s' '{\"streams\":[{\"codec_type\":\"audio\",\"codec_name\":\"opus\"}],\"format\":{\"duration\":\"1.5\"}}'\n",
+    )?;
+    for executable in [&yt_dlp, &ffprobe] {
+        let mut permissions = fs::metadata(executable)?.permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(executable, permissions)?;
+    }
+    for url in ["https://youtu.be/source-one", "https://youtu.be/source-two"] {
+        assert!(
+            Command::new(env!("CARGO_BIN_EXE_music-sync"))
+                .args(["source", "add", url, "--database"])
+                .arg(&database)
+                .output()?
+                .status
+                .success()
+        );
+    }
+    let run = || {
+        Command::new(env!("CARGO_BIN_EXE_music-sync"))
+            .args(["--json", "sync", "run", "--config"])
+            .arg(&config)
+            .args(["--max-jobs", "2", "--yt-dlp"])
+            .arg(&yt_dlp)
+            .arg("--ffprobe")
+            .arg(&ffprobe)
+            .output()
+    };
+
+    let first = run()?;
+    let first_report: serde_json::Value = serde_json::from_slice(&first.stdout)?;
+    assert!(first.status.success());
+    assert_eq!(first_report["sources"].as_array().map(Vec::len), Some(2));
+    assert_eq!(first_report["acquisitions"]["committed"], 2);
+    assert_eq!(
+        first_report["playlists"]["playlists"]
+            .as_array()
+            .map(Vec::len),
+        Some(2)
+    );
+    assert!(library.join("youtube/one.opus").exists());
+    assert!(library.join("youtube/two.opus").exists());
+
+    fs::write(&marker, b"")?;
+    let partial = run()?;
+    let partial_report: serde_json::Value = serde_json::from_slice(&partial.stdout)?;
+    assert_eq!(partial.status.code(), Some(1));
+    assert_eq!(partial_report["sources"][0]["status"], "reconciled");
+    assert_eq!(partial_report["sources"][1]["status"], "failed");
+    assert_eq!(partial_report["acquisitions"]["selected"], 0);
+    assert_eq!(
+        partial_report["playlists"]["failures"]
+            .as_array()
+            .map(Vec::len),
+        Some(0)
+    );
+    assert_eq!(
+        fs::read_to_string(playlists.join("collection-2.m3u8"))?,
+        "#EXTM3U\nyoutube/two.opus\n"
+    );
+    Ok(())
+}

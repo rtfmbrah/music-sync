@@ -1,0 +1,18 @@
+[Unit]
+Description=Synchronize the music-sync library
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=music-sync
+Group=music-sync
+ExecStart=/opt/music-sync/bin/music-sync sync run --config /etc/music-sync/music-sync.toml --max-jobs 100 --yt-dlp /opt/music-sync/libexec/yt-dlp --ffprobe /usr/bin/ffprobe
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/music-sync /srv/music /srv/music-playlists
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true

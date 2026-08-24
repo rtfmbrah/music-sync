@@ -15,15 +15,22 @@ provider order, absent memberships are only deactivated, and acquisition jobs us
 stable provider-item idempotency key. Provider failures occur before reconciliation
 and therefore cannot masquerade as an empty snapshot.
 
+`sync run` composes all currently implemented phases for timer-driven operation. It
+enumerates active sources in stable ID order, isolates enumeration failures, commits
+successful snapshots, attempts one bounded acquisition snapshot, and then atomically
+materializes playlists. Any isolated failure produces exit status 1 after unrelated
+work completes; fatal durable-state failures produce exit status 2.
+
 ## PLANNED
 
 Synchronization proceeds in bounded, independently recoverable phases:
 
-1. enumerate configured source identities cheaply through a provider adapter;
+1. enumerate configured source identities cheaply through a provider adapter
+   (CURRENT);
 2. compare the snapshot with durable provider items and memberships (CURRENT);
 3. transactionally activate/deactivate membership and create idempotent jobs
    (CURRENT);
-4. run expensive resolution/acquisition/enrichment only for new or incomplete state;
+4. run acquisition only for new or incomplete state (CURRENT; enrichment PLANNED);
 5. atomically materialize M3U8 collections from active memberships (CURRENT).
 
 A failed item records its outcome and does not stop other items. A second identical

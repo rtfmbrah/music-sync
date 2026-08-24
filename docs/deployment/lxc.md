@@ -158,3 +158,27 @@ reported `Updated`, omitted that entry, and preserved both acquired audio files.
 - Never write, rename, tag, or delete under `/srv/music` during adoption tests.
 - Use `/srv/music-sync-v2-test` for binaries, config, state, and generated output.
 - Global package installation or service changes require separate explicit approval.
+
+## Timer-driven operation
+
+The repository includes example systemd units under `deploy/systemd`. They are not
+installed automatically. Before deployment, create a dedicated service account,
+place configuration outside the repository, install the static binary and pinned
+yt-dlp at the explicit unit paths, and replace the example writable library and
+playlist paths with the configured deployment paths. `ProtectSystem=strict` keeps
+the remaining host filesystem read-only to the service.
+
+The oneshot command returns 0 only when all source, acquisition, and playlist work
+succeeds, 1 after isolated failures, and 2 for fatal configuration or durable-state
+errors. The timer may therefore alert on partial runs without preventing successful
+unrelated work from being committed.
+
+The composed command was validated on 2026-08-24 with the static-musl binary and
+offline two-item fixtures under `/srv/music-sync-v2-test/sync-20260824`. Its first
+run reconciled one source, committed two acquisitions, and created one ordered
+playlist. The repeat reported two unchanged memberships, zero selected acquisition
+jobs, and an unchanged playlist. Both audio files remained present and `/srv/music`
+remained non-writable. Local `systemd-analyze verify` parsed the example units and
+then reported the expected missing `/opt/music-sync/bin/music-sync`, because the
+examples are deliberately not installed on the development host. A complete unit
+verification remains a deployment-time check after adapting and installing paths.

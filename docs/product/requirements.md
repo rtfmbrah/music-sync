@@ -37,6 +37,8 @@ architecture documents explain implementation boundaries.
   continuing after isolated failures without immediately retrying the same job.
 - Atomic UTF-8 M3U8 materialization from ordered active memberships and preferred
   healthy artifacts, with unresolved-entry reporting and no-clobber first writes.
+- One bounded timer-friendly sync command composing active-source reconciliation,
+  acquisition, and playlist phases while isolating ordinary provider/job failures.
 - Executable preservation and replacement policies plus deterministic tests.
 - Nix development shell, task runner, architecture enforcement, and CI-ready check.
 

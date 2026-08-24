@@ -43,6 +43,7 @@ cargo run -p music-sync-cli -- source reconcile 1 --database state.sqlite3
 cargo run -p music-sync-cli -- acquisition run-one --config music-sync.toml
 cargo run -p music-sync-cli -- acquisition run-pending --max-jobs 100 --config music-sync.toml
 cargo run -p music-sync-cli -- playlist materialize --config music-sync.toml
+cargo run -p music-sync-cli -- sync run --max-jobs 100 --config music-sync.toml
 ```
 
 The example configuration uses production-style placeholder paths and will report
@@ -55,6 +56,8 @@ The canonical pre-commit and CI command is `just check`. The separate
 Use `just build-portable` inside the Nix shell for a static x86_64 Linux deployment
 artifact. Confirmed LXC details and safety boundaries are documented in
 [`docs/deployment/lxc.md`](docs/deployment/lxc.md).
+Example timer-driven operation is provided under `deploy/systemd/`; paths and the
+dedicated service account must be adapted to the target host before installation.
 
 ## Configuration and secrets
 

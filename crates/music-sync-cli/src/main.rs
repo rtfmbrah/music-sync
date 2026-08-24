@@ -23,6 +23,9 @@ use music_sync::media_probe::Ffprobe;
 use music_sync::persistence::Database;
 use music_sync::playlist::{PlaylistMaterializationReport, materialize_playlists};
 use music_sync::provider::{SourceId, SourceSnapshot, is_supported_youtube_url};
+use music_sync::sync::{
+    SourceSyncResult, SyncBoundaries, SyncDirectories, SyncRunReport, run_sync,
+};
 use music_sync::yt_dlp::YtDlp;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
@@ -74,6 +77,39 @@ enum Command {
     Playlist {
         #[command(subcommand)]
         command: PlaylistCommand,
+    },
+    /// Run one bounded source, acquisition, and playlist synchronization cycle.
+    Sync {
+        #[command(subcommand)]
+        command: SyncCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SyncCommand {
+    /// Reconcile active sources, acquire pending media, and materialize playlists.
+    Run {
+        /// TOML configuration containing all application directories.
+        #[arg(short, long, default_value = "music-sync.toml")]
+        config: PathBuf,
+        /// Maximum acquisition jobs attempted once during this run.
+        #[arg(long, default_value = "100")]
+        max_jobs: NonZeroUsize,
+        /// yt-dlp executable path.
+        #[arg(long, default_value = "yt-dlp")]
+        yt_dlp: PathBuf,
+        /// ffprobe executable path.
+        #[arg(long, default_value = "ffprobe")]
+        ffprobe: PathBuf,
+        /// Per-source enumeration deadline in seconds.
+        #[arg(long, default_value = "60")]
+        source_timeout_seconds: NonZeroU64,
+        /// Per-job yt-dlp deadline in seconds.
+        #[arg(long, default_value = "600")]
+        download_timeout_seconds: NonZeroU64,
+        /// Per-job ffprobe deadline in seconds.
+        #[arg(long, default_value = "30")]
+        probe_timeout_seconds: NonZeroU64,
     },
 }
 
@@ -516,7 +552,76 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn Error>> {
                 ExitCode::from(1)
             })
         }
+        Command::Sync {
+            command:
+                SyncCommand::Run {
+                    config,
+                    max_jobs,
+                    yt_dlp,
+                    ffprobe,
+                    source_timeout_seconds,
+                    download_timeout_seconds,
+                    probe_timeout_seconds,
+                },
+        } => {
+            let config = AppConfig::from_file(&config)?;
+            let mut database = Database::open(&config.database_path())?;
+            let source_adapter = YtDlp::new(
+                yt_dlp.clone(),
+                Duration::from_secs(source_timeout_seconds.get()),
+            );
+            let acquisition_adapter =
+                YtDlp::new(yt_dlp, Duration::from_secs(download_timeout_seconds.get()));
+            let probe = Ffprobe::new(ffprobe, Duration::from_secs(probe_timeout_seconds.get()));
+            let report = run_sync(
+                &mut database,
+                SyncDirectories {
+                    state: &config.state_directory,
+                    library: &config.library_directory,
+                    playlists: &config.playlist_directory,
+                },
+                SyncBoundaries {
+                    source_adapter: &source_adapter,
+                    acquisition_adapter: &acquisition_adapter,
+                    probe: &probe,
+                    hasher: &Sha256FileHasher,
+                },
+                max_jobs.get(),
+            )?;
+            render_sync_run(&report, cli.json)?;
+            Ok(if report.is_successful() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(1)
+            })
+        }
     }
+}
+
+fn render_sync_run(report: &SyncRunReport, json: bool) -> Result<(), serde_json::Error> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(report)?);
+        return Ok(());
+    }
+    let reconciled = report
+        .sources
+        .iter()
+        .filter(|result| matches!(result, SourceSyncResult::Reconciled { .. }))
+        .count();
+    println!("Sources selected:   {}", report.sources.len());
+    println!("Sources reconciled: {reconciled}");
+    println!("Sources failed:     {}", report.sources.len() - reconciled);
+    for source in &report.sources {
+        if let SourceSyncResult::Failed { source_id, message } = source {
+            println!("  Source {}: {message}", source_id.0);
+        }
+    }
+    println!("Jobs selected:      {}", report.acquisitions.selected);
+    println!("Jobs committed:     {}", report.acquisitions.committed);
+    println!("Jobs failed:        {}", report.acquisitions.failures.len());
+    println!("Playlists written:  {}", report.playlists.playlists.len());
+    println!("Playlists failed:   {}", report.playlists.failures.len());
+    Ok(())
 }
 
 fn render_playlist_materialization(
