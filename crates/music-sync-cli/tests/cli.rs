@@ -938,6 +938,161 @@ fn status_reports_durable_failures_without_modifying_state()
 }
 
 #[test]
+fn repair_verification_and_explicit_commit_preserve_the_lost_artifact_path()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = tempfile::tempdir()?;
+    let state = root.path().join("state");
+    let library = root.path().join("library");
+    let playlists = root.path().join("playlists");
+    fs::create_dir_all(&state)?;
+    fs::create_dir_all(&library)?;
+    fs::create_dir_all(&playlists)?;
+    let config = root.path().join("music-sync.toml");
+    fs::write(
+        &config,
+        format!(
+            "state_directory = {:?}\nlibrary_directory = {:?}\nplaylist_directory = {:?}\n",
+            state, library, playlists
+        ),
+    )?;
+    let database_path = state.join("music-sync.sqlite3");
+    let yt_dlp = root.path().join("yt-dlp");
+    let ffprobe = root.path().join("ffprobe");
+    let fpcalc = root.path().join("fpcalc");
+    fs::write(
+        &yt_dlp,
+        "#!/bin/sh\nset -eu\ncase \" $* \" in\n  *' --dump-single-json '*) printf '%s' '{\"id\":\"original\",\"webpage_url\":\"https://youtu.be/original\",\"title\":\"Fixture Track\"}' ;;\n  *) while test \"$1\" != '--paths'; do shift; done; output=$2; printf '%s' 'candidate audio' > \"$output/media.opus\"; printf '%s\\n' \"$output/media.opus\" ;;\nesac\n",
+    )?;
+    let mbid = "f59c5520-5f46-4d2c-b2c4-822eabf53419";
+    fs::write(
+        &ffprobe,
+        format!(
+            "#!/bin/sh\nprintf '%s' '{{\"streams\":[{{\"codec_type\":\"audio\",\"codec_name\":\"opus\",\"sample_rate\":\"48000\",\"channels\":2}}],\"format\":{{\"duration\":\"180.0\",\"tags\":{{\"MusicBrainz_Recording_Id\":\"{mbid}\"}}}}}}'\n"
+        ),
+    )?;
+    let values = (1..=180)
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    fs::write(
+        &fpcalc,
+        format!("#!/bin/sh\nprintf '%s' '{{\"duration\":180.0,\"fingerprint\":[{values}]}}'\n"),
+    )?;
+    for executable in [&yt_dlp, &ffprobe, &fpcalc] {
+        let mut permissions = fs::metadata(executable)?.permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(executable, permissions)?;
+    }
+    assert!(
+        Command::new(env!("CARGO_BIN_EXE_music-sync"))
+            .args(["source", "add", "https://youtu.be/original", "--database"])
+            .arg(&database_path)
+            .output()?
+            .status
+            .success()
+    );
+    assert!(
+        Command::new(env!("CARGO_BIN_EXE_music-sync"))
+            .args(["sync", "run", "--config"])
+            .arg(&config)
+            .arg("--yt-dlp")
+            .arg(&yt_dlp)
+            .arg("--ffprobe")
+            .arg(&ffprobe)
+            .arg("--fpcalc")
+            .arg(&fpcalc)
+            .output()?
+            .status
+            .success()
+    );
+    let original = library.join("youtube/original.opus");
+    fs::remove_file(&original)?;
+    let connection = rusqlite::Connection::open(&database_path)?;
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT musicbrainz_recording_id FROM recordings WHERE id = 1",
+                [],
+                |row| row.get::<_, Option<String>>(0),
+            )?
+            .as_deref(),
+        Some(mbid)
+    );
+    connection.execute("UPDATE artifacts SET health = 'missing' WHERE id = 1", [])?;
+    connection.execute(
+        "UPDATE provider_items SET availability = 'permanently_unavailable' WHERE id = 1",
+        [],
+    )?;
+    connection.execute(
+        "INSERT INTO repair_cases(recording_id, original_provider_item_id,
+             reference_artifact_id, state) VALUES (1, 1, 1, 'unresolved')",
+        [],
+    )?;
+    connection.execute(
+        "INSERT INTO repair_attempts(repair_case_id, candidate_provider,
+             candidate_provider_item_id, candidate_url, state, reason)
+         VALUES (1, 'youtube', 'candidate', 'https://youtu.be/candidate',
+                 'generated', 'fixture candidate')",
+        [],
+    )?;
+    drop(connection);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_music-sync"))
+        .args(["--json", "repair", "run-one", "--config"])
+        .arg(&config)
+        .arg("--yt-dlp")
+        .arg(&yt_dlp)
+        .arg("--ffprobe")
+        .arg(&ffprobe)
+        .arg("--fpcalc")
+        .arg(&fpcalc)
+        .output()?;
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(report["outcome"], "completed");
+    assert_eq!(report["decision"], "verified");
+    assert!(!original.exists());
+    assert!(!library.join("repair").exists());
+    let staged_candidate = state.join("repair-staging/attempt-1/media.opus");
+    assert!(staged_candidate.exists());
+    let commit = || {
+        Command::new(env!("CARGO_BIN_EXE_music-sync"))
+            .args(["--json", "repair", "commit", "1", "--config"])
+            .arg(&config)
+            .output()
+    };
+    fs::write(&staged_candidate, b"mutated after verification")?;
+    let changed_commit = commit()?;
+    assert_eq!(changed_commit.status.code(), Some(2));
+    assert!(!library.join("repair").exists());
+    fs::write(&staged_candidate, b"candidate audio")?;
+    let first_commit = commit()?;
+    let first_report: serde_json::Value = serde_json::from_slice(&first_commit.stdout)?;
+    assert!(
+        first_commit.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first_commit.stderr)
+    );
+    assert_eq!(first_report["filesystem"], "created");
+    assert_eq!(first_report["persistence"]["inserted"], true);
+    let replacement = library.join("repair/recording-1-attempt-1.opus");
+    assert_eq!(fs::read(&replacement)?, b"candidate audio");
+    assert!(!original.exists());
+
+    let repeated_commit = commit()?;
+    let repeated_report: serde_json::Value = serde_json::from_slice(&repeated_commit.stdout)?;
+    assert!(repeated_commit.status.success());
+    assert_eq!(repeated_report["filesystem"], "recovered_existing");
+    assert_eq!(repeated_report["persistence"]["inserted"], false);
+    assert_eq!(fs::read(&replacement)?, b"candidate audio");
+    Ok(())
+}
+
+#[test]
 fn library_health_reports_hash_mismatch_without_modifying_media()
 -> Result<(), Box<dyn std::error::Error>> {
     let root = tempfile::tempdir()?;

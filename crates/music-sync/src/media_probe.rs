@@ -34,6 +34,10 @@ pub struct MediaProperties {
     pub has_embedded_artwork: bool,
     /// Presence of useful tags; values are intentionally not retained in summaries.
     pub tags: MediaTagPresence,
+    /// Structurally valid, unambiguous embedded MusicBrainz recording ID.
+    pub musicbrainz_recording_id: Option<String>,
+    /// Structurally valid, unambiguous normalized embedded ISRC.
+    pub isrc: Option<String>,
 }
 
 /// Presence of useful embedded metadata classes.
@@ -220,12 +224,15 @@ fn parse_output(bytes: &[u8]) -> Result<MediaProperties, MediaProbeError> {
     let has_basic_tags = normalized_tags
         .iter()
         .any(|key| matches!(key.as_str(), "title" | "artist" | "album"));
-    let musicbrainz_recording_id = canonical_tag_status(
+    let (musicbrainz_recording_id_status, musicbrainz_recording_id) = canonical_tag(
         &format.tags,
         &["musicbrainzrecordingid", "musicbrainztrackid"],
         is_musicbrainz_recording_id,
+        |value| value.to_ascii_lowercase(),
     );
-    let isrc = canonical_tag_status(&format.tags, &["isrc"], is_isrc);
+    let (isrc_status, isrc) = canonical_tag(&format.tags, &["isrc"], is_isrc, |value| {
+        value.replace('-', "").to_ascii_uppercase()
+    });
 
     Ok(MediaProperties {
         codec,
@@ -241,31 +248,37 @@ fn parse_output(bytes: &[u8]) -> Result<MediaProperties, MediaProbeError> {
         }),
         tags: MediaTagPresence {
             has_basic_tags,
-            musicbrainz_recording_id,
-            isrc,
+            musicbrainz_recording_id: musicbrainz_recording_id_status,
+            isrc: isrc_status,
         },
+        musicbrainz_recording_id,
+        isrc,
     })
 }
 
-fn canonical_tag_status(
+fn canonical_tag(
     tags: &BTreeMap<String, String>,
     expected_keys: &[&str],
     validator: fn(&str) -> bool,
-) -> CanonicalTagStatus {
-    let mut observed = false;
+    normalize: fn(&str) -> String,
+) -> (CanonicalTagStatus, Option<String>) {
+    let mut observed = None;
     for (key, value) in tags {
         if !expected_keys.contains(&normalize_tag_key(key).as_str()) || value.trim().is_empty() {
             continue;
         }
-        observed = true;
         if !validator(value.trim()) {
-            return CanonicalTagStatus::Malformed;
+            return (CanonicalTagStatus::Malformed, None);
         }
+        let value = normalize(value.trim());
+        if observed.as_ref().is_some_and(|prior| prior != &value) {
+            return (CanonicalTagStatus::Malformed, None);
+        }
+        observed = Some(value);
     }
-    if observed {
-        CanonicalTagStatus::Valid
-    } else {
-        CanonicalTagStatus::Absent
+    match observed {
+        Some(value) => (CanonicalTagStatus::Valid, Some(value)),
+        None => (CanonicalTagStatus::Absent, None),
     }
 }
 
@@ -423,6 +436,11 @@ mod tests {
             CanonicalTagStatus::Valid
         );
         assert_eq!(properties.tags.isrc, CanonicalTagStatus::Absent);
+        assert_eq!(
+            properties.musicbrainz_recording_id.as_deref(),
+            Some("f59c5520-5f46-4d2c-b2c4-822eabf53419")
+        );
+        assert_eq!(properties.isrc, None);
         Ok(())
     }
 
@@ -436,6 +454,8 @@ mod tests {
         )?;
 
         assert_eq!(properties.tags.isrc, CanonicalTagStatus::Valid);
+        assert_eq!(properties.isrc.as_deref(), Some("USABC2412345"));
+        assert_eq!(properties.musicbrainz_recording_id, None);
         assert_eq!(
             properties.tags.musicbrainz_recording_id,
             CanonicalTagStatus::Malformed

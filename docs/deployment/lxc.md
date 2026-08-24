@@ -206,3 +206,16 @@ deterministic `fpcalc` fixture against the two isolated sync artifacts. The firs
 bounded pass recorded two fingerprints; the identical repeat reported both
 unchanged. Exact media hashes matched before and after, operational status reported
 schema 7 and two healthy artifacts, and `/srv/music` remained non-writable.
+
+The complete conservative repair path was validated on 2026-08-25 with the
+schema-v10 static binary and offline provider/probe/fingerprint fixtures under
+`/srv/music-sync-v2-test/repair-20260825`. One acquired artifact retained embedded
+canonical identity and raw fingerprint evidence. Its final test-library path was
+moved to preserved test storage, health became missing, and an explicit permanent
+original loss created exactly one repair case. Bounded search generated one untrusted
+candidate; staging, structural validation, exact hashing, canonical/duration/raw
+fingerprint comparison verified it. No media appeared in the library before explicit
+commit. Commit created a new no-clobber repair artifact, retained the historical
+bytes and missing artifact row, and playlist materialization changed preference to
+the new path. Status reported one committed attempt, one healthy replacement, and
+one historical missing artifact. `/srv/music` remained non-writable throughout.

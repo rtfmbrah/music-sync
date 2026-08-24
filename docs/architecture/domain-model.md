@@ -56,6 +56,17 @@ preserved unhealthy reference artifact. Attempts retain provider candidates and 
 explicit generated/rejected/unresolved/verified/committed state; candidate search is
 not folded into acquisition or recording identity.
 
+Schema version 9 expands repair attempts with exclusive running/deferred execution,
+monotonic attempt counts, complete staged validation/fingerprint/decision evidence,
+and prepared/committed artifact intent. A committed replacement adds a new healthy
+artifact and changes preference; it does not mutate or delete the historical
+missing/corrupt artifact row.
+
+Schema version 10 retains unambiguous embedded recording MBID and normalized ISRC
+through crash-safe acquisition intent. Initial acquisition may populate an unresolved
+recording with those values; repeated acquisition never silently overwrites a
+contradictory canonical association.
+
 ## PLANNED
 
 Add artists, releases, external fingerprint/canonical resolutions, metadata

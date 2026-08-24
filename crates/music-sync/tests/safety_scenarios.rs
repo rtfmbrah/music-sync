@@ -1,7 +1,8 @@
 //! Cross-module behavioral regressions for non-negotiable safety properties.
 
 use music_sync::identity::{
-    FingerprintComparison, ReplacementDecision, ReplacementEvidence, verify_replacement,
+    CanonicalIdentityComparison, FingerprintComparison, MetadataCompatibility, ReplacementDecision,
+    ReplacementEvidence, verify_replacement,
 };
 use music_sync::preservation::{
     ArtifactHealth, ReconciliationAction, ReconciliationState, SourceAvailability, reconcile,
@@ -42,8 +43,8 @@ fn same_title_wrong_recording_is_rejected_by_audio_identity() {
     // Titles are intentionally absent from ReplacementEvidence: text can generate
     // candidates, but cannot prove that candidate audio is the desired recording.
     let decision = verify_replacement(ReplacementEvidence {
-        canonical_identity_matches: true,
-        metadata_compatible: true,
+        canonical_identity: CanonicalIdentityComparison::Match,
+        metadata: MetadataCompatibility::Match,
         fingerprint: FingerprintComparison::Mismatch,
     });
     assert_eq!(decision, ReplacementDecision::Reject);

@@ -59,6 +59,10 @@ pub struct ValidatedStagedMedia {
     pub sample_rate_hz: Option<u32>,
     /// Audio channel count when available.
     pub channels: Option<u32>,
+    /// Valid unambiguous embedded MusicBrainz recording ID when present.
+    pub musicbrainz_recording_id: Option<String>,
+    /// Valid unambiguous normalized embedded ISRC when present.
+    pub isrc: Option<String>,
 }
 
 /// Validates one staged file without modifying or moving it.
@@ -112,6 +116,8 @@ pub fn validate_staged_media(
         duration_ms: properties.duration_ms,
         sample_rate_hz: properties.sample_rate_hz,
         channels: properties.channels,
+        musicbrainz_recording_id: properties.musicbrainz_recording_id,
+        isrc: properties.isrc,
     })
 }
 
@@ -169,7 +175,7 @@ fn is_safe_component(value: &str) -> bool {
 ///
 /// Staging and library storage must share a filesystem. An existing exact-byte path
 /// is reported as recovered prepared work; different bytes are always rejected.
-fn commit_staged_file(
+pub(crate) fn commit_staged_file(
     validated: &ValidatedStagedMedia,
     final_path: &Path,
     hasher: &dyn ContentHasher,
@@ -657,6 +663,8 @@ mod tests {
                 channels: Some(2),
                 has_embedded_artwork: false,
                 tags: MediaTagPresence::default(),
+                musicbrainz_recording_id: None,
+                isrc: None,
             })
         }
     }

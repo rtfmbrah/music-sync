@@ -18,6 +18,28 @@ pub enum FingerprintComparison {
     Mismatch,
 }
 
+/// Result of comparing independently sourced canonical recording identifiers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CanonicalIdentityComparison {
+    /// Neither side has sufficient canonical identifier evidence.
+    Unavailable,
+    /// At least one shared canonical identifier agrees with no contradiction.
+    Match,
+    /// Available canonical identifiers contradict each other.
+    Mismatch,
+}
+
+/// Result of comparing duration and meaningful version qualifiers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetadataCompatibility {
+    /// Required duration or qualifier evidence is absent.
+    Unavailable,
+    /// Available duration and qualifiers are compatible.
+    Match,
+    /// Duration or a meaningful version qualifier contradicts the reference.
+    Mismatch,
+}
+
 /// Conservatively compares near-identical raw Chromaprint algorithm-2 evidence.
 ///
 /// The policy follows Chromaprint's own matcher constants for 120-value query
@@ -69,10 +91,10 @@ pub fn compare_raw_fingerprints(
 /// Independently derived evidence about a replacement candidate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReplacementEvidence {
-    /// Whether a canonical identifier such as recording MBID or ISRC agrees.
-    pub canonical_identity_matches: bool,
-    /// Whether duration and meaningful version qualifiers are compatible.
-    pub metadata_compatible: bool,
+    /// Comparison of canonical identifiers such as recording MBID or ISRC.
+    pub canonical_identity: CanonicalIdentityComparison,
+    /// Comparison of duration and meaningful version qualifiers.
+    pub metadata: MetadataCompatibility,
     /// Result of comparing reference and candidate audio fingerprints.
     pub fingerprint: FingerprintComparison,
 }
@@ -91,8 +113,15 @@ pub enum ReplacementDecision {
 /// Verifies candidate evidence; text similarity is deliberately not an input.
 #[must_use]
 pub fn verify_replacement(evidence: ReplacementEvidence) -> ReplacementDecision {
-    if !evidence.canonical_identity_matches || !evidence.metadata_compatible {
+    if evidence.canonical_identity == CanonicalIdentityComparison::Mismatch
+        || evidence.metadata == MetadataCompatibility::Mismatch
+    {
         return ReplacementDecision::Reject;
+    }
+    if evidence.canonical_identity == CanonicalIdentityComparison::Unavailable
+        || evidence.metadata == MetadataCompatibility::Unavailable
+    {
+        return ReplacementDecision::Unresolved;
     }
     match evidence.fingerprint {
         FingerprintComparison::Match => ReplacementDecision::Accept,
@@ -108,9 +137,19 @@ mod tests {
     #[test]
     fn matching_metadata_without_audio_evidence_is_unresolved() {
         let decision = verify_replacement(ReplacementEvidence {
-            canonical_identity_matches: true,
-            metadata_compatible: true,
+            canonical_identity: CanonicalIdentityComparison::Match,
+            metadata: MetadataCompatibility::Match,
             fingerprint: FingerprintComparison::Unavailable,
+        });
+        assert_eq!(decision, ReplacementDecision::Unresolved);
+    }
+
+    #[test]
+    fn matching_audio_without_canonical_evidence_is_unresolved() {
+        let decision = verify_replacement(ReplacementEvidence {
+            canonical_identity: CanonicalIdentityComparison::Unavailable,
+            metadata: MetadataCompatibility::Match,
+            fingerprint: FingerprintComparison::Match,
         });
         assert_eq!(decision, ReplacementDecision::Unresolved);
     }

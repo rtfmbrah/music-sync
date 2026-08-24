@@ -211,6 +211,8 @@ mod tests {
                     musicbrainz_recording_id: CanonicalTagStatus::Absent,
                     isrc: CanonicalTagStatus::Absent,
                 },
+                musicbrainz_recording_id: None,
+                isrc: None,
             })
         }
     }

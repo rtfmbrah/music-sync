@@ -46,11 +46,27 @@ health, membership removal, or restored provider availability cancels an unresol
 case. `repair generate` performs bounded title-based search but stores every result
 as generated-only evidence; search position and text confer no identity trust.
 
+Schema version 9 adds exclusive candidate claims, stable per-attempt staging,
+deferred/retryable failures, complete verification evidence, and recoverable commit
+intent. `repair run-one` downloads at most one generated candidate, validates stable
+bytes and audio structure, retains actual embedded canonical identifier values,
+compares duration and raw Chromaprint evidence, and records rejected, unresolved, or
+verified. Missing canonical or duration evidence is unresolved rather than mismatch.
+Only a match with no contradiction becomes verified.
+
+`repair commit` rehashes verified staging immediately before creating a new managed
+`repair/recording-<id>-attempt-<id>.<ext>` hard link. It never overwrites or removes
+the missing/corrupt reference path. Prepared intent makes a crash after linking
+recoverable; finalization transactionally creates a healthy artifact, stores its
+fingerprint, associates the independently verified candidate provider object, and
+makes the new artifact preferred. Live membership, permanent-loss, and unhealthy
+reference prerequisites are checked again before and during commit.
+
 ## PLANNED
 
-AcoustID and MusicBrainz may corroborate embedded canonical evidence. Persist file
-hashes for integrity, not as perceptual identity. Duration and qualifiers filter
-versions before a temporary candidate is downloaded and fingerprinted.
+AcoustID and MusicBrainz may corroborate embedded canonical evidence when local tags
+are absent. Meaningful version qualifiers require a canonical metadata source rather
+than title inference.
 
 Pipeline:
 
@@ -63,8 +79,8 @@ permanent original loss + missing/corrupt artifact
 -> mismatch: reject | insufficient: unresolved | verified: atomic commit
 ```
 
-Thresholds and qualifier behavior require fixture-based tests before production use.
-The first search result has no special trust.
+Qualifier behavior requires fixture-based tests alongside canonical metadata
+resolution. The first search result has no special trust.
 
 ## NON-NEGOTIABLE
 

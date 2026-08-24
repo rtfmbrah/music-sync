@@ -25,8 +25,11 @@ Staged-media validation composes the ffprobe and streaming SHA-256 boundaries. I
 requires a non-empty regular file with a structural audio stream and rejects any
 size mismatch across the pre-probe observation, hashed byte count, and post-hash
 observation. Successful evidence contains codec, optional duration/sample rate/
-channels, exact byte count, and lowercase SHA-256. Validation remains read-only and
-does not imply canonical recording identity.
+channels, structurally valid unambiguous embedded recording MBID/ISRC values, exact
+byte count, and lowercase SHA-256. Schema version 10 carries canonical values through
+prepared acquisition intent and populates previously unresolved recording evidence
+without overwriting contradictory identity. Validation remains read-only; a
+well-formed embedded tag is evidence, not provider-object identity.
 
 Schema version 5 persists prepared acquisition commits containing staged/final paths
 and all validation evidence. Final paths derive only from bounded provider identity
@@ -56,6 +59,12 @@ unsafe. A deferred job can appear again only after explicit retry release.
 `acquisition recover-running` is a separate operator action for a confirmed
 abandoned process; it marks running jobs deferred, audits the transition, and retains
 staging evidence.
+
+Verified repair uses the same structural validation, exact hashing, safe destination,
+same-filesystem hard-link, directory-sync, and no-clobber recovery boundaries. Repair
+staging is separately namespaced by durable attempt. A later explicit commit rehashes
+staging before preparing intent, creates a new repair artifact path, and preserves the
+old missing/corrupt path and row indefinitely.
 
 ## PLANNED
 

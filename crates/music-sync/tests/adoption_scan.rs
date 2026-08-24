@@ -270,6 +270,8 @@ impl MediaProbe for FixedProbe {
                 musicbrainz_recording_id: CanonicalTagStatus::Absent,
                 isrc: CanonicalTagStatus::Valid,
             },
+            musicbrainz_recording_id: None,
+            isrc: Some("USRC17607839".into()),
         })
     }
 }

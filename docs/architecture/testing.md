@@ -65,6 +65,10 @@
   permanent-loss/health/membership/fingerprint prerequisite is required, generated
   candidates remain unverified and idempotent, recovered health cancels a case, and
   renewed loss can reopen it.
+- Schema-v9 and black-box repair tests cover migration of generated candidates,
+  exclusive claim and evidence state, real staged download/probe/hash/fingerprint
+  composition, canonical/duration/perceptual verification, rejection of staging
+  mutation, atomic no-clobber commit, old-path preservation, and idempotent recovery.
 - Scenario tests encode removed membership, disappeared remote with healthy local
   media, transient failure, same-title fingerprint mismatch, and repeat idempotency.
 - The architecture check reads Cargo metadata and enforces CLI-to-library dependency

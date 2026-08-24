@@ -35,8 +35,10 @@ in ad hoc TODO documents.
 - `yt-dlp`, `ffprobe`, `ffmpeg`, hash, and `fpcalc` adapters (yt-dlp, ffprobe, hash,
   and bounded raw fpcalc complete; ffmpeg planned).
 - Artifact probing and health reconciliation (complete).
-- Conservative candidate pipeline and perceptual identity thresholds.
-- Fixture-backed unavailable/transient/provider-change scenarios.
+- Conservative staged candidate pipeline and perceptual identity thresholds
+  (complete for retained embedded canonical evidence; external resolution planned).
+- Fixture-backed unavailable/transient/provider-change scenarios (unavailable,
+  transient, mismatched, insufficient, verified, and staging-change coverage complete).
 
 ## P3 — Metadata enrichment
 

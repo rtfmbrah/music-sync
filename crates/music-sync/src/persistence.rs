@@ -26,10 +26,15 @@ const MIGRATIONS: &[(u32, &str)] = &[
         include_str!("../migrations/0007_artifact_fingerprints.sql"),
     ),
     (8, include_str!("../migrations/0008_repair_cases.sql")),
+    (9, include_str!("../migrations/0009_repair_execution.sql")),
+    (
+        10,
+        include_str!("../migrations/0010_acquisition_canonical_evidence.sql"),
+    ),
 ];
 
 /// Current durable schema version.
-pub const CURRENT_SCHEMA_VERSION: u32 = 8;
+pub const CURRENT_SCHEMA_VERSION: u32 = 10;
 
 /// A connection to music-sync's private application state.
 #[derive(Debug)]
@@ -167,6 +172,17 @@ impl Database {
                 unresolved: count("SELECT COUNT(*) FROM repair_cases WHERE state = 'unresolved'")?,
                 verified: count("SELECT COUNT(*) FROM repair_cases WHERE state = 'verified'")?,
                 cancelled: count("SELECT COUNT(*) FROM repair_cases WHERE state = 'cancelled'")?,
+            },
+            repair_attempts: RepairAttemptCounts {
+                generated: count("SELECT COUNT(*) FROM repair_attempts WHERE state = 'generated'")?,
+                running: count("SELECT COUNT(*) FROM repair_attempts WHERE state = 'running'")?,
+                deferred: count("SELECT COUNT(*) FROM repair_attempts WHERE state = 'deferred'")?,
+                rejected: count("SELECT COUNT(*) FROM repair_attempts WHERE state = 'rejected'")?,
+                unresolved: count(
+                    "SELECT COUNT(*) FROM repair_attempts WHERE state = 'unresolved'",
+                )?,
+                verified: count("SELECT COUNT(*) FROM repair_attempts WHERE state = 'verified'")?,
+                committed: count("SELECT COUNT(*) FROM repair_attempts WHERE state = 'committed'")?,
             },
             playlist_outputs: count(
                 "SELECT COUNT(*) FROM playlist_outputs WHERE sha256 IS NOT NULL",
@@ -617,8 +633,22 @@ impl Database {
         if state != "eligible" && state != "unresolved" {
             return Err(DatabaseError::RepairCaseNotEligible(case_id));
         }
+        let original_identity = transaction
+            .query_row(
+                "SELECT provider_items.provider, provider_items.provider_item_id
+                 FROM repair_cases JOIN provider_items ON
+                      provider_items.id = repair_cases.original_provider_item_id
+                 WHERE repair_cases.id = ?1",
+                [case_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .map_err(DatabaseError::Sqlite)?;
         let mut inserted = 0_u64;
         for candidate in candidates {
+            if original_identity.0 == "youtube" && original_identity.1 == candidate.provider_item_id
+            {
+                continue;
+            }
             let metadata =
                 serde_json::to_string(&candidate.raw_metadata).map_err(DatabaseError::Json)?;
             inserted += transaction
@@ -641,6 +671,564 @@ impl Database {
             .map_err(DatabaseError::Sqlite)?;
         transaction.commit().map_err(DatabaseError::Sqlite)?;
         Ok(inserted)
+    }
+
+    /// Atomically claims the oldest generated repair candidate whose case remains safe.
+    pub fn claim_next_repair_attempt(
+        &mut self,
+    ) -> Result<Option<RepairAttemptWork>, DatabaseError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(DatabaseError::Sqlite)?;
+        let work = transaction
+            .query_row(
+                "SELECT repair_attempts.id, repair_attempts.repair_case_id,
+                        repair_cases.recording_id, repair_cases.original_provider_item_id,
+                        repair_attempts.candidate_provider,
+                        repair_attempts.candidate_provider_item_id,
+                        repair_attempts.candidate_url, repair_attempts.attempt_count + 1,
+                        recordings.musicbrainz_recording_id, recordings.isrc,
+                        artifacts.duration_ms, artifact_fingerprints.max_seconds,
+                        artifact_fingerprints.duration_ms,
+                        artifact_fingerprints.fingerprint_json
+                 FROM repair_attempts
+                 JOIN repair_cases ON repair_cases.id = repair_attempts.repair_case_id
+                 JOIN provider_items ON
+                      provider_items.id = repair_cases.original_provider_item_id
+                 JOIN recordings ON recordings.id = repair_cases.recording_id
+                 JOIN artifacts ON artifacts.id = repair_cases.reference_artifact_id
+                 JOIN artifact_fingerprints ON
+                      artifact_fingerprints.artifact_id = artifacts.id
+                 WHERE repair_attempts.state = 'generated'
+                   AND repair_cases.state = 'unresolved'
+                   AND provider_items.availability = 'permanently_unavailable'
+                   AND artifacts.health IN ('missing', 'corrupt')
+                   AND EXISTS (
+                       SELECT 1 FROM collection_memberships
+                       WHERE collection_memberships.provider_item_id = provider_items.id
+                         AND collection_memberships.active = 1)
+                 ORDER BY repair_attempts.id LIMIT 1",
+                [],
+                |row| {
+                    Ok(RepairAttemptWork {
+                        attempt_id: row.get(0)?,
+                        case_id: row.get(1)?,
+                        recording_id: row.get(2)?,
+                        original_provider_item_id: row.get(3)?,
+                        candidate_provider: row.get(4)?,
+                        candidate_provider_item_id: row.get(5)?,
+                        candidate_url: row.get(6)?,
+                        attempt: row.get(7)?,
+                        reference_musicbrainz_recording_id: row.get(8)?,
+                        reference_isrc: row.get(9)?,
+                        reference_duration_ms: row.get(10)?,
+                        reference_fingerprint_max_seconds: row.get(11)?,
+                        reference_fingerprint_duration_ms: row.get(12)?,
+                        reference_fingerprint_json: row.get(13)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(DatabaseError::Sqlite)?;
+        if let Some(work) = &work {
+            transaction
+                .execute(
+                    "UPDATE repair_attempts SET state = 'running',
+                         attempt_count = attempt_count + 1, updated_at = CURRENT_TIMESTAMP
+                     WHERE id = ?1 AND state = 'generated'",
+                    [work.attempt_id],
+                )
+                .map_err(DatabaseError::Sqlite)?;
+        }
+        transaction.commit().map_err(DatabaseError::Sqlite)?;
+        Ok(work)
+    }
+
+    /// Defers one running repair attempt without changing case eligibility.
+    pub fn defer_repair_attempt(
+        &mut self,
+        attempt_id: i64,
+        message: &str,
+    ) -> Result<bool, DatabaseError> {
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(DatabaseError::Sqlite)?;
+        let changed = transaction
+            .execute(
+                "UPDATE repair_attempts SET state = 'deferred', reason = ?2,
+                 updated_at = CURRENT_TIMESTAMP WHERE id = ?1 AND state = 'running'",
+                rusqlite::params![attempt_id, message],
+            )
+            .map_err(DatabaseError::Sqlite)?
+            == 1;
+        if changed {
+            transaction
+                .execute(
+                    "INSERT INTO events(level, component, event, message, context_json)
+                 VALUES ('warning', 'repair', 'repair_attempt_deferred', ?2,
+                         json_object('repair_attempt_id', ?1))",
+                    rusqlite::params![attempt_id, message],
+                )
+                .map_err(DatabaseError::Sqlite)?;
+        }
+        transaction.commit().map_err(DatabaseError::Sqlite)?;
+        Ok(changed)
+    }
+
+    /// Explicitly releases one deferred repair attempt for a later bounded run.
+    pub fn retry_deferred_repair_attempt(
+        &mut self,
+        attempt_id: i64,
+    ) -> Result<bool, DatabaseError> {
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(DatabaseError::Sqlite)?;
+        let changed = transaction
+            .execute(
+                "UPDATE repair_attempts SET state = 'generated',
+                 reason = 'operator explicitly requested retry',
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?1 AND state = 'deferred'",
+                [attempt_id],
+            )
+            .map_err(DatabaseError::Sqlite)?
+            == 1;
+        if changed {
+            transaction
+                .execute(
+                    "INSERT INTO events(level, component, event, message, context_json)
+                 VALUES ('info', 'repair', 'repair_attempt_retry_requested',
+                         'Operator explicitly released deferred repair attempt',
+                         json_object('repair_attempt_id', ?1))",
+                    [attempt_id],
+                )
+                .map_err(DatabaseError::Sqlite)?;
+        }
+        transaction.commit().map_err(DatabaseError::Sqlite)?;
+        Ok(changed)
+    }
+
+    /// Marks abandoned running repair attempts deferred after operator confirmation.
+    pub fn recover_running_repair_attempts(&mut self) -> Result<u64, DatabaseError> {
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(DatabaseError::Sqlite)?;
+        let changed = transaction
+            .execute(
+                "UPDATE repair_attempts SET state = 'deferred',
+                 reason = 'operator recovered abandoned running repair attempt',
+                 updated_at = CURRENT_TIMESTAMP WHERE state = 'running'",
+                [],
+            )
+            .map_err(DatabaseError::Sqlite)? as u64;
+        if changed > 0 {
+            transaction
+                .execute(
+                    "INSERT INTO events(level, component, event, message, context_json)
+                 VALUES ('warning', 'repair', 'repair_attempts_recovered',
+                         'Operator recovered abandoned running repair attempts',
+                         json_object('count', ?1))",
+                    [changed],
+                )
+                .map_err(DatabaseError::Sqlite)?;
+        }
+        transaction.commit().map_err(DatabaseError::Sqlite)?;
+        Ok(changed)
+    }
+
+    /// Persists independently derived candidate evidence and its conservative decision.
+    pub fn complete_repair_verification(
+        &mut self,
+        evidence: &RepairVerificationEvidence,
+    ) -> Result<(), DatabaseError> {
+        let staged_path = evidence
+            .staged_path
+            .to_str()
+            .ok_or_else(|| DatabaseError::NonUnicodePath(evidence.staged_path.clone()))?;
+        let bytes = i64::try_from(evidence.bytes)
+            .map_err(|_| DatabaseError::ArtifactTooLarge(evidence.bytes))?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(DatabaseError::Sqlite)?;
+        let running = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM repair_attempts WHERE id = ?1 AND state = 'running')",
+                [evidence.attempt_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(DatabaseError::Sqlite)?;
+        if !running {
+            return Err(DatabaseError::RepairAttemptNotRunning(evidence.attempt_id));
+        }
+        transaction
+            .execute(
+                "INSERT INTO repair_attempt_evidence(
+                 repair_attempt_id, staged_path, sha256, byte_count, codec, duration_ms,
+                 sample_rate_hz, channels, musicbrainz_recording_id, isrc,
+                 fingerprint_max_seconds, fingerprint_duration_ms, fingerprint_json,
+                 decision, decision_reason)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+             ON CONFLICT(repair_attempt_id) DO UPDATE SET
+                 staged_path = excluded.staged_path, sha256 = excluded.sha256,
+                 byte_count = excluded.byte_count, codec = excluded.codec,
+                 duration_ms = excluded.duration_ms,
+                 sample_rate_hz = excluded.sample_rate_hz, channels = excluded.channels,
+                 musicbrainz_recording_id = excluded.musicbrainz_recording_id,
+                 isrc = excluded.isrc,
+                 fingerprint_max_seconds = excluded.fingerprint_max_seconds,
+                 fingerprint_duration_ms = excluded.fingerprint_duration_ms,
+                 fingerprint_json = excluded.fingerprint_json,
+                 decision = excluded.decision, decision_reason = excluded.decision_reason,
+                 updated_at = CURRENT_TIMESTAMP",
+                rusqlite::params![
+                    evidence.attempt_id,
+                    staged_path,
+                    evidence.sha256,
+                    bytes,
+                    evidence.codec,
+                    evidence.duration_ms,
+                    evidence.sample_rate_hz,
+                    evidence.channels,
+                    evidence.musicbrainz_recording_id,
+                    evidence.isrc,
+                    evidence.fingerprint_max_seconds,
+                    evidence.fingerprint_duration_ms,
+                    evidence.fingerprint_json,
+                    evidence.decision.as_str(),
+                    evidence.reason,
+                ],
+            )
+            .map_err(DatabaseError::Sqlite)?;
+        transaction
+            .execute(
+                "UPDATE repair_attempts SET state = ?2, reason = ?3,
+                 updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+                rusqlite::params![
+                    evidence.attempt_id,
+                    evidence.decision.as_str(),
+                    evidence.reason
+                ],
+            )
+            .map_err(DatabaseError::Sqlite)?;
+        if evidence.decision == RepairVerificationDecision::Verified {
+            transaction
+                .execute(
+                    "UPDATE repair_cases SET state = 'verified', updated_at = CURRENT_TIMESTAMP
+                 WHERE id = (SELECT repair_case_id FROM repair_attempts WHERE id = ?1)",
+                    [evidence.attempt_id],
+                )
+                .map_err(DatabaseError::Sqlite)?;
+        }
+        transaction.commit().map_err(DatabaseError::Sqlite)
+    }
+
+    /// Loads one verified candidate and its exact staged evidence for commit.
+    pub fn verified_repair_attempt(
+        &self,
+        attempt_id: i64,
+    ) -> Result<RepairCommitWork, DatabaseError> {
+        self.connection
+            .query_row(
+                "SELECT repair_attempts.id, repair_attempts.repair_case_id,
+                    repair_cases.recording_id, repair_attempts.candidate_provider,
+                    repair_attempts.candidate_provider_item_id,
+                    repair_attempts.candidate_url, repair_attempts.candidate_metadata_json,
+                    repair_attempt_evidence.staged_path, repair_attempt_evidence.sha256,
+                    repair_attempt_evidence.byte_count, repair_attempt_evidence.codec,
+                    repair_attempt_evidence.duration_ms,
+                    repair_attempt_evidence.sample_rate_hz,
+                    repair_attempt_evidence.channels,
+                    repair_attempt_evidence.musicbrainz_recording_id,
+                    repair_attempt_evidence.isrc,
+                    repair_attempt_evidence.fingerprint_max_seconds,
+                    repair_attempt_evidence.fingerprint_duration_ms,
+                    repair_attempt_evidence.fingerprint_json
+             FROM repair_attempts
+             JOIN repair_cases ON repair_cases.id = repair_attempts.repair_case_id
+             JOIN provider_items AS original_provider_item ON
+                  original_provider_item.id = repair_cases.original_provider_item_id
+             JOIN artifacts AS reference_artifact ON
+                  reference_artifact.id = repair_cases.reference_artifact_id
+             JOIN repair_attempt_evidence ON
+                  repair_attempt_evidence.repair_attempt_id = repair_attempts.id
+             WHERE repair_attempts.id = ?1 AND repair_attempts.state IN ('verified', 'committed')
+               AND repair_cases.state = 'verified'
+               AND repair_attempt_evidence.decision = 'verified'
+               AND original_provider_item.availability = 'permanently_unavailable'
+               AND reference_artifact.health IN ('missing', 'corrupt')
+               AND EXISTS (SELECT 1 FROM collection_memberships
+                   WHERE collection_memberships.provider_item_id = original_provider_item.id
+                     AND collection_memberships.active = 1)",
+                [attempt_id],
+                |row| {
+                    let bytes = row.get::<_, i64>(9)?;
+                    let duration_ms = row.get::<_, Option<i64>>(11)?;
+                    let sample_rate_hz = row.get::<_, Option<i64>>(12)?;
+                    let channels = row.get::<_, Option<i64>>(13)?;
+                    Ok(RepairCommitWork {
+                        attempt_id: row.get(0)?,
+                        case_id: row.get(1)?,
+                        recording_id: row.get(2)?,
+                        candidate_provider: row.get(3)?,
+                        candidate_provider_item_id: row.get(4)?,
+                        candidate_url: row.get(5)?,
+                        candidate_metadata_json: row.get(6)?,
+                        validated: ValidatedStagedMedia {
+                            path: PathBuf::from(row.get::<_, String>(7)?),
+                            sha256: row.get(8)?,
+                            bytes: u64::try_from(bytes).map_err(|error| {
+                                rusqlite::Error::FromSqlConversionFailure(
+                                    9,
+                                    rusqlite::types::Type::Integer,
+                                    Box::new(error),
+                                )
+                            })?,
+                            codec: row.get(10)?,
+                            duration_ms: duration_ms.map(u64::try_from).transpose().map_err(
+                                |error| {
+                                    rusqlite::Error::FromSqlConversionFailure(
+                                        11,
+                                        rusqlite::types::Type::Integer,
+                                        Box::new(error),
+                                    )
+                                },
+                            )?,
+                            sample_rate_hz: sample_rate_hz.map(u32::try_from).transpose().map_err(
+                                |error| {
+                                    rusqlite::Error::FromSqlConversionFailure(
+                                        12,
+                                        rusqlite::types::Type::Integer,
+                                        Box::new(error),
+                                    )
+                                },
+                            )?,
+                            channels: channels.map(u32::try_from).transpose().map_err(|error| {
+                                rusqlite::Error::FromSqlConversionFailure(
+                                    13,
+                                    rusqlite::types::Type::Integer,
+                                    Box::new(error),
+                                )
+                            })?,
+                            musicbrainz_recording_id: row.get(14)?,
+                            isrc: row.get(15)?,
+                        },
+                        fingerprint_max_seconds: row.get(16)?,
+                        fingerprint_duration_ms: row.get(17)?,
+                        fingerprint_json: row.get(18)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(DatabaseError::Sqlite)?
+            .ok_or(DatabaseError::RepairAttemptNotVerified(attempt_id))
+    }
+
+    /// Persists recoverable intent before the no-clobber repair filesystem effect.
+    pub(crate) fn prepare_repair_commit(
+        &mut self,
+        attempt_id: i64,
+        final_path: &Path,
+    ) -> Result<bool, DatabaseError> {
+        let final_path = final_path
+            .to_str()
+            .ok_or_else(|| DatabaseError::NonUnicodePath(final_path.to_path_buf()))?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(DatabaseError::Sqlite)?;
+        let verified = transaction
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM repair_attempts
+                     JOIN repair_cases ON repair_cases.id = repair_attempts.repair_case_id
+                     JOIN provider_items ON
+                          provider_items.id = repair_cases.original_provider_item_id
+                     JOIN artifacts ON artifacts.id = repair_cases.reference_artifact_id
+                     WHERE repair_attempts.id = ?1
+                       AND repair_attempts.state IN ('verified', 'committed')
+                       AND repair_cases.state = 'verified'
+                       AND provider_items.availability = 'permanently_unavailable'
+                       AND artifacts.health IN ('missing', 'corrupt')
+                       AND EXISTS (SELECT 1 FROM collection_memberships
+                           WHERE collection_memberships.provider_item_id = provider_items.id
+                             AND collection_memberships.active = 1))",
+                [attempt_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(DatabaseError::Sqlite)?;
+        if !verified {
+            return Err(DatabaseError::RepairAttemptNotVerified(attempt_id));
+        }
+        let inserted = transaction
+            .execute(
+                "INSERT OR IGNORE INTO repair_commits(repair_attempt_id, final_path)
+             VALUES (?1, ?2)",
+                rusqlite::params![attempt_id, final_path],
+            )
+            .map_err(DatabaseError::Sqlite)?
+            == 1;
+        let stored = transaction
+            .query_row(
+                "SELECT final_path FROM repair_commits WHERE repair_attempt_id = ?1",
+                [attempt_id],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(DatabaseError::Sqlite)?;
+        if stored != final_path {
+            return Err(DatabaseError::RepairCommitMismatch(attempt_id));
+        }
+        transaction.commit().map_err(DatabaseError::Sqlite)?;
+        Ok(inserted)
+    }
+
+    /// Atomically records a prepared verified repair after its final link exists.
+    pub(crate) fn finalize_repair_commit(
+        &mut self,
+        attempt_id: i64,
+    ) -> Result<RepairCommitPersistence, DatabaseError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(DatabaseError::Sqlite)?;
+        let row = transaction
+            .query_row(
+                "SELECT repair_cases.recording_id, repair_attempts.repair_case_id,
+                    repair_attempts.candidate_provider,
+                    repair_attempts.candidate_provider_item_id,
+                    repair_attempts.candidate_url,
+                    repair_attempts.candidate_metadata_json,
+                    repair_attempt_evidence.sha256, repair_attempt_evidence.byte_count,
+                    repair_attempt_evidence.codec, repair_attempt_evidence.duration_ms,
+                    repair_attempt_evidence.sample_rate_hz, repair_attempt_evidence.channels,
+                    repair_attempt_evidence.fingerprint_max_seconds,
+                    repair_attempt_evidence.fingerprint_duration_ms,
+                    repair_attempt_evidence.fingerprint_json,
+                    repair_commits.final_path, repair_commits.artifact_id
+             FROM repair_attempts
+             JOIN repair_cases ON repair_cases.id = repair_attempts.repair_case_id
+             JOIN provider_items AS original_provider_item ON
+                  original_provider_item.id = repair_cases.original_provider_item_id
+             JOIN artifacts AS reference_artifact ON
+                  reference_artifact.id = repair_cases.reference_artifact_id
+             JOIN repair_attempt_evidence ON
+                  repair_attempt_evidence.repair_attempt_id = repair_attempts.id
+             JOIN repair_commits ON repair_commits.repair_attempt_id = repair_attempts.id
+             WHERE repair_attempts.id = ?1 AND repair_attempts.state IN ('verified', 'committed')
+               AND repair_cases.state = 'verified'
+               AND repair_attempt_evidence.decision = 'verified'
+               AND original_provider_item.availability = 'permanently_unavailable'
+               AND reference_artifact.health IN ('missing', 'corrupt')
+               AND EXISTS (SELECT 1 FROM collection_memberships
+                   WHERE collection_memberships.provider_item_id = original_provider_item.id
+                     AND collection_memberships.active = 1)",
+                [attempt_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, i64>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, Option<i64>>(9)?,
+                        row.get::<_, Option<i64>>(10)?,
+                        row.get::<_, Option<i64>>(11)?,
+                        row.get::<_, i64>(12)?,
+                        row.get::<_, i64>(13)?,
+                        row.get::<_, String>(14)?,
+                        row.get::<_, String>(15)?,
+                        row.get::<_, Option<i64>>(16)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(DatabaseError::Sqlite)?
+            .ok_or(DatabaseError::RepairCommitNotPrepared(attempt_id))?;
+        if let Some(artifact_id) = row.16 {
+            return Ok(RepairCommitPersistence {
+                artifact_id,
+                inserted: false,
+            });
+        }
+        let existing_recording = transaction
+            .query_row(
+                "SELECT recording_id FROM provider_items
+                 WHERE provider = ?1 AND provider_item_id = ?2",
+                rusqlite::params![row.2, row.3],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .optional()
+            .map_err(DatabaseError::Sqlite)?
+            .flatten();
+        if existing_recording.is_some_and(|recording_id| recording_id != row.0) {
+            return Err(DatabaseError::RepairCandidateIdentityConflict {
+                provider: row.2,
+                provider_item_id: row.3,
+            });
+        }
+        transaction
+            .execute(
+                "INSERT INTO artifacts(recording_id, path, sha256, duration_ms, codec,
+                 sample_rate_hz, channels, health)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'healthy')",
+                rusqlite::params![row.0, row.15, row.6, row.9, row.8, row.10, row.11],
+            )
+            .map_err(DatabaseError::Sqlite)?;
+        let artifact_id = transaction.last_insert_rowid();
+        transaction
+            .execute(
+                "INSERT INTO artifact_fingerprints(artifact_id, algorithm, max_seconds,
+                 duration_ms, fingerprint_json, value_count)
+             VALUES (?1, 2, ?2, ?3, ?4, json_array_length(?4))",
+                rusqlite::params![artifact_id, row.12, row.13, row.14],
+            )
+            .map_err(DatabaseError::Sqlite)?;
+        transaction
+            .execute(
+                "UPDATE recordings SET preferred_artifact_id = ?2 WHERE id = ?1",
+                rusqlite::params![row.0, artifact_id],
+            )
+            .map_err(DatabaseError::Sqlite)?;
+        transaction
+            .execute(
+                "INSERT INTO provider_items(provider, provider_item_id, original_url,
+                 source_metadata_json, availability, recording_id)
+             VALUES (?1, ?2, ?3, ?4, 'available', ?5)
+             ON CONFLICT(provider, provider_item_id) DO UPDATE SET
+                 original_url = excluded.original_url,
+                 source_metadata_json = excluded.source_metadata_json,
+                 availability = 'available', recording_id = excluded.recording_id",
+                rusqlite::params![row.2, row.3, row.4, row.5, row.0],
+            )
+            .map_err(DatabaseError::Sqlite)?;
+        transaction
+            .execute(
+                "UPDATE repair_attempts SET state = 'committed', reason =
+                 'independently verified replacement committed without overwrite',
+                 updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+                [attempt_id],
+            )
+            .map_err(DatabaseError::Sqlite)?;
+        transaction
+            .execute(
+                "UPDATE repair_commits SET artifact_id = ?2, committed_at = CURRENT_TIMESTAMP
+             WHERE repair_attempt_id = ?1",
+                rusqlite::params![attempt_id, artifact_id],
+            )
+            .map_err(DatabaseError::Sqlite)?;
+        transaction.commit().map_err(DatabaseError::Sqlite)?;
+        Ok(RepairCommitPersistence {
+            artifact_id,
+            inserted: true,
+        })
     }
 
     /// Persists one conservative artifact-health observation transactionally.
@@ -1226,8 +1814,9 @@ impl Database {
             .execute(
                 "INSERT OR IGNORE INTO acquisition_commits(
                      job_id, staged_path, final_path, sha256, bytes, codec,
-                     duration_ms, sample_rate_hz, channels, status)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'prepared')",
+                     duration_ms, sample_rate_hz, channels, status,
+                     musicbrainz_recording_id, isrc)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'prepared', ?10, ?11)",
                 rusqlite::params![
                     job_id,
                     staged_path,
@@ -1238,6 +1827,8 @@ impl Database {
                     duration_ms,
                     validated.sample_rate_hz,
                     validated.channels,
+                    validated.musicbrainz_recording_id,
+                    validated.isrc,
                 ],
             )
             .map_err(DatabaseError::Sqlite)?
@@ -1245,7 +1836,7 @@ impl Database {
         let stored = transaction
             .query_row(
                 "SELECT staged_path, final_path, sha256, bytes, codec, duration_ms,
-                        sample_rate_hz, channels
+                        sample_rate_hz, channels, musicbrainz_recording_id, isrc
                  FROM acquisition_commits WHERE job_id = ?1",
                 [job_id],
                 |row| {
@@ -1258,6 +1849,8 @@ impl Database {
                         row.get::<_, Option<i64>>(5)?,
                         row.get::<_, Option<u32>>(6)?,
                         row.get::<_, Option<u32>>(7)?,
+                        row.get::<_, Option<String>>(8)?,
+                        row.get::<_, Option<String>>(9)?,
                     ))
                 },
             )
@@ -1273,6 +1866,8 @@ impl Database {
             duration_ms,
             validated.sample_rate_hz,
             validated.channels,
+            validated.musicbrainz_recording_id.clone(),
+            validated.isrc.clone(),
         );
         if stored != expected {
             return Err(DatabaseError::AcquisitionCommitMismatch(job_id));
@@ -1295,6 +1890,8 @@ impl Database {
                         acquisition_commits.sha256, acquisition_commits.codec,
                         acquisition_commits.duration_ms,
                         acquisition_commits.sample_rate_hz, acquisition_commits.channels,
+                        acquisition_commits.musicbrainz_recording_id,
+                        acquisition_commits.isrc,
                         acquisition_jobs.provider_item_id, jobs.status
                  FROM acquisition_commits
                  JOIN acquisition_jobs USING(job_id)
@@ -1310,15 +1907,17 @@ impl Database {
                         row.get::<_, Option<i64>>(4)?,
                         row.get::<_, Option<u32>>(5)?,
                         row.get::<_, Option<u32>>(6)?,
-                        row.get::<_, i64>(7)?,
-                        row.get::<_, String>(8)?,
+                        row.get::<_, Option<String>>(7)?,
+                        row.get::<_, Option<String>>(8)?,
+                        row.get::<_, i64>(9)?,
+                        row.get::<_, String>(10)?,
                     ))
                 },
             )
             .optional()
             .map_err(DatabaseError::Sqlite)?
             .ok_or(DatabaseError::AcquisitionCommitNotPrepared(job_id))?;
-        if commit.0 == "committed" && commit.8 == "succeeded" {
+        if commit.0 == "committed" && commit.10 == "succeeded" {
             let (recording_id, artifact_id) = transaction
                 .query_row(
                     "SELECT artifacts.recording_id, artifacts.id FROM artifacts
@@ -1334,21 +1933,57 @@ impl Database {
                 inserted: false,
             });
         }
-        if commit.0 != "prepared" || commit.8 != "running" {
+        if commit.0 != "prepared" || commit.10 != "running" {
             return Err(DatabaseError::AcquisitionCommitNotPrepared(job_id));
         }
         let existing_recording_id = transaction
             .query_row(
                 "SELECT recording_id FROM provider_items WHERE id = ?1",
-                [commit.7],
+                [commit.9],
                 |row| row.get::<_, Option<i64>>(0),
             )
             .map_err(DatabaseError::Sqlite)?;
         let recording_id = if let Some(recording_id) = existing_recording_id {
+            let prior = transaction
+                .query_row(
+                    "SELECT musicbrainz_recording_id, isrc FROM recordings WHERE id = ?1",
+                    [recording_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, Option<String>>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                        ))
+                    },
+                )
+                .map_err(DatabaseError::Sqlite)?;
+            if prior
+                .0
+                .as_ref()
+                .zip(commit.7.as_ref())
+                .is_some_and(|(left, right)| left != right)
+                || prior
+                    .1
+                    .as_ref()
+                    .zip(commit.8.as_ref())
+                    .is_some_and(|(left, right)| left != right)
+            {
+                return Err(DatabaseError::AcquisitionCanonicalConflict(job_id));
+            }
+            transaction
+                .execute(
+                    "UPDATE recordings SET
+                     musicbrainz_recording_id = COALESCE(musicbrainz_recording_id, ?2),
+                     isrc = COALESCE(isrc, ?3) WHERE id = ?1",
+                    rusqlite::params![recording_id, commit.7, commit.8],
+                )
+                .map_err(DatabaseError::Sqlite)?;
             recording_id
         } else {
             transaction
-                .execute("INSERT INTO recordings DEFAULT VALUES", [])
+                .execute(
+                    "INSERT INTO recordings(musicbrainz_recording_id, isrc) VALUES (?1, ?2)",
+                    rusqlite::params![commit.7, commit.8],
+                )
                 .map_err(DatabaseError::Sqlite)?;
             transaction.last_insert_rowid()
         };
@@ -1356,7 +1991,7 @@ impl Database {
             .execute(
                 "UPDATE provider_items SET recording_id = ?2
                  WHERE id = ?1 AND recording_id IS NULL",
-                rusqlite::params![commit.7, recording_id],
+                rusqlite::params![commit.9, recording_id],
             )
             .map_err(DatabaseError::Sqlite)?;
         transaction
@@ -1801,6 +2436,8 @@ pub struct OperationalStatus {
     pub artifacts: ArtifactHealthCounts,
     /// Repair cases grouped by their conservative durable state.
     pub repairs: RepairCaseCounts,
+    /// Repair candidate attempts grouped by their constrained state.
+    pub repair_attempts: RepairAttemptCounts,
     /// Playlist outputs with committed exact-byte evidence.
     pub playlist_outputs: u64,
     /// Bounded newest-first warning/error events.
@@ -1846,6 +2483,25 @@ pub struct RepairCaseCounts {
     pub verified: u64,
     /// Cases made ineligible by recovered health, membership, or availability.
     pub cancelled: u64,
+}
+
+/// Durable repair-attempt counts by constrained execution/decision state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct RepairAttemptCounts {
+    /// Search-generated candidates awaiting claim.
+    pub generated: u64,
+    /// Exclusively claimed candidates.
+    pub running: u64,
+    /// Retryable attempts retained after infrastructure failure.
+    pub deferred: u64,
+    /// Candidates contradicting known evidence.
+    pub rejected: u64,
+    /// Candidates with insufficient evidence.
+    pub unresolved: u64,
+    /// Independently verified candidates awaiting commit.
+    pub verified: u64,
+    /// Verified candidates committed as healthy preferred artifacts.
+    pub committed: u64,
 }
 
 /// One bounded persisted warning or error event.
@@ -2079,6 +2735,131 @@ pub struct EligibleRepairCase {
     pub fingerprint_json: String,
 }
 
+/// Exclusively claimed generated repair candidate plus retained reference evidence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepairAttemptWork {
+    /// Durable attempt ID and staging namespace.
+    pub attempt_id: i64,
+    /// Parent repair-case ID.
+    pub case_id: i64,
+    /// Recording whose preferred artifact may be repaired.
+    pub recording_id: i64,
+    /// Definitively unavailable original provider row.
+    pub original_provider_item_id: i64,
+    /// Candidate provider adapter.
+    pub candidate_provider: String,
+    /// Provider-owned candidate identity.
+    pub candidate_provider_item_id: String,
+    /// Auditable candidate download URL.
+    pub candidate_url: String,
+    /// Monotonic claim attempt number.
+    pub attempt: u32,
+    /// Reference canonical MBID when known.
+    pub reference_musicbrainz_recording_id: Option<String>,
+    /// Reference canonical ISRC when known.
+    pub reference_isrc: Option<String>,
+    /// Reference structural duration when known.
+    pub reference_duration_ms: Option<i64>,
+    /// Extraction bound of the retained reference fingerprint.
+    pub reference_fingerprint_max_seconds: i64,
+    /// Duration reported with the retained reference fingerprint.
+    pub reference_fingerprint_duration_ms: i64,
+    /// Serialized retained raw fingerprint values.
+    pub reference_fingerprint_json: String,
+}
+
+/// Persistable independently derived staged repair evidence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepairVerificationEvidence {
+    /// Claimed durable repair attempt.
+    pub attempt_id: i64,
+    /// Validated staged candidate path.
+    pub staged_path: PathBuf,
+    /// Exact candidate bytes SHA-256.
+    pub sha256: String,
+    /// Exact stable candidate byte count.
+    pub bytes: u64,
+    /// Candidate audio codec.
+    pub codec: String,
+    /// Candidate structural duration.
+    pub duration_ms: Option<i64>,
+    /// Candidate audio sample rate.
+    pub sample_rate_hz: Option<i64>,
+    /// Candidate channel count.
+    pub channels: Option<i64>,
+    /// Candidate embedded canonical MBID.
+    pub musicbrainz_recording_id: Option<String>,
+    /// Candidate embedded canonical ISRC.
+    pub isrc: Option<String>,
+    /// Candidate fingerprint extraction bound.
+    pub fingerprint_max_seconds: i64,
+    /// Candidate fingerprint duration.
+    pub fingerprint_duration_ms: i64,
+    /// Serialized raw candidate fingerprint.
+    pub fingerprint_json: String,
+    /// Conservative verification result.
+    pub decision: RepairVerificationDecision,
+    /// Auditable reason for the decision.
+    pub reason: String,
+}
+
+/// Verified staged candidate loaded for a recoverable no-clobber commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepairCommitWork {
+    /// Durable verified attempt.
+    pub attempt_id: i64,
+    /// Parent repair case.
+    pub case_id: i64,
+    /// Target canonical recording.
+    pub recording_id: i64,
+    /// Verified candidate provider.
+    pub candidate_provider: String,
+    /// Verified candidate provider identity.
+    pub candidate_provider_item_id: String,
+    /// Auditable candidate URL.
+    pub candidate_url: String,
+    /// Stored raw candidate provider metadata.
+    pub candidate_metadata_json: String,
+    /// Exact validated staged media evidence.
+    pub validated: ValidatedStagedMedia,
+    /// Candidate fingerprint extraction bound.
+    pub fingerprint_max_seconds: i64,
+    /// Candidate fingerprint duration.
+    pub fingerprint_duration_ms: i64,
+    /// Candidate raw fingerprint JSON.
+    pub fingerprint_json: String,
+}
+
+/// Transactional database effect of finalizing a repair commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct RepairCommitPersistence {
+    /// New healthy replacement artifact ID.
+    pub artifact_id: i64,
+    /// Whether this call inserted it rather than observing committed recovery.
+    pub inserted: bool,
+}
+
+/// Durable terminal result of independently checking one candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepairVerificationDecision {
+    /// Candidate contradicts known identity or version evidence.
+    Rejected,
+    /// Candidate evidence is insufficient for a safe decision.
+    Unresolved,
+    /// Candidate satisfies canonical, duration, and perceptual checks.
+    Verified,
+}
+
+impl RepairVerificationDecision {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Rejected => "rejected",
+            Self::Unresolved => "unresolved",
+            Self::Verified => "verified",
+        }
+    }
+}
+
 /// Persistence initialization or migration failure.
 #[derive(Debug, Error)]
 pub enum DatabaseError {
@@ -2178,6 +2959,28 @@ pub enum DatabaseError {
     /// Candidate generation cannot mutate a terminal or cancelled repair case.
     #[error("repair case {0} is not eligible for candidate generation")]
     RepairCaseNotEligible(i64),
+    /// Repair verification requires an exclusively running attempt.
+    #[error("repair attempt {0} is not running")]
+    RepairAttemptNotRunning(i64),
+    /// Repair commit requires a verified attempt and evidence.
+    #[error("repair attempt {0} is not verified")]
+    RepairAttemptNotVerified(i64),
+    /// Repeated repair preparation supplied a different final path.
+    #[error("prepared repair commit does not match attempt {0}")]
+    RepairCommitMismatch(i64),
+    /// Repair finalization requires matching prepared intent.
+    #[error("repair commit is not prepared for verified attempt {0}")]
+    RepairCommitNotPrepared(i64),
+    /// A provider candidate already belongs to another canonical recording.
+    #[error(
+        "repair candidate {provider}:{provider_item_id} is already associated with another recording"
+    )]
+    RepairCandidateIdentityConflict {
+        /// Candidate provider adapter.
+        provider: String,
+        /// Provider-owned candidate identity.
+        provider_item_id: String,
+    },
     /// Commit preparation requires a currently running acquisition.
     #[error("acquisition job is not running: {0}")]
     AcquisitionNotRunning(i64),
@@ -2190,6 +2993,9 @@ pub enum DatabaseError {
     /// Finalization requires matching prepared intent and a running job.
     #[error("acquisition commit is not prepared for running job {0}")]
     AcquisitionCommitNotPrepared(i64),
+    /// Embedded canonical evidence contradicted an already associated recording.
+    #[error("acquisition canonical evidence conflicts with recording for job {0}")]
+    AcquisitionCanonicalConflict(i64),
     /// Another collection already reserved the intended playlist path.
     #[error("playlist output path is already reserved: {0}")]
     PlaylistPathReserved(PathBuf),
@@ -2541,6 +3347,29 @@ mod tests {
             0
         );
         assert_eq!(database.table_count("repair_attempts")?, 1);
+        let work = database
+            .claim_next_repair_attempt()?
+            .ok_or("generated repair attempt was not claimable")?;
+        assert_eq!(work.attempt, 1);
+        assert!(database.claim_next_repair_attempt()?.is_none());
+        database.complete_repair_verification(&RepairVerificationEvidence {
+            attempt_id: work.attempt_id,
+            staged_path: PathBuf::from("/state/repair-staging/attempt-1/media.opus"),
+            sha256: "00".repeat(32),
+            bytes: 13,
+            codec: "opus".into(),
+            duration_ms: Some(180_000),
+            sample_rate_hz: Some(48_000),
+            channels: Some(2),
+            musicbrainz_recording_id: None,
+            isrc: None,
+            fingerprint_max_seconds: 120,
+            fingerprint_duration_ms: 180_000,
+            fingerprint_json: "[1,2,3]".into(),
+            decision: RepairVerificationDecision::Unresolved,
+            reason: "canonical identity unavailable".into(),
+        })?;
+        assert_eq!(database.table_count("repair_attempt_evidence")?, 1);
 
         database
             .connection
@@ -2567,6 +3396,59 @@ mod tests {
 
         assert_eq!(database.schema_version()?, CURRENT_SCHEMA_VERSION);
         assert!(database.list_sources(true)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn migration_nine_preserves_existing_generated_repair_attempts()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("v8.sqlite3");
+        let connection = Connection::open(&path)?;
+        connection.execute_batch("PRAGMA foreign_keys = ON")?;
+        for (version, sql) in &MIGRATIONS[..8] {
+            connection.execute_batch(sql)?;
+            connection.execute(
+                "INSERT INTO schema_migrations(version) VALUES (?1)",
+                [version],
+            )?;
+            connection.pragma_update(None, "user_version", version)?;
+        }
+        connection.execute("INSERT INTO recordings DEFAULT VALUES", [])?;
+        connection.execute(
+            "INSERT INTO artifacts(recording_id, path, health)
+             VALUES (1, '/music/missing.opus', 'missing')",
+            [],
+        )?;
+        connection.execute(
+            "INSERT INTO provider_items(provider, provider_item_id, original_url,
+                 availability, recording_id)
+             VALUES ('youtube', 'original', 'https://youtu.be/original',
+                     'permanently_unavailable', 1)",
+            [],
+        )?;
+        connection.execute(
+            "INSERT INTO repair_cases(recording_id, original_provider_item_id,
+                 reference_artifact_id) VALUES (1, 1, 1)",
+            [],
+        )?;
+        connection.execute(
+            "INSERT INTO repair_attempts(repair_case_id, candidate_provider,
+                 candidate_provider_item_id, candidate_url, state, reason)
+             VALUES (1, 'youtube', 'candidate', 'https://youtu.be/candidate',
+                     'generated', 'search generated only')",
+            [],
+        )?;
+        drop(connection);
+
+        let database = Database::open(&path)?;
+        let state = database.connection.query_row(
+            "SELECT state, attempt_count FROM repair_attempts WHERE id = 1",
+            [],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?)),
+        )?;
+        assert_eq!(state, ("generated".into(), 0));
+        assert_eq!(database.schema_version()?, CURRENT_SCHEMA_VERSION);
         Ok(())
     }
 }

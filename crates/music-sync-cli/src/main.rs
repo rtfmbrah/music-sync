@@ -25,7 +25,10 @@ use music_sync::media_probe::Ffprobe;
 use music_sync::persistence::Database;
 use music_sync::playlist::{PlaylistMaterializationReport, materialize_playlists};
 use music_sync::provider::{SourceId, SourceSnapshot, is_supported_youtube_url};
-use music_sync::repair::{assess_repair_eligibility, generate_repair_candidates};
+use music_sync::repair::{
+    assess_repair_eligibility, commit_verified_repair, generate_repair_candidates,
+    run_one_repair_verification,
+};
 use music_sync::sync::{
     SourceSyncResult, SyncBoundaries, SyncDirectories, SyncLimits, SyncRunReport, run_sync,
 };
@@ -136,6 +139,55 @@ enum RepairCommand {
         /// Per-search provider deadline in seconds.
         #[arg(long, default_value = "60")]
         timeout_seconds: NonZeroU64,
+    },
+    /// Claim, stage, and independently verify at most one generated candidate.
+    RunOne {
+        /// TOML configuration containing state and managed library directories.
+        #[arg(short, long, default_value = "music-sync.toml")]
+        config: PathBuf,
+        /// yt-dlp executable path.
+        #[arg(long, default_value = "yt-dlp")]
+        yt_dlp: PathBuf,
+        /// ffprobe executable path.
+        #[arg(long, default_value = "ffprobe")]
+        ffprobe: PathBuf,
+        /// fpcalc executable path.
+        #[arg(long, default_value = "fpcalc")]
+        fpcalc: PathBuf,
+        /// Candidate download deadline in seconds.
+        #[arg(long, default_value = "600")]
+        download_timeout_seconds: NonZeroU64,
+        /// Candidate structural probe deadline in seconds.
+        #[arg(long, default_value = "30")]
+        probe_timeout_seconds: NonZeroU64,
+        /// Candidate fingerprint deadline in seconds.
+        #[arg(long, default_value = "60")]
+        fingerprint_timeout_seconds: NonZeroU64,
+        /// Maximum candidate audio seconds fingerprinted.
+        #[arg(long, default_value = "120")]
+        fingerprint_audio_seconds: NonZeroU64,
+    },
+    /// Atomically commit one independently verified candidate without overwriting media.
+    Commit {
+        /// Durable verified repair attempt ID.
+        attempt_id: i64,
+        /// TOML configuration containing the managed library directory.
+        #[arg(short, long, default_value = "music-sync.toml")]
+        config: PathBuf,
+    },
+    /// Explicitly release one deferred repair attempt for retry.
+    Retry {
+        /// Durable deferred repair attempt ID.
+        attempt_id: i64,
+        /// TOML configuration identifying application state.
+        #[arg(short, long, default_value = "music-sync.toml")]
+        config: PathBuf,
+    },
+    /// Recover abandoned running repair attempts after confirming no process is active.
+    RecoverRunning {
+        /// TOML configuration identifying application state.
+        #[arg(short, long, default_value = "music-sync.toml")]
+        config: PathBuf,
     },
 }
 
@@ -391,6 +443,93 @@ fn main() -> ExitCode {
 fn run(cli: Cli) -> Result<ExitCode, Box<dyn Error>> {
     match cli.command {
         Command::Repair {
+            command: RepairCommand::Retry { attempt_id, config },
+        } => {
+            let config = AppConfig::from_file(&config)?;
+            let mut database = Database::open(&config.database_path())?;
+            if !database.retry_deferred_repair_attempt(attempt_id)? {
+                return Err(format!("repair attempt {attempt_id} is not deferred").into());
+            }
+            println!("Repair attempt {attempt_id} released for retry.");
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Repair {
+            command: RepairCommand::RecoverRunning { config },
+        } => {
+            let config = AppConfig::from_file(&config)?;
+            let mut database = Database::open(&config.database_path())?;
+            let recovered = database.recover_running_repair_attempts()?;
+            if cli.json {
+                println!("{}", serde_json::json!({ "recovered": recovered }));
+            } else {
+                println!("Repair attempts recovered: {recovered}");
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Repair {
+            command: RepairCommand::Commit { attempt_id, config },
+        } => {
+            let config = AppConfig::from_file(&config)?;
+            let mut database = Database::open(&config.database_path())?;
+            let report = commit_verified_repair(
+                &mut database,
+                attempt_id,
+                &config.library_directory,
+                &Sha256FileHasher,
+            )?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("Repair attempt committed: {}", report.attempt_id);
+                println!("Artifact path: {}", report.final_path.display());
+                println!("Artifact ID: {}", report.persistence.artifact_id);
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Repair {
+            command:
+                RepairCommand::RunOne {
+                    config,
+                    yt_dlp,
+                    ffprobe,
+                    fpcalc,
+                    download_timeout_seconds,
+                    probe_timeout_seconds,
+                    fingerprint_timeout_seconds,
+                    fingerprint_audio_seconds,
+                },
+        } => {
+            let config = AppConfig::from_file(&config)?;
+            let mut database = Database::open(&config.database_path())?;
+            let fingerprint_audio_seconds = u32::try_from(fingerprint_audio_seconds.get())
+                .map_err(|_| "maximum fingerprint audio seconds exceeds u32")?;
+            let downloader =
+                YtDlp::new(yt_dlp, Duration::from_secs(download_timeout_seconds.get()));
+            let probe = Ffprobe::new(ffprobe, Duration::from_secs(probe_timeout_seconds.get()));
+            let fingerprinter = Fpcalc::new(
+                fpcalc,
+                Duration::from_secs(fingerprint_timeout_seconds.get()),
+                fingerprint_audio_seconds,
+            );
+            let outcome = run_one_repair_verification(
+                &mut database,
+                &config.state_directory,
+                &downloader,
+                &probe,
+                &Sha256FileHasher,
+                &fingerprinter,
+            )?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&outcome)?);
+            } else {
+                println!("Repair verification: {outcome:?}");
+            }
+            Ok(match outcome {
+                music_sync::repair::RepairRunOutcome::Deferred { .. } => ExitCode::from(1),
+                _ => ExitCode::SUCCESS,
+            })
+        }
+        Command::Repair {
             command:
                 RepairCommand::Generate {
                     config,
@@ -520,6 +659,26 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn Error>> {
                 println!("Repairs unresolved:      {}", report.repairs.unresolved);
                 println!("Repairs verified:        {}", report.repairs.verified);
                 println!("Repairs cancelled:       {}", report.repairs.cancelled);
+                println!(
+                    "Repair attempts queued:  {}",
+                    report.repair_attempts.generated
+                );
+                println!(
+                    "Repair attempts running: {}",
+                    report.repair_attempts.running
+                );
+                println!(
+                    "Repair attempts deferred:{}",
+                    report.repair_attempts.deferred
+                );
+                println!(
+                    "Repair attempts verified:{}",
+                    report.repair_attempts.verified
+                );
+                println!(
+                    "Repair attempts committed:{}",
+                    report.repair_attempts.committed
+                );
                 println!("Playlist outputs:        {}", report.playlist_outputs);
                 println!("Recent warning/errors:   {}", report.recent_events.len());
                 for event in report.recent_events {
