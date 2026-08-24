@@ -57,6 +57,23 @@ prepared in SQLite before a same-filesystem no-clobber commit, enabling exact-by
 crash recovery. Unknown existing sidecars and contradictory prepared bytes are
 preserved and deferred. Repeated committed runs perform no provider or file work.
 
+Schema version 14 and `metadata materialize` provide explicit source-preserving tag
+output for healthy artifacts proven owned by acquisition or repair. Selected title,
+artist credit, release, date, recording MBID, and ISRC become ffmpeg metadata while
+`-c copy` forbids audio transcoding. Selected canonical release art replaces provider
+art: ordinary attachment-capable containers receive an attached image stream, while
+Opus/Ogg receives a FLAC-picture block in Vorbis comments through a temporary
+ffmetadata input rather than an oversized process argument.
+
+Before remux, the exact source hash is copied into immutable SHA-256-addressed artifact
+history. Hidden output is durably reserved, produced with overwrite disabled, then
+structurally probed and hashed. Codec, sample rate, channels, and bounded duration must
+agree with the source. Complete commit intent precedes atomic visible replacement; the
+original history and output hashes distinguish interruption states. SQLite then moves
+the historical artifact row, inserts the derived healthy artifact, and changes
+preference transactionally. Unknown hidden paths and changed source bytes are
+preserved/deferred; retry is explicit.
+
 ## PLANNED
 
 Extend canonical release context with
@@ -69,7 +86,6 @@ outranks a video thumbnail. Release selection accounts for original albums, sing
 soundtracks, deluxe editions, compilations, and remasters without confusing them with
 recording identity.
 
-Normalized filenames, directory organization, tags, art, and lyrics are independent
-of codec uniformity. Prefer adjacent `.lrc` files for lyrics so updates do not rewrite
-audio and remain compatible with Navidrome. Tag mutations need atomic replacement,
-prior-artifact validation, and idempotency tests.
+Normalized filenames and future directory organization remain independent from codec
+uniformity and this tag-only visible path transition. Exact acquired bytes remain in
+application history.

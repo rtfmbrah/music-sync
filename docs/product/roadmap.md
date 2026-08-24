@@ -46,7 +46,7 @@ in ad hoc TODO documents.
   exact recording MBID and unique ISRC lookup with deterministic release context).
 - Cover Art Archive selection and immutable content-addressed cache (complete).
 - Synchronized/plain LRCLIB lyrics with crash-safe adjacent-file output (complete).
-- Source-preserving tag normalization and artwork priority.
+- Source-preserving atomic tag normalization and canonical artwork priority (complete).
 
 ## P4 — Autonomous discovery
 

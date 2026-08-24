@@ -73,6 +73,10 @@
   exact MBID and unique-ISRC HTTP paths, required User-Agent, loopback-only test HTTP,
   deterministic release selection, transactional artist/release/field provenance,
   explicit selections, repeat idempotency, and ambiguous results without live API use.
+- Canonical tag tests enforce literal ffmpeg stream-copy arguments, canonical field and
+  Opus picture-block routing, source/result structural comparison, immutable original
+  bytes, no-clobber hidden staging, atomic preferred-artifact transition, repeat
+  idempotency, and recovery after visible replacement precedes SQLite finalization.
 - Scenario tests encode removed membership, disappeared remote with healthy local
   media, transient failure, same-title fingerprint mismatch, and repeat idempotency.
 - The architecture check reads Cargo metadata and enforces CLI-to-library dependency

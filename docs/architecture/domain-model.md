@@ -80,6 +80,11 @@ and prepared/committed adjacent-output intent. Automatic sidecars are limited to
 healthy artifacts proven owned by a committed acquisition or repair. Adopted media
 remains read-only.
 
+Schema version 14 stores reserved hidden staging, prepared/committed canonical tag
+materialization, immutable original-byte history, explicit deferral, and the derived
+preferred artifact. The former artifact row moves to its retained history path; it is
+not deleted or collapsed into the derived container.
+
 ## PLANNED
 
 Add discovery seeds/candidates and expanded job attempts when a real workflow

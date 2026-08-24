@@ -33,7 +33,7 @@ test-architecture:
 
 # Validate deployment shell scripts without network or side effects.
 test-scripts:
-    bash -n scripts/install-ytdlp crates/music-sync/tests/fixtures/acquisition/*.sh crates/music-sync/tests/fixtures/repair/*.sh
+    bash -n scripts/install-ytdlp crates/music-sync/tests/fixtures/acquisition/*.sh crates/music-sync/tests/fixtures/repair/*.sh crates/music-sync/tests/fixtures/tag/*.sh
 
 # Apply safe formatter and Clippy suggestions.
 fix:

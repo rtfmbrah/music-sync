@@ -1446,6 +1446,153 @@ fn lyrics_fetch_writes_owned_adjacent_sidecar_and_repeats_offline()
 }
 
 #[test]
+fn metadata_materialize_stream_copies_and_retains_original_bytes()
+-> Result<(), Box<dyn std::error::Error>> {
+    use music_sync::content_hash::{ContentHasher, Sha256FileHasher};
+
+    let root = tempfile::tempdir()?;
+    let state = root.path().join("state");
+    let library = root.path().join("library");
+    let playlists = root.path().join("playlists");
+    fs::create_dir_all(&state)?;
+    fs::create_dir_all(&library)?;
+    fs::create_dir_all(&playlists)?;
+    let audio = library.join("track.opus");
+    let original = b"original-opus";
+    fs::write(&audio, original)?;
+    let hash = Sha256FileHasher.hash(&audio)?;
+    let source_sha = hash
+        .sha256
+        .iter()
+        .map(|v| format!("{v:02x}"))
+        .collect::<String>();
+    let config = root.path().join("music-sync.toml");
+    fs::write(
+        &config,
+        format!(
+            "state_directory = {:?}\nlibrary_directory = {:?}\nplaylist_directory = {:?}\n",
+            state, library, playlists
+        ),
+    )?;
+    let database = state.join("music-sync.sqlite3");
+    assert!(
+        Command::new(env!("CARGO_BIN_EXE_music-sync"))
+            .args(["source", "add", "https://youtu.be/bootstrap", "--database"])
+            .arg(&database)
+            .output()?
+            .status
+            .success()
+    );
+    let connection = rusqlite::Connection::open(&database)?;
+    connection.execute("INSERT INTO recordings(musicbrainz_recording_id,isrc) VALUES ('f59c5520-5f46-4d2c-b2c4-822eabf53419','USABC2412345')",[])?;
+    connection.execute("INSERT INTO artifacts(recording_id,path,sha256,duration_ms,codec,sample_rate_hz,channels,health) VALUES (1,?1,?2,1000,'opus',48000,2,'healthy')",rusqlite::params![audio.to_str().ok_or("path")?,source_sha])?;
+    connection.execute(
+        "UPDATE recordings SET preferred_artifact_id=1 WHERE id=1",
+        [],
+    )?;
+    connection.execute("INSERT INTO provider_items(provider,provider_item_id,original_url,recording_id) VALUES ('youtube','fixture','https://youtu.be/fixture',1)",[])?;
+    connection.execute(
+        "INSERT INTO sync_runs(status,finished_at) VALUES ('succeeded',CURRENT_TIMESTAMP)",
+        [],
+    )?;
+    connection.execute("INSERT INTO jobs(run_id,kind,status,idempotency_key) VALUES (1,'acquire','succeeded','acquire:youtube:fixture')",[])?;
+    connection.execute(
+        "INSERT INTO acquisition_jobs(job_id,provider_item_id) VALUES (1,1)",
+        [],
+    )?;
+    connection.execute("INSERT INTO acquisition_commits(job_id,staged_path,final_path,sha256,bytes,codec,duration_ms,status,committed_at) VALUES (1,'/tmp/staged',?1,?2,13,'opus',1000,'committed',CURRENT_TIMESTAMP)",rusqlite::params![audio.to_str().ok_or("path")?,source_sha])?;
+    let release_mbid = "99999999-8888-7777-6666-555555555555";
+    for (field, value) in [
+        ("title", "Canonical Track"),
+        ("artist_credit", "Canonical Artist"),
+        ("release", "Canonical Album"),
+        ("release_date", "2025-01-02"),
+    ] {
+        let entity = if field == "release" {
+            release_mbid
+        } else {
+            "fixture"
+        };
+        let cursor=connection.execute("INSERT INTO metadata_observations(recording_id,field,value,source,source_entity_id,confidence_millionths,resolution_context) VALUES (1,?1,?2,'musicbrainz',?3,1000000,'fixture')",[field,value,entity])?;
+        assert_eq!(cursor, 1);
+        let id = connection.last_insert_rowid();
+        connection.execute(
+            "INSERT INTO metadata_selections(recording_id,field,observation_id) VALUES (1,?1,?2)",
+            rusqlite::params![field, id],
+        )?;
+    }
+    let artwork_relative =
+        "artwork-cache/aa/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.jpg";
+    let artwork = state.join(artwork_relative);
+    fs::create_dir_all(artwork.parent().ok_or("artwork parent")?)?;
+    fs::write(&artwork, b"\xff\xd8\xffcanonical-art")?;
+    connection.execute("INSERT INTO releases(musicbrainz_release_id,canonical_title) VALUES (?1,'Canonical Album')",[release_mbid])?;
+    connection.execute("INSERT INTO artwork_blobs(sha256,relative_path,mime_type,byte_count) VALUES (?1,?2,'image/jpeg',16)",rusqlite::params!["aa".repeat(32),artwork_relative])?;
+    connection.execute("INSERT INTO release_artwork(release_id,blob_id,source,source_image_id,source_url,role,approved) VALUES (1,1,'cover_art_archive','42','https://example.invalid/art.jpg','front',1)",[])?;
+    drop(connection);
+    let tools = tempfile::tempdir()?;
+    let ffmpeg = tools.path().join("ffmpeg");
+    let ffprobe = tools.path().join("ffprobe");
+    fs::copy(
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../music-sync/tests/fixtures/tag/ffmpeg-copy.sh"
+        ),
+        &ffmpeg,
+    )?;
+    fs::copy(
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../music-sync/tests/fixtures/tag/ffprobe.sh"
+        ),
+        &ffprobe,
+    )?;
+    for path in [&ffmpeg, &ffprobe] {
+        let mut permissions = fs::metadata(path)?.permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(path, permissions)?;
+    }
+    let run = || {
+        Command::new(env!("CARGO_BIN_EXE_music-sync"))
+            .args(["--json", "metadata", "materialize", "--config"])
+            .arg(&config)
+            .args(["--ffmpeg"])
+            .arg(&ffmpeg)
+            .arg("--ffprobe")
+            .arg(&ffprobe)
+            .args(["--max-recordings", "1"])
+            .output()
+    };
+    let first = run()?;
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&first.stdout)?;
+    assert_eq!(report["committed"], 1);
+    assert_eq!(fs::read(&audio)?, b"original-opus-canonical-tags");
+    let history = state
+        .join("artifact-history")
+        .join(&source_sha[..2])
+        .join(format!("{source_sha}.opus"));
+    assert_eq!(fs::read(&history)?, original);
+    let repeat = run()?;
+    assert!(repeat.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&repeat.stdout)?["selected"],
+        0
+    );
+    let connection = rusqlite::Connection::open(database)?;
+    assert_eq!(
+        connection.query_row("SELECT COUNT(*) FROM artifacts", [], |row| row
+            .get::<_, u64>(0))?,
+        2
+    );
+    Ok(())
+}
+
+#[test]
 fn library_health_reports_hash_mismatch_without_modifying_media()
 -> Result<(), Box<dyn std::error::Error>> {
     let root = tempfile::tempdir()?;

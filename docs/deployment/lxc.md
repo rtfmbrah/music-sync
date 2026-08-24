@@ -246,3 +246,14 @@ plain response and were atomically committed as an adjacent `.lrc`; the audio by
 remained unchanged. An immediate repeat used an unreachable endpoint, selected zero
 work, and succeeded without HTTP. Status reported one resolved recording and one
 committed sidecar. `/srv/music` remained non-writable.
+
+Source-preserving canonical tag materialization was validated with the schema-v14
+static binary and Debian's real ffmpeg/ffprobe under
+`/srv/music-sync-v2-test/tags-20260825`. A real generated Opus stream and JPEG were
+processed with audio stream copy. Full ffprobe output showed canonical title, artist,
+album, date, recording MBID, and ISRC on the audio stream, plus a canonical MJPEG
+stream with `attached_pic=1` decoded from the Opus picture block. The visible result
+had a new container hash while immutable artifact history exactly matched the original
+SHA-256. The immediate repeat selected zero work and succeeded with deliberately
+nonexistent ffmpeg/ffprobe paths. Status reported one committed materialization and two
+healthy artifact identities. `/srv/music` remained non-writable.

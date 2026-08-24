@@ -36,6 +36,7 @@ use music_sync::repair::{
 use music_sync::sync::{
     SourceSyncResult, SyncBoundaries, SyncDirectories, SyncLimits, SyncRunReport, run_sync,
 };
+use music_sync::tag_materialization::{FfmpegMetadataRemuxer, materialize_canonical_tags};
 use music_sync::yt_dlp::YtDlp;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
@@ -143,6 +144,35 @@ enum MetadataCommand {
         /// Per-request HTTP deadline in seconds.
         #[arg(long, default_value = "30")]
         timeout_seconds: NonZeroU64,
+    },
+    /// Stream-copy selected canonical tags while retaining exact original bytes.
+    Materialize {
+        /// TOML configuration identifying state and the managed library.
+        #[arg(short, long, default_value = "music-sync.toml")]
+        config: PathBuf,
+        /// Maximum recordings attempted once in stable order.
+        #[arg(long, default_value = "20")]
+        max_recordings: NonZeroUsize,
+        /// ffmpeg executable path.
+        #[arg(long, default_value = "ffmpeg")]
+        ffmpeg: PathBuf,
+        /// ffprobe executable path.
+        #[arg(long, default_value = "ffprobe")]
+        ffprobe: PathBuf,
+        /// Per-recording remux deadline in seconds.
+        #[arg(long, default_value = "120")]
+        timeout_seconds: NonZeroU64,
+        /// Per-output validation deadline in seconds.
+        #[arg(long, default_value = "30")]
+        probe_timeout_seconds: NonZeroU64,
+    },
+    /// Explicitly release one deferred materialization for retry.
+    RetryMaterialize {
+        /// Durable recording ID.
+        recording_id: i64,
+        /// TOML configuration identifying application state.
+        #[arg(short, long, default_value = "music-sync.toml")]
+        config: PathBuf,
     },
 }
 
@@ -527,6 +557,68 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> Result<ExitCode, Box<dyn Error>> {
     match cli.command {
+        Command::Metadata {
+            command:
+                MetadataCommand::RetryMaterialize {
+                    recording_id,
+                    config,
+                },
+        } => {
+            let config = AppConfig::from_file(&config)?;
+            let mut database = Database::open(&config.database_path())?;
+            let released = database.retry_metadata_materialization(recording_id)?;
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::json!({"recording_id": recording_id, "released": released})
+                );
+            } else {
+                println!("Materialization retry released: {released}");
+            }
+            Ok(if released {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(1)
+            })
+        }
+        Command::Metadata {
+            command:
+                MetadataCommand::Materialize {
+                    config,
+                    max_recordings,
+                    ffmpeg,
+                    ffprobe,
+                    timeout_seconds,
+                    probe_timeout_seconds,
+                },
+        } => {
+            let config = AppConfig::from_file(&config)?;
+            let mut database = Database::open(&config.database_path())?;
+            let remuxer =
+                FfmpegMetadataRemuxer::new(ffmpeg, Duration::from_secs(timeout_seconds.get()));
+            let probe = Ffprobe::new(ffprobe, Duration::from_secs(probe_timeout_seconds.get()));
+            let report = materialize_canonical_tags(
+                &mut database,
+                &remuxer,
+                &probe,
+                &Sha256FileHasher,
+                &config.state_directory,
+                max_recordings.get(),
+            )?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("Recordings selected: {}", report.selected);
+                println!("Tags committed:      {}", report.committed);
+                println!("Commits recovered:   {}", report.recovered);
+                println!("Tags deferred:       {}", report.deferred);
+            }
+            Ok(if report.failures.is_empty() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(1)
+            })
+        }
         Command::Lyrics {
             command:
                 LyricsCommand::Fetch {
@@ -922,6 +1014,18 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn Error>> {
                 println!(
                     "Lyrics sidecars:         {}",
                     report.lyrics.committed_outputs
+                );
+                println!(
+                    "Tag outputs prepared:    {}",
+                    report.metadata_materializations.prepared
+                );
+                println!(
+                    "Tag outputs committed:   {}",
+                    report.metadata_materializations.committed
+                );
+                println!(
+                    "Tag outputs deferred:    {}",
+                    report.metadata_materializations.deferred
                 );
                 println!("Playlist outputs:        {}", report.playlist_outputs);
                 println!("Recent warning/errors:   {}", report.recent_events.len());

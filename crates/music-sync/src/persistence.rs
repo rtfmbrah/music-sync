@@ -38,10 +38,14 @@ const MIGRATIONS: &[(u32, &str)] = &[
     ),
     (12, include_str!("../migrations/0012_release_artwork.sql")),
     (13, include_str!("../migrations/0013_lyrics_sidecars.sql")),
+    (
+        14,
+        include_str!("../migrations/0014_metadata_materialization.sql"),
+    ),
 ];
 
 /// Current durable schema version.
-pub const CURRENT_SCHEMA_VERSION: u32 = 13;
+pub const CURRENT_SCHEMA_VERSION: u32 = 14;
 
 /// A connection to music-sync's private application state.
 #[derive(Debug)]
@@ -233,6 +237,17 @@ impl Database {
                 )?,
                 committed_outputs: count(
                     "SELECT COUNT(*) FROM lyrics_outputs WHERE state = 'committed'",
+                )?,
+            },
+            metadata_materializations: MetadataMaterializationCounts {
+                prepared: count(
+                    "SELECT COUNT(*) FROM metadata_materializations WHERE state='prepared'",
+                )?,
+                committed: count(
+                    "SELECT COUNT(*) FROM metadata_materializations WHERE state='committed'",
+                )?,
+                deferred: count(
+                    "SELECT COUNT(*) FROM metadata_materialization_states WHERE state='deferred'",
                 )?,
             },
             playlist_outputs: count(
@@ -1018,6 +1033,295 @@ impl Database {
             }
         }
         Ok(())
+    }
+
+    /// Loads canonical managed artifacts eligible for source-preserving tag materialization.
+    pub fn metadata_materialization_candidates(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<MetadataMaterializationCandidate>, DatabaseError> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut statement = self.connection.prepare(
+            "SELECT recordings.id, artifacts.id, artifacts.path, artifacts.sha256,
+                    artifacts.codec, artifacts.duration_ms, artifacts.sample_rate_hz,
+                    artifacts.channels, title.value, artist.value, release.value,
+                    date.value, recordings.musicbrainz_recording_id, recordings.isrc,
+                    metadata_materializations.state, artwork_blobs.relative_path,
+                    artwork_blobs.mime_type, metadata_materialization_staging.recording_id
+             FROM recordings
+             JOIN artifacts ON artifacts.id = recordings.preferred_artifact_id
+             JOIN metadata_selections ts ON ts.recording_id=recordings.id AND ts.field='title'
+             JOIN metadata_observations title ON title.id=ts.observation_id
+             JOIN metadata_selections ars ON ars.recording_id=recordings.id AND ars.field='artist_credit'
+             JOIN metadata_observations artist ON artist.id=ars.observation_id
+             JOIN metadata_selections rs ON rs.recording_id=recordings.id AND rs.field='release'
+             JOIN metadata_observations release ON release.id=rs.observation_id
+             LEFT JOIN metadata_selections ds ON ds.recording_id=recordings.id AND ds.field='release_date'
+             LEFT JOIN metadata_observations date ON date.id=ds.observation_id
+             LEFT JOIN metadata_materializations ON metadata_materializations.recording_id=recordings.id
+             LEFT JOIN metadata_materialization_states state ON state.recording_id=recordings.id
+             LEFT JOIN releases selected_release ON selected_release.musicbrainz_release_id=release.source_entity_id
+             LEFT JOIN release_artwork ON release_artwork.release_id=selected_release.id
+             LEFT JOIN artwork_blobs ON artwork_blobs.id=release_artwork.blob_id
+             LEFT JOIN metadata_materialization_staging ON metadata_materialization_staging.recording_id=recordings.id
+             WHERE artifacts.health='healthy' AND artifacts.sha256 IS NOT NULL
+               AND (EXISTS (SELECT 1 FROM acquisition_commits WHERE final_path=artifacts.path AND status='committed')
+                    OR EXISTS (SELECT 1 FROM repair_commits WHERE final_path=artifacts.path AND committed_at IS NOT NULL))
+               AND (metadata_materializations.recording_id IS NULL OR metadata_materializations.state='prepared')
+               AND (state.recording_id IS NULL OR state.state='pending')
+             ORDER BY recordings.id LIMIT ?1"
+        ).map_err(DatabaseError::Sqlite)?;
+        statement
+            .query_map([limit], |row| {
+                Ok(MetadataMaterializationCandidate {
+                    recording_id: row.get(0)?,
+                    source_artifact_id: row.get(1)?,
+                    source_path: PathBuf::from(row.get::<_, String>(2)?),
+                    source_sha256: row.get(3)?,
+                    codec: row.get(4)?,
+                    duration_ms: row.get(5)?,
+                    sample_rate_hz: row.get(6)?,
+                    channels: row.get(7)?,
+                    title: row.get(8)?,
+                    artist_credit: row.get(9)?,
+                    release_title: row.get(10)?,
+                    release_date: row.get(11)?,
+                    musicbrainz_recording_id: row.get(12)?,
+                    isrc: row.get(13)?,
+                    prepared: row.get::<_, Option<String>>(14)?.as_deref() == Some("prepared"),
+                    artwork_relative_path: row.get(15)?,
+                    artwork_mime_type: row.get(16)?,
+                    staging_reserved: row.get::<_, Option<i64>>(17)?.is_some(),
+                })
+            })
+            .map_err(DatabaseError::Sqlite)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(DatabaseError::Sqlite)
+    }
+
+    /// Defers one failed materialization until explicit operator retry.
+    pub fn defer_metadata_materialization(
+        &mut self,
+        recording_id: i64,
+        message: &str,
+    ) -> Result<(), DatabaseError> {
+        self.connection.execute(
+            "INSERT INTO metadata_materialization_states(recording_id,state,message) VALUES (?1,'deferred',?2)
+             ON CONFLICT(recording_id) DO UPDATE SET state='deferred',message=excluded.message,updated_at=CURRENT_TIMESTAMP",
+            rusqlite::params![recording_id,message]
+        ).map_err(DatabaseError::Sqlite)?;
+        Ok(())
+    }
+
+    /// Reserves the deterministic hidden staging path before ffmpeg can create it.
+    pub fn reserve_metadata_materialization_staging(
+        &mut self,
+        recording_id: i64,
+        path: &Path,
+    ) -> Result<bool, DatabaseError> {
+        let path = path
+            .to_str()
+            .ok_or_else(|| DatabaseError::NonUnicodePath(path.into()))?;
+        let changed = self.connection.execute(
+            "INSERT OR IGNORE INTO metadata_materialization_staging(recording_id,path) VALUES (?1,?2)",
+            rusqlite::params![recording_id,path],
+        ).map_err(DatabaseError::Sqlite)? > 0;
+        if !changed {
+            let matches = self
+                .connection
+                .query_row(
+                    "SELECT path=?2 FROM metadata_materialization_staging WHERE recording_id=?1",
+                    rusqlite::params![recording_id, path],
+                    |row| row.get::<_, bool>(0),
+                )
+                .map_err(DatabaseError::Sqlite)?;
+            if !matches {
+                return Err(DatabaseError::MetadataStagingMismatch(recording_id));
+            }
+        }
+        Ok(changed)
+    }
+
+    /// Explicitly releases one deferred canonical materialization for retry.
+    pub fn retry_metadata_materialization(
+        &mut self,
+        recording_id: i64,
+    ) -> Result<bool, DatabaseError> {
+        Ok(self
+            .connection
+            .execute(
+                "UPDATE metadata_materialization_states SET state='pending',
+             message='operator explicitly requested retry',updated_at=CURRENT_TIMESTAMP
+             WHERE recording_id=?1 AND state='deferred'",
+                [recording_id],
+            )
+            .map_err(DatabaseError::Sqlite)?
+            == 1)
+    }
+
+    /// Persists complete validated tag-output intent before replacing the visible path.
+    pub fn prepare_metadata_materialization(
+        &mut self,
+        candidate: &MetadataMaterializationCandidate,
+        intent: &MetadataMaterializationIntent,
+    ) -> Result<bool, DatabaseError> {
+        let source_path = candidate
+            .source_path
+            .to_str()
+            .ok_or_else(|| DatabaseError::NonUnicodePath(candidate.source_path.clone()))?
+            .to_owned();
+        let history_path = intent
+            .history_path
+            .to_str()
+            .ok_or_else(|| DatabaseError::NonUnicodePath(intent.history_path.clone()))?
+            .to_owned();
+        let staged_path = intent
+            .staged_path
+            .to_str()
+            .ok_or_else(|| DatabaseError::NonUnicodePath(intent.staged_path.clone()))?
+            .to_owned();
+        let changed = self
+            .connection
+            .execute(
+                "INSERT OR IGNORE INTO metadata_materializations(recording_id,source_artifact_id,
+             source_path,source_sha256,history_path,staged_path,final_path,result_sha256,
+             result_bytes,codec,duration_ms,sample_rate_hz,channels,canonical_snapshot_json,
+             state,message) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,
+             'prepared','validated stream-copy output prepared')",
+                rusqlite::params![
+                    candidate.recording_id,
+                    candidate.source_artifact_id,
+                    source_path,
+                    candidate.source_sha256,
+                    history_path,
+                    staged_path,
+                    candidate
+                        .source_path
+                        .to_str()
+                        .ok_or_else(|| DatabaseError::NonUnicodePath(
+                            candidate.source_path.clone()
+                        ))?,
+                    intent.validated.sha256,
+                    i64::try_from(intent.validated.bytes)
+                        .map_err(|_| DatabaseError::ArtifactTooLarge(intent.validated.bytes))?,
+                    intent.validated.codec,
+                    intent.validated.duration_ms,
+                    intent.validated.sample_rate_hz,
+                    intent.validated.channels,
+                    intent.canonical_snapshot_json
+                ],
+            )
+            .map_err(DatabaseError::Sqlite)?
+            > 0;
+        Ok(changed)
+    }
+
+    /// Loads complete prepared evidence for interruption recovery.
+    pub fn prepared_metadata_materialization(
+        &self,
+        recording_id: i64,
+    ) -> Result<Option<MetadataMaterializationIntent>, DatabaseError> {
+        self.connection
+            .query_row(
+                "SELECT history_path,staged_path,result_sha256,result_bytes,codec,duration_ms,
+                    sample_rate_hz,channels,canonical_snapshot_json
+             FROM metadata_materializations WHERE recording_id=?1 AND state='prepared'",
+                [recording_id],
+                |row| {
+                    let bytes = row.get::<_, i64>(3)?;
+                    Ok(MetadataMaterializationIntent {
+                        history_path: PathBuf::from(row.get::<_, String>(0)?),
+                        staged_path: PathBuf::from(row.get::<_, String>(1)?),
+                        validated: ValidatedStagedMedia {
+                            path: PathBuf::from(row.get::<_, String>(1)?),
+                            sha256: row.get(2)?,
+                            bytes: u64::try_from(bytes).map_err(|error| {
+                                rusqlite::Error::FromSqlConversionFailure(
+                                    3,
+                                    rusqlite::types::Type::Integer,
+                                    Box::new(error),
+                                )
+                            })?,
+                            codec: row.get(4)?,
+                            duration_ms: row
+                                .get::<_, Option<i64>>(5)?
+                                .and_then(|v| u64::try_from(v).ok()),
+                            sample_rate_hz: row
+                                .get::<_, Option<i64>>(6)?
+                                .and_then(|v| u32::try_from(v).ok()),
+                            channels: row
+                                .get::<_, Option<i64>>(7)?
+                                .and_then(|v| u32::try_from(v).ok()),
+                            musicbrainz_recording_id: None,
+                            isrc: None,
+                        },
+                        canonical_snapshot_json: row.get(8)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(DatabaseError::Sqlite)
+    }
+
+    /// Atomically switches durable preference after the filesystem replacement is verified.
+    pub fn commit_metadata_materialization(
+        &mut self,
+        recording_id: i64,
+    ) -> Result<ArtifactPersistenceResult, DatabaseError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(DatabaseError::Sqlite)?;
+        let row=transaction.query_row(
+            "SELECT source_artifact_id,history_path,final_path,result_sha256,result_bytes,
+                    codec,duration_ms,sample_rate_hz,channels,result_artifact_id
+             FROM metadata_materializations WHERE recording_id=?1 AND state IN ('prepared','committed')",
+            [recording_id], |row| Ok((row.get::<_,i64>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?,row.get::<_,i64>(4)?,row.get::<_,String>(5)?,row.get::<_,Option<i64>>(6)?,row.get::<_,Option<i64>>(7)?,row.get::<_,Option<i64>>(8)?,row.get::<_,Option<i64>>(9)?))
+        ).map_err(DatabaseError::Sqlite)?;
+        if let Some(id) = row.9 {
+            return Ok(ArtifactPersistenceResult {
+                recording_id,
+                artifact_id: id,
+                inserted: false,
+            });
+        }
+        transaction
+            .execute(
+                "UPDATE artifacts SET path=?2 WHERE id=?1",
+                rusqlite::params![row.0, row.1],
+            )
+            .map_err(DatabaseError::Sqlite)?;
+        transaction.execute(
+            "INSERT INTO artifacts(recording_id,path,sha256,duration_ms,codec,sample_rate_hz,channels,health)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,'healthy')",
+            rusqlite::params![recording_id,row.2,row.3,row.6,row.5,row.7,row.8]
+        ).map_err(DatabaseError::Sqlite)?;
+        let artifact_id = transaction.last_insert_rowid();
+        transaction
+            .execute(
+                "UPDATE recordings SET preferred_artifact_id=?2 WHERE id=?1",
+                rusqlite::params![recording_id, artifact_id],
+            )
+            .map_err(DatabaseError::Sqlite)?;
+        transaction.execute("UPDATE metadata_materializations SET result_artifact_id=?2,state='committed',message='canonical tags committed with source bytes retained',committed_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE recording_id=?1",rusqlite::params![recording_id,artifact_id]).map_err(DatabaseError::Sqlite)?;
+        transaction
+            .execute(
+                "DELETE FROM metadata_materialization_states WHERE recording_id=?1",
+                [recording_id],
+            )
+            .map_err(DatabaseError::Sqlite)?;
+        transaction
+            .execute(
+                "DELETE FROM metadata_materialization_staging WHERE recording_id=?1",
+                [recording_id],
+            )
+            .map_err(DatabaseError::Sqlite)?;
+        transaction.commit().map_err(DatabaseError::Sqlite)?;
+        Ok(ArtifactPersistenceResult {
+            recording_id,
+            artifact_id,
+            inserted: true,
+        })
     }
 
     /// Loads active unhealthy original items in stable order for availability checks.
@@ -3150,6 +3454,8 @@ pub struct OperationalStatus {
     pub artwork: ArtworkResolutionCounts,
     /// Lyrics resolution and committed adjacent-output counts.
     pub lyrics: LyricsResolutionCounts,
+    /// Source-preserving canonical tag materialization counts.
+    pub metadata_materializations: MetadataMaterializationCounts,
     /// Playlist outputs with committed exact-byte evidence.
     pub playlist_outputs: u64,
     /// Bounded newest-first warning/error events.
@@ -3257,6 +3563,17 @@ pub struct LyricsResolutionCounts {
     pub deferred: u64,
     /// Atomically committed owned adjacent sidecars.
     pub committed_outputs: u64,
+}
+
+/// Durable canonical tag materialization counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct MetadataMaterializationCounts {
+    /// Validated output awaiting or recovering filesystem commit.
+    pub prepared: u64,
+    /// Committed derived artifacts with retained source history.
+    pub committed: u64,
+    /// Failures excluded until explicit retry.
+    pub deferred: u64,
 }
 
 /// One bounded persisted warning or error event.
@@ -3580,6 +3897,60 @@ pub struct ResolvedLyrics {
     pub signature_json: String,
     /// Exact bounded response JSON.
     pub raw_response_json: String,
+}
+
+/// Healthy owned artifact and selected canonical fields for stream-copy tagging.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetadataMaterializationCandidate {
+    /// Durable recording row.
+    pub recording_id: i64,
+    /// Current preferred source artifact.
+    pub source_artifact_id: i64,
+    /// Visible source path to replace only after archival.
+    pub source_path: PathBuf,
+    /// Persisted exact source bytes.
+    pub source_sha256: String,
+    /// Source audio codec.
+    pub codec: Option<String>,
+    /// Source duration.
+    pub duration_ms: Option<i64>,
+    /// Source sample rate.
+    pub sample_rate_hz: Option<i64>,
+    /// Source channel count.
+    pub channels: Option<i64>,
+    /// Selected title.
+    pub title: String,
+    /// Selected artist credit.
+    pub artist_credit: String,
+    /// Selected release title.
+    pub release_title: String,
+    /// Selected release date.
+    pub release_date: Option<String>,
+    /// Strong recording MBID when known.
+    pub musicbrainz_recording_id: Option<String>,
+    /// Normalized ISRC when known.
+    pub isrc: Option<String>,
+    /// Whether durable commit intent already exists.
+    pub prepared: bool,
+    /// Selected canonical release-art cache path relative to application state.
+    pub artwork_relative_path: Option<String>,
+    /// Magic-byte-derived selected artwork MIME type.
+    pub artwork_mime_type: Option<String>,
+    /// Whether the deterministic hidden staging path is durably owned.
+    pub staging_reserved: bool,
+}
+
+/// Complete validated stream-copy output intent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetadataMaterializationIntent {
+    /// Immutable content-addressed original-byte history path.
+    pub history_path: PathBuf,
+    /// Hidden validated output path beside the final artifact.
+    pub staged_path: PathBuf,
+    /// Independently validated output evidence.
+    pub validated: ValidatedStagedMedia,
+    /// Exact selected-field snapshot used for ffmpeg arguments.
+    pub canonical_snapshot_json: String,
 }
 
 /// Original provider object whose active recording artifact needs repair assessment.
@@ -3937,6 +4308,9 @@ pub enum DatabaseError {
     /// Sidecar finalization requires matching prepared intent.
     #[error("lyrics output is not prepared for recording {0}")]
     LyricsOutputNotPrepared(i64),
+    /// Repeated hidden staging reservation contradicted its durable path.
+    #[error("metadata staging path does not match recording {0}")]
+    MetadataStagingMismatch(i64),
     /// Metadata provider candidate count exceeded durable representation.
     #[error("metadata candidate count exceeds SQLite range")]
     MetadataCandidateCountTooLarge,
