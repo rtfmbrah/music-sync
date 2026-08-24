@@ -206,6 +206,105 @@ impl Database {
             .map_err(DatabaseError::Sqlite)
     }
 
+    /// Loads a stable bounded set of registered artifacts for local health checks.
+    pub fn artifact_health_candidates(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<ArtifactHealthCandidate>, DatabaseError> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut statement = self
+            .connection
+            .prepare("SELECT id, path, sha256, health FROM artifacts ORDER BY id LIMIT ?1")
+            .map_err(DatabaseError::Sqlite)?;
+        let rows = statement
+            .query_map([limit], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .map_err(DatabaseError::Sqlite)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(DatabaseError::Sqlite)?;
+        rows.into_iter()
+            .map(|(id, path, sha256, health)| {
+                Ok(ArtifactHealthCandidate {
+                    id,
+                    path: PathBuf::from(path),
+                    sha256,
+                    health: ArtifactHealth::parse(&health)?,
+                })
+            })
+            .collect()
+    }
+
+    /// Persists one conservative artifact-health observation transactionally.
+    pub fn record_artifact_health(
+        &mut self,
+        observation: &ArtifactHealthObservation,
+    ) -> Result<bool, DatabaseError> {
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(DatabaseError::Sqlite)?;
+        let prior = transaction
+            .query_row(
+                "SELECT health FROM artifacts WHERE id = ?1",
+                [observation.artifact_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(DatabaseError::Sqlite)?
+            .ok_or(DatabaseError::ArtifactNotFound(observation.artifact_id))?;
+        let health = observation.health.as_str();
+        let changed = prior != health;
+        transaction
+            .execute(
+                "UPDATE artifacts SET health = ?2,
+                     sha256 = COALESCE(?3, sha256),
+                     duration_ms = COALESCE(?4, duration_ms),
+                     codec = COALESCE(?5, codec),
+                     sample_rate_hz = COALESCE(?6, sample_rate_hz),
+                     channels = COALESCE(?7, channels)
+                 WHERE id = ?1",
+                rusqlite::params![
+                    observation.artifact_id,
+                    health,
+                    observation.sha256,
+                    observation.duration_ms,
+                    observation.codec,
+                    observation.sample_rate_hz,
+                    observation.channels
+                ],
+            )
+            .map_err(DatabaseError::Sqlite)?;
+        if changed {
+            let level = if observation.health == ArtifactHealth::Healthy {
+                "info"
+            } else {
+                "warning"
+            };
+            transaction
+                .execute(
+                    "INSERT INTO events(level, component, event, message, context_json)
+                     VALUES (?1, 'artifact-health', 'artifact_health_changed', ?2, ?3)",
+                    rusqlite::params![
+                        level,
+                        format!(
+                            "Artifact {} health changed from {} to {}",
+                            observation.artifact_id, prior, health
+                        ),
+                        format!("{{\"artifact_id\":{}}}", observation.artifact_id)
+                    ],
+                )
+                .map_err(DatabaseError::Sqlite)?;
+        }
+        transaction.commit().map_err(DatabaseError::Sqlite)?;
+        Ok(changed)
+    }
+
     /// Reports the applied schema version.
     pub fn schema_version(&self) -> Result<u32, DatabaseError> {
         self.connection
@@ -1373,6 +1472,73 @@ pub struct AcquisitionHistoryEntry {
     pub latest_message: Option<String>,
 }
 
+/// Registered artifact selected for a local health check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactHealthCandidate {
+    /// Durable artifact ID.
+    pub id: i64,
+    /// Registered absolute media path.
+    pub path: PathBuf,
+    /// Prior exact-byte hash when known.
+    pub sha256: Option<String>,
+    /// Previously persisted health.
+    pub health: ArtifactHealth,
+}
+
+/// Constrained physical artifact health.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactHealth {
+    /// Health has not yet been reconciled.
+    Unknown,
+    /// Local bytes passed structural and integrity checks.
+    Healthy,
+    /// Registered path is absent.
+    Missing,
+    /// Local bytes contradict persisted integrity evidence or are not a regular file.
+    Corrupt,
+}
+
+impl ArtifactHealth {
+    fn parse(value: &str) -> Result<Self, DatabaseError> {
+        match value {
+            "unknown" => Ok(Self::Unknown),
+            "healthy" => Ok(Self::Healthy),
+            "missing" => Ok(Self::Missing),
+            "corrupt" => Ok(Self::Corrupt),
+            unexpected => Err(DatabaseError::InvalidArtifactHealth(unexpected.into())),
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Healthy => "healthy",
+            Self::Missing => "missing",
+            Self::Corrupt => "corrupt",
+        }
+    }
+}
+
+/// Persistable evidence from one completed artifact health check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactHealthObservation {
+    /// Durable checked artifact ID.
+    pub artifact_id: i64,
+    /// Conservatively determined health.
+    pub health: ArtifactHealth,
+    /// Exact current SHA-256 when successfully hashed.
+    pub sha256: Option<String>,
+    /// Structurally observed duration.
+    pub duration_ms: Option<i64>,
+    /// Structurally observed codec.
+    pub codec: Option<String>,
+    /// Structurally observed sample rate.
+    pub sample_rate_hz: Option<i64>,
+    /// Structurally observed channel count.
+    pub channels: Option<i64>,
+}
+
 /// Persistence initialization or migration failure.
 #[derive(Debug, Error)]
 pub enum DatabaseError {
@@ -1454,6 +1620,12 @@ pub enum DatabaseError {
     /// Validated artifact byte counts exceeded SQLite's signed integer range.
     #[error("artifact value exceeds SQLite integer range: {0}")]
     ArtifactTooLarge(u64),
+    /// An artifact ID did not exist during health persistence.
+    #[error("artifact {0} does not exist")]
+    ArtifactNotFound(i64),
+    /// Durable artifact health violated the constrained schema vocabulary.
+    #[error("invalid durable artifact health: {0}")]
+    InvalidArtifactHealth(String),
     /// Commit preparation requires a currently running acquisition.
     #[error("acquisition job is not running: {0}")]
     AcquisitionNotRunning(i64),

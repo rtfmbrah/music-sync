@@ -55,6 +55,9 @@
   runs, explicit retry is audited and attempted later, succeeded work cannot be
   released again, abandoned running recovery retains staging, and immutable history
   reports bounded newest-first provider/job failure context.
+- Artifact-health tests prove stable bounded checking, healthy/missing/hash-mismatch
+  classification, unchanged media bytes, persistent corrupt evidence, and prior
+  healthy-state preservation when probing fails.
 - Scenario tests encode removed membership, disappeared remote with healthy local
   media, transient failure, same-title fingerprint mismatch, and repeat idempotency.
 - The architecture check reads Cargo metadata and enforces CLI-to-library dependency

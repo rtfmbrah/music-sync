@@ -928,3 +928,71 @@ fn status_reports_durable_failures_without_modifying_state()
     assert!(library.read_dir()?.next().is_none());
     Ok(())
 }
+
+#[test]
+fn library_health_reports_hash_mismatch_without_modifying_media()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = tempfile::tempdir()?;
+    let state = root.path().join("state");
+    let library = root.path().join("library");
+    let playlists = root.path().join("playlists");
+    fs::create_dir_all(&state)?;
+    fs::create_dir_all(&library)?;
+    fs::create_dir_all(&playlists)?;
+    let media = library.join("track.opus");
+    fs::write(&media, b"original audio")?;
+    let config = root.path().join("music-sync.toml");
+    fs::write(
+        &config,
+        format!(
+            "state_directory = {:?}\nlibrary_directory = {:?}\nplaylist_directory = {:?}\n",
+            state, library, playlists
+        ),
+    )?;
+    let database = state.join("music-sync.sqlite3");
+    let ffprobe = root.path().join("ffprobe");
+    fs::write(
+        &ffprobe,
+        "#!/bin/sh\nprintf '%s' '{\"streams\":[{\"codec_type\":\"audio\",\"codec_name\":\"opus\"}],\"format\":{\"duration\":\"1.5\"}}'\n",
+    )?;
+    let mut permissions = fs::metadata(&ffprobe)?.permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&ffprobe, permissions)?;
+    assert!(
+        Command::new(env!("CARGO_BIN_EXE_music-sync"))
+            .args(["library", "adopt"])
+            .arg(&library)
+            .args(["--apply", "--database"])
+            .arg(&database)
+            .output()?
+            .status
+            .success()
+    );
+    let run = || {
+        Command::new(env!("CARGO_BIN_EXE_music-sync"))
+            .args(["--json", "library", "health", "--config"])
+            .arg(&config)
+            .args(["--max-artifacts", "1", "--ffprobe"])
+            .arg(&ffprobe)
+            .output()
+    };
+    let first = run()?;
+    let first_report: serde_json::Value = serde_json::from_slice(&first.stdout)?;
+    assert!(first.status.success());
+    assert_eq!(first_report["healthy"], 1);
+    assert_eq!(first_report["changed"], 1);
+
+    fs::write(&media, b"externally changed audio")?;
+    let second = run()?;
+    let second_report: serde_json::Value = serde_json::from_slice(&second.stdout)?;
+    assert!(second.status.success());
+    assert_eq!(second_report["corrupt"], 1);
+    assert_eq!(second_report["changed"], 1);
+    let repeated = run()?;
+    let repeated_report: serde_json::Value = serde_json::from_slice(&repeated.stdout)?;
+    assert!(repeated.status.success());
+    assert_eq!(repeated_report["corrupt"], 1);
+    assert_eq!(repeated_report["changed"], 0);
+    assert_eq!(fs::read(media)?, b"externally changed audio");
+    Ok(())
+}

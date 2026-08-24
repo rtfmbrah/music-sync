@@ -195,3 +195,8 @@ fail transiently and appeared in newest-first history as deferred with attempt c
 one and their persisted diagnostics. A normal following batch selected zero jobs.
 After explicit `acquisition retry 1`, a bounded batch selected and committed only
 that job; the other remained deferred. Production music remained non-writable.
+
+Bounded artifact health was validated against the isolated recovered artifact. The
+static binary reported one selected healthy artifact with no state change or failure.
+Its exact media SHA-256 was identical before and after the check, and production
+music remained non-writable.

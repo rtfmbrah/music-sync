@@ -33,7 +33,7 @@ in ad hoc TODO documents.
   acquisition; interrupted staging is retained).
 - `yt-dlp`, `ffprobe`, `ffmpeg`, hash, and `fpcalc` adapters (yt-dlp, ffprobe, and
   hash complete; ffmpeg/fpcalc planned).
-- Artifact probing and health reconciliation.
+- Artifact probing and health reconciliation (complete).
 - Conservative candidate pipeline and perceptual identity thresholds.
 - Fixture-backed unavailable/transient/provider-change scenarios.
 

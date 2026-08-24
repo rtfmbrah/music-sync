@@ -17,6 +17,13 @@ Acquisition staging can now retain a SHA-256 digest after structural audio
 validation. This proves exact artifact bytes only; it is deliberately not used as
 perceptual or canonical recording evidence.
 
+`library health` checks registered artifacts in stable bounded order without media
+mutation. Absent paths become missing; non-regular paths and exact-hash mismatch
+become corrupt. Probe, permission, and hashing failures leave prior health unchanged
+because insufficient infrastructure evidence is not corruption. Successful checks
+refresh structural properties and exact SHA-256. No health result starts replacement
+search in this phase.
+
 ## PLANNED
 
 Use `fpcalc`/Chromaprint to derive perceptual fingerprints and a documented comparison

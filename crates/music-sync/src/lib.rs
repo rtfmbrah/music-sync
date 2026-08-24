@@ -10,6 +10,7 @@ pub mod adoption;
 pub mod config;
 pub mod content_hash;
 pub mod diagnostics;
+pub mod health;
 pub mod identity;
 pub mod media_probe;
 pub mod persistence;

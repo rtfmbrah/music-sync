@@ -38,6 +38,7 @@ cargo run -p music-sync-cli -- --help
 cargo run -p music-sync-cli -- doctor --config config.example.toml
 cargo run -p music-sync-cli -- library adopt /path/to/music
 cargo run -p music-sync-cli -- library adopt /path/to/music --probe --max-probes 25
+cargo run -p music-sync-cli -- library health --max-artifacts 1000 --config music-sync.toml
 cargo run -p music-sync-cli -- source add 'https://www.youtube.com/playlist?list=…' --database state.sqlite3
 cargo run -p music-sync-cli -- source reconcile 1 --database state.sqlite3
 cargo run -p music-sync-cli -- acquisition run-one --config music-sync.toml

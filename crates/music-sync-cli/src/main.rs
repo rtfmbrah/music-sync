@@ -19,6 +19,7 @@ use music_sync::adoption::{
 use music_sync::config::AppConfig;
 use music_sync::content_hash::Sha256FileHasher;
 use music_sync::diagnostics::{CheckStatus, DoctorReport, run_doctor};
+use music_sync::health::reconcile_artifact_health;
 use music_sync::media_probe::Ffprobe;
 use music_sync::persistence::Database;
 use music_sync::playlist::{PlaylistMaterializationReport, materialize_playlists};
@@ -257,6 +258,21 @@ enum SourceCommand {
 
 #[derive(Debug, Subcommand)]
 enum LibraryCommand {
+    /// Reconcile registered artifact health without modifying media files.
+    Health {
+        /// TOML configuration containing state and library directories.
+        #[arg(short, long, default_value = "music-sync.toml")]
+        config: PathBuf,
+        /// Maximum artifacts checked in stable ID order.
+        #[arg(long, default_value = "1000")]
+        max_artifacts: NonZeroUsize,
+        /// ffprobe executable path.
+        #[arg(long, default_value = "ffprobe")]
+        ffprobe: PathBuf,
+        /// Per-artifact ffprobe deadline in seconds.
+        #[arg(long, default_value = "30")]
+        probe_timeout_seconds: NonZeroU64,
+    },
     /// Scan a library recursively without modifying any file.
     Adopt {
         /// Existing music-library directory to scan.
@@ -350,6 +366,45 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn Error>> {
             let report = run_doctor(&config);
             render_doctor(&report, cli.json)?;
             Ok(if report.is_healthy() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(1)
+            })
+        }
+        Command::Library {
+            command:
+                LibraryCommand::Health {
+                    config,
+                    max_artifacts,
+                    ffprobe,
+                    probe_timeout_seconds,
+                },
+        } => {
+            let config = AppConfig::from_file(&config)?;
+            let mut database = Database::open(&config.database_path())?;
+            let probe = Ffprobe::new(ffprobe, Duration::from_secs(probe_timeout_seconds.get()));
+            let report = reconcile_artifact_health(
+                &mut database,
+                &config.library_directory,
+                &probe,
+                &Sha256FileHasher,
+                max_artifacts.get(),
+            )?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("Artifacts selected: {}", report.selected);
+                println!("Artifacts checked:  {}", report.checked);
+                println!("Health changed:      {}", report.changed);
+                println!("Healthy:             {}", report.healthy);
+                println!("Missing:             {}", report.missing);
+                println!("Corrupt:             {}", report.corrupt);
+                println!("Check failures:      {}", report.failures.len());
+                for failure in &report.failures {
+                    println!("  Artifact {}: {}", failure.artifact_id, failure.message);
+                }
+            }
+            Ok(if report.failures.is_empty() {
                 ExitCode::SUCCESS
             } else {
                 ExitCode::from(1)

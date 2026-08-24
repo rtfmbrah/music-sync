@@ -43,6 +43,8 @@ architecture documents explain implementation boundaries.
   playlist counts and bounded newest-first warning/error diagnostics.
 - Bounded immutable acquisition history plus audited explicit retry and abandoned-run
   recovery; deferred work is never automatically retried by timer runs.
+- Bounded local artifact-health reconciliation using structural probe and exact-byte
+  evidence, with missing/corrupt state but no media mutation or replacement search.
 - Executable preservation and replacement policies plus deterministic tests.
 - Nix development shell, task runner, architecture enforcement, and CI-ready check.
 
