@@ -28,10 +28,25 @@ non-compilation Album, EP, then Single context, followed by date and MBID. Canon
 recording title, composed artist credit, selected release title, and release date are
 stored as independent selected observations.
 
+Schema version 12 adds release-artwork resolution, selected-art provenance, and
+immutable content-addressed blobs. `artwork fetch` considers only canonically selected
+MusicBrainz releases. It reads the bounded Cover Art Archive release index, selects a
+front image before other roles and approved art within a role, and prefers the current
+1200 or 500 pixel thumbnail URLs before an original image. A provider `404` becomes a
+durable unavailable result; network, provider, malformed-response, and storage errors
+are deferred independently per release.
+
+Downloaded art is limited to 20 MiB and accepted only when JPEG, PNG, or WebP magic
+bytes match. SHA-256 determines an immutable path below `artwork-cache/` in application
+state. Creation is no-clobber and an existing path must contain identical bytes.
+Selection and provider JSON are persisted only after cache validation. Repeated runs
+do no HTTP or filesystem work for resolved or unavailable releases. Artwork enrichment
+does not rewrite audio and does not place files in the library.
+
 ## PLANNED
 
-Resolve release artwork through Cover Art Archive and synchronized or plain lyrics
-through LRCLIB or another evaluated provider. Extend canonical release context with
+Resolve synchronized or plain lyrics through LRCLIB or another evaluated provider.
+Extend canonical release context with
 track/disc positions through bounded release lookup. Do not model enrichment as
 whichever provider wrote last.
 

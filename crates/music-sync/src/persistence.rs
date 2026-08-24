@@ -36,10 +36,11 @@ const MIGRATIONS: &[(u32, &str)] = &[
         11,
         include_str!("../migrations/0011_metadata_provenance.sql"),
     ),
+    (12, include_str!("../migrations/0012_release_artwork.sql")),
 ];
 
 /// Current durable schema version.
-pub const CURRENT_SCHEMA_VERSION: u32 = 11;
+pub const CURRENT_SCHEMA_VERSION: u32 = 12;
 
 /// A connection to music-sync's private application state.
 #[derive(Debug)]
@@ -203,6 +204,18 @@ impl Database {
                     "SELECT COUNT(*) FROM metadata_resolutions WHERE state = 'deferred'",
                 )?,
                 selected_fields: count("SELECT COUNT(*) FROM metadata_selections")?,
+            },
+            artwork: ArtworkResolutionCounts {
+                resolved: count(
+                    "SELECT COUNT(*) FROM artwork_resolutions WHERE state = 'resolved'",
+                )?,
+                unavailable: count(
+                    "SELECT COUNT(*) FROM artwork_resolutions WHERE state = 'unavailable'",
+                )?,
+                deferred: count(
+                    "SELECT COUNT(*) FROM artwork_resolutions WHERE state = 'deferred'",
+                )?,
+                cached_blobs: count("SELECT COUNT(*) FROM artwork_blobs")?,
             },
             playlist_outputs: count(
                 "SELECT COUNT(*) FROM playlist_outputs WHERE sha256 IS NOT NULL",
@@ -645,6 +658,124 @@ impl Database {
             release_selected: release_id.is_some(),
             observations_selected: observations,
         })
+    }
+
+    /// Loads canonically selected releases whose artwork is unresolved or deferred.
+    pub fn artwork_resolution_candidates(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<ArtworkResolutionCandidate>, DatabaseError> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT DISTINCT releases.id, releases.musicbrainz_release_id
+                 FROM releases
+                 JOIN metadata_observations ON metadata_observations.source_entity_id =
+                      releases.musicbrainz_release_id AND metadata_observations.field = 'release'
+                 JOIN metadata_selections ON metadata_selections.observation_id =
+                      metadata_observations.id
+                 LEFT JOIN artwork_resolutions ON artwork_resolutions.release_id = releases.id
+                 WHERE artwork_resolutions.release_id IS NULL
+                    OR artwork_resolutions.state = 'deferred'
+                 ORDER BY releases.id LIMIT ?1",
+            )
+            .map_err(DatabaseError::Sqlite)?;
+        statement
+            .query_map([limit], |row| {
+                Ok(ArtworkResolutionCandidate {
+                    release_id: row.get(0)?,
+                    musicbrainz_release_id: row.get(1)?,
+                })
+            })
+            .map_err(DatabaseError::Sqlite)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(DatabaseError::Sqlite)
+    }
+
+    /// Records a release with no artwork or a retryable provider failure.
+    pub fn record_artwork_resolution_state(
+        &mut self,
+        release_id: i64,
+        state: ArtworkResolutionState,
+        message: &str,
+        raw_response_json: &str,
+    ) -> Result<(), DatabaseError> {
+        if state == ArtworkResolutionState::Resolved {
+            return Err(DatabaseError::InvalidArtworkResolutionTransition);
+        }
+        self.connection
+            .execute(
+                "INSERT INTO artwork_resolutions(release_id, state, message, raw_response_json)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(release_id) DO UPDATE SET state = excluded.state,
+                     message = excluded.message, raw_response_json = excluded.raw_response_json,
+                     updated_at = CURRENT_TIMESTAMP",
+                rusqlite::params![release_id, state.as_str(), message, raw_response_json],
+            )
+            .map_err(DatabaseError::Sqlite)?;
+        Ok(())
+    }
+
+    /// Selects one validated immutable artwork blob for a canonical release.
+    pub fn record_resolved_artwork(
+        &mut self,
+        candidate: &ArtworkResolutionCandidate,
+        artwork: &ResolvedArtwork,
+        blob: &ArtworkBlob,
+        raw_response_json: &str,
+    ) -> Result<bool, DatabaseError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(DatabaseError::Sqlite)?;
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO artwork_blobs(sha256, relative_path, mime_type, byte_count)
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    blob.sha256,
+                    blob.relative_path,
+                    blob.mime_type,
+                    blob.byte_count
+                ],
+            )
+            .map_err(DatabaseError::Sqlite)?;
+        let blob_id = transaction
+            .query_row(
+                "SELECT id FROM artwork_blobs WHERE sha256 = ?1",
+                [&blob.sha256],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(DatabaseError::Sqlite)?;
+        let changed = transaction
+            .execute(
+                "INSERT OR IGNORE INTO release_artwork(release_id, blob_id, source,
+                 source_image_id, source_url, role, approved)
+                 VALUES (?1, ?2, 'cover_art_archive', ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    candidate.release_id,
+                    blob_id,
+                    artwork.source_image_id,
+                    artwork.source_url,
+                    artwork.role,
+                    artwork.approved
+                ],
+            )
+            .map_err(DatabaseError::Sqlite)?
+            > 0;
+        transaction
+            .execute(
+                "INSERT INTO artwork_resolutions(release_id, state, message, raw_response_json)
+                 VALUES (?1, 'resolved', 'release artwork cached and selected', ?2)
+                 ON CONFLICT(release_id) DO UPDATE SET state = 'resolved',
+                     message = excluded.message, raw_response_json = excluded.raw_response_json,
+                     updated_at = CURRENT_TIMESTAMP",
+                rusqlite::params![candidate.release_id, raw_response_json],
+            )
+            .map_err(DatabaseError::Sqlite)?;
+        transaction.commit().map_err(DatabaseError::Sqlite)?;
+        Ok(changed)
     }
 
     /// Loads active unhealthy original items in stable order for availability checks.
@@ -2773,6 +2904,8 @@ pub struct OperationalStatus {
     pub repair_attempts: RepairAttemptCounts,
     /// Canonical metadata resolution and selected-field counts.
     pub metadata: MetadataResolutionCounts,
+    /// Release artwork resolution and immutable-cache counts.
+    pub artwork: ArtworkResolutionCounts,
     /// Playlist outputs with committed exact-byte evidence.
     pub playlist_outputs: u64,
     /// Bounded newest-first warning/error events.
@@ -2852,6 +2985,19 @@ pub struct MetadataResolutionCounts {
     pub deferred: u64,
     /// Explicit field selections backed by provenance observations.
     pub selected_fields: u64,
+}
+
+/// Durable release-artwork and immutable-cache counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct ArtworkResolutionCounts {
+    /// Releases with selected cached art.
+    pub resolved: u64,
+    /// Releases for which the provider reported no usable art.
+    pub unavailable: u64,
+    /// Releases awaiting retry after an ordinary failure.
+    pub deferred: u64,
+    /// Unique content-addressed image blobs.
+    pub cached_blobs: u64,
 }
 
 /// One bounded persisted warning or error event.
@@ -3053,6 +3199,62 @@ pub struct MetadataPersistenceSummary {
     pub release_selected: bool,
     /// New field observations selected; repeat may be zero.
     pub observations_selected: u64,
+}
+
+/// Canonically selected release awaiting artwork resolution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtworkResolutionCandidate {
+    /// Durable release row ID.
+    pub release_id: i64,
+    /// Exact MusicBrainz release MBID.
+    pub musicbrainz_release_id: String,
+}
+
+/// Non-destructive durable artwork resolution state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtworkResolutionState {
+    /// A validated immutable blob was selected.
+    Resolved,
+    /// The provider has no usable image for this release.
+    Unavailable,
+    /// Provider or infrastructure failure requires a later retry.
+    Deferred,
+}
+
+impl ArtworkResolutionState {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Resolved => "resolved",
+            Self::Unavailable => "unavailable",
+            Self::Deferred => "deferred",
+        }
+    }
+}
+
+/// Auditable provider selection persisted for a release.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedArtwork {
+    /// Provider-owned image identity.
+    pub source_image_id: String,
+    /// Exact selected download URL.
+    pub source_url: String,
+    /// Normalized front, back, or other role.
+    pub role: String,
+    /// Provider approval flag.
+    pub approved: bool,
+}
+
+/// Validated content-addressed image committed to state storage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtworkBlob {
+    /// Lowercase hexadecimal SHA-256.
+    pub sha256: String,
+    /// State-directory-relative immutable cache path.
+    pub relative_path: String,
+    /// Magic-byte-derived media type.
+    pub mime_type: String,
+    /// Exact image length.
+    pub byte_count: i64,
 }
 
 /// Original provider object whose active recording artifact needs repair assessment.
@@ -3398,6 +3600,9 @@ pub enum DatabaseError {
     /// Metadata state-only persistence cannot claim a resolved transition.
     #[error("resolved metadata requires canonical observation persistence")]
     InvalidMetadataResolutionTransition,
+    /// Artwork state-only persistence cannot claim a resolved transition.
+    #[error("resolved artwork requires validated blob persistence")]
+    InvalidArtworkResolutionTransition,
     /// Metadata provider candidate count exceeded durable representation.
     #[error("metadata candidate count exceeds SQLite range")]
     MetadataCandidateCountTooLarge,
@@ -3947,6 +4152,35 @@ mod tests {
         assert_eq!(database.table_count("metadata_observations")?, 4);
         assert_eq!(database.table_count("metadata_selections")?, 4);
         assert!(database.metadata_resolution_candidates(10)?.is_empty());
+
+        let artwork_candidate = database.artwork_resolution_candidates(10)?.remove(0);
+        let artwork = ResolvedArtwork {
+            source_image_id: "42".into(),
+            source_url: "https://archive.org/fixture.jpg".into(),
+            role: "front".into(),
+            approved: true,
+        };
+        let blob = ArtworkBlob {
+            sha256: "ab".repeat(32),
+            relative_path: format!("artwork-cache/ab/{}.jpg", "ab".repeat(32)),
+            mime_type: "image/jpeg".into(),
+            byte_count: 123,
+        };
+        assert!(database.record_resolved_artwork(
+            &artwork_candidate,
+            &artwork,
+            &blob,
+            "{\"images\":[]}",
+        )?);
+        assert!(!database.record_resolved_artwork(
+            &artwork_candidate,
+            &artwork,
+            &blob,
+            "{\"images\":[]}",
+        )?);
+        assert!(database.artwork_resolution_candidates(10)?.is_empty());
+        assert_eq!(database.table_count("artwork_blobs")?, 1);
+        assert_eq!(database.table_count("release_artwork")?, 1);
         Ok(())
     }
 }

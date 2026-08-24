@@ -44,7 +44,7 @@ in ad hoc TODO documents.
 
 - MusicBrainz recording/artist/release resolution and field provenance (complete for
   exact recording MBID and unique ISRC lookup with deterministic release context).
-- Cover Art Archive selection and cache.
+- Cover Art Archive selection and immutable content-addressed cache (complete).
 - Synchronized/plain lyrics and adjacent-file output.
 - Source-preserving tag normalization and artwork priority.
 

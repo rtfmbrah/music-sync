@@ -16,6 +16,7 @@ use music_sync::adoption::{
     AdoptionApplyReport, AdoptionReport, HashLimit, ProbeLimit, apply_library, scan_library,
     scan_library_with_hash, scan_library_with_probe, scan_library_with_probe_and_hash,
 };
+use music_sync::artwork::{CoverArtArchive, resolve_release_artwork};
 use music_sync::config::AppConfig;
 use music_sync::content_hash::Sha256FileHasher;
 use music_sync::diagnostics::{CheckStatus, DoctorReport, run_doctor};
@@ -91,6 +92,11 @@ enum Command {
         #[command(subcommand)]
         command: MetadataCommand,
     },
+    /// Resolve and immutably cache canonical release artwork.
+    Artwork {
+        #[command(subcommand)]
+        command: ArtworkCommand,
+    },
     /// Materialize Navidrome-compatible playlists from durable collections.
     Playlist {
         #[command(subcommand)]
@@ -128,6 +134,28 @@ enum MetadataCommand {
         /// Maximum recordings attempted once in stable order.
         #[arg(long, default_value = "100")]
         max_recordings: NonZeroUsize,
+        /// Per-request HTTP deadline in seconds.
+        #[arg(long, default_value = "30")]
+        timeout_seconds: NonZeroU64,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ArtworkCommand {
+    /// Fetch a bounded set of selected releases through Cover Art Archive.
+    Fetch {
+        /// TOML configuration identifying application state.
+        #[arg(short, long, default_value = "music-sync.toml")]
+        config: PathBuf,
+        /// Meaningful HTTP User-Agent including operator contact information.
+        #[arg(long)]
+        user_agent: String,
+        /// Cover Art Archive endpoint; override only for controlled fixtures/mirrors.
+        #[arg(long, default_value = "https://coverartarchive.org")]
+        endpoint: String,
+        /// Maximum releases attempted once in stable order.
+        #[arg(long, default_value = "100")]
+        max_releases: NonZeroUsize,
         /// Per-request HTTP deadline in seconds.
         #[arg(long, default_value = "30")]
         timeout_seconds: NonZeroU64,
@@ -471,6 +499,52 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> Result<ExitCode, Box<dyn Error>> {
     match cli.command {
+        Command::Artwork {
+            command:
+                ArtworkCommand::Fetch {
+                    config,
+                    user_agent,
+                    endpoint,
+                    max_releases,
+                    timeout_seconds,
+                },
+        } => {
+            let config = AppConfig::from_file(&config)?;
+            let mut database = Database::open(&config.database_path())?;
+            let https_only = endpoint.starts_with("https://");
+            if !https_only
+                && !endpoint.starts_with("http://127.0.0.1:")
+                && !endpoint.starts_with("http://[::1]:")
+            {
+                return Err("artwork endpoint must use HTTPS or loopback HTTP".into());
+            }
+            let provider = CoverArtArchive::with_endpoint(
+                &endpoint,
+                &user_agent,
+                Duration::from_secs(timeout_seconds.get()),
+                https_only,
+            )?;
+            let report = resolve_release_artwork(
+                &mut database,
+                &provider,
+                &config.state_directory,
+                max_releases.get(),
+            )?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("Releases selected:   {}", report.selected);
+                println!("Artwork resolved:    {}", report.resolved);
+                println!("Artwork unavailable: {}", report.unavailable);
+                println!("Artwork deferred:    {}", report.deferred);
+                println!("Provider failures:   {}", report.failures.len());
+            }
+            Ok(if report.failures.is_empty() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(1)
+            })
+        }
         Command::Metadata {
             command:
                 MetadataCommand::Resolve {
@@ -762,6 +836,10 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn Error>> {
                     "Metadata fields selected:{}",
                     report.metadata.selected_fields
                 );
+                println!("Artwork resolved:        {}", report.artwork.resolved);
+                println!("Artwork unavailable:     {}", report.artwork.unavailable);
+                println!("Artwork deferred:        {}", report.artwork.deferred);
+                println!("Artwork cached blobs:    {}", report.artwork.cached_blobs);
                 println!("Playlist outputs:        {}", report.playlist_outputs);
                 println!("Recent warning/errors:   {}", report.recent_events.len());
                 for event in report.recent_events {

@@ -1221,6 +1221,115 @@ fn metadata_resolve_uses_strong_identity_and_persists_field_provenance()
 }
 
 #[test]
+fn artwork_fetch_caches_validated_front_cover_and_repeats_offline()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let root = tempfile::tempdir()?;
+    let state = root.path().join("state");
+    let library = root.path().join("library");
+    let playlists = root.path().join("playlists");
+    fs::create_dir_all(&state)?;
+    fs::create_dir_all(&library)?;
+    fs::create_dir_all(&playlists)?;
+    let config = root.path().join("music-sync.toml");
+    fs::write(
+        &config,
+        format!(
+            "state_directory = {:?}\nlibrary_directory = {:?}\nplaylist_directory = {:?}\n",
+            state, library, playlists
+        ),
+    )?;
+    let database_path = state.join("music-sync.sqlite3");
+    assert!(
+        Command::new(env!("CARGO_BIN_EXE_music-sync"))
+            .args(["source", "add", "https://youtu.be/bootstrap", "--database"])
+            .arg(&database_path)
+            .output()?
+            .status
+            .success()
+    );
+    let release_mbid = "99999999-8888-7777-6666-555555555555";
+    let connection = rusqlite::Connection::open(&database_path)?;
+    connection.execute("INSERT INTO recordings DEFAULT VALUES", [])?;
+    connection.execute(
+        "INSERT INTO releases(musicbrainz_release_id, canonical_title)
+         VALUES (?1, 'Fixture Album')",
+        [release_mbid],
+    )?;
+    connection.execute(
+        "INSERT INTO metadata_observations(recording_id, field, value, source,
+         source_entity_id, confidence_millionths, resolution_context)
+         VALUES (1, 'release', 'Fixture Album', 'musicbrainz', ?1, 1000000, 'fixture')",
+        [release_mbid],
+    )?;
+    connection.execute(
+        "INSERT INTO metadata_selections(recording_id, field, observation_id)
+         VALUES (1, 'release', 1)",
+        [],
+    )?;
+    drop(connection);
+
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let address = listener.local_addr()?;
+    let image = b"\xff\xd8\xfffixture-jpeg";
+    let index = format!(
+        "{{\"images\":[{{\"id\":42,\"image\":\"http://{address}/image.jpg\",\"front\":true,\"approved\":true}}]}}"
+    );
+    let server = std::thread::spawn(move || -> Result<(), std::io::Error> {
+        for response_body in [index.as_bytes(), image.as_slice()] {
+            let (mut stream, _) = listener.accept()?;
+            let mut request = [0_u8; 8_192];
+            let length = stream.read(&mut request)?;
+            let request = String::from_utf8_lossy(&request[..length]);
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains("user-agent: music-sync-test/0.1 (test@example.invalid)")
+            );
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                response_body.len()
+            )?;
+            stream.write_all(response_body)?;
+        }
+        Ok(())
+    });
+    let run = |endpoint: String| {
+        Command::new(env!("CARGO_BIN_EXE_music-sync"))
+            .args(["--json", "artwork", "fetch", "--config"])
+            .arg(&config)
+            .args(["--user-agent", "music-sync-test/0.1 (test@example.invalid)"])
+            .arg("--endpoint")
+            .arg(endpoint)
+            .output()
+    };
+    let first = run(format!("http://{address}"))?;
+    server.join().map_err(|_| "fixture server panicked")??;
+    let first_report: serde_json::Value = serde_json::from_slice(&first.stdout)?;
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert_eq!(first_report["resolved"], 1);
+    let second = run("http://127.0.0.1:9".into())?;
+    let second_report: serde_json::Value = serde_json::from_slice(&second.stdout)?;
+    assert!(second.status.success());
+    assert_eq!(second_report["selected"], 0);
+    let connection = rusqlite::Connection::open(&database_path)?;
+    let relative_path =
+        connection.query_row("SELECT relative_path FROM artwork_blobs", [], |row| {
+            row.get::<_, String>(0)
+        })?;
+    assert_eq!(fs::read(state.join(relative_path))?, image);
+    assert_eq!(fs::read_dir(&library)?.count(), 0);
+    Ok(())
+}
+
+#[test]
 fn library_health_reports_hash_mismatch_without_modifying_media()
 -> Result<(), Box<dyn std::error::Error>> {
     let root = tempfile::tempdir()?;

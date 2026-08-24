@@ -227,3 +227,13 @@ ordered artist credit, release, and ISRC JSON, resolved one exact MBID, and sele
 four independently provenanced fields. The immediate repeat selected zero work and
 made no provider request. Status reported one resolved recording and four selected
 fields; `/srv/music` remained non-writable.
+
+Release artwork was validated with the schema-v12 static binary and a two-request
+Cover Art Archive-compatible loopback fixture under
+`/srv/music-sync-v2-test/artwork-20260825`. An initial deliberate connection race was
+durably deferred without accepting bytes; the retry selected one canonical release,
+validated JPEG magic, and created one SHA-256-addressed immutable cache blob. An
+immediate repeat used an unreachable endpoint, selected zero work, and still
+succeeded, proving it performed no HTTP request. Status reported one resolved release
+and one cached blob. No file was written to the test library or production library,
+and `/srv/music` remained non-writable.

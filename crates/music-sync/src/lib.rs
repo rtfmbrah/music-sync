@@ -7,6 +7,7 @@
 
 pub mod acquisition;
 pub mod adoption;
+pub mod artwork;
 pub mod config;
 pub mod content_hash;
 pub mod diagnostics;
