@@ -134,6 +134,29 @@ enum PlaylistCommand {
 
 #[derive(Debug, Subcommand)]
 enum AcquisitionCommand {
+    /// Show bounded newest-first durable acquisition history without mutation.
+    History {
+        /// TOML configuration identifying the application database.
+        #[arg(short, long, default_value = "music-sync.toml")]
+        config: PathBuf,
+        /// Maximum history entries to return (1 through 1000).
+        #[arg(long, default_value = "100")]
+        limit: NonZeroUsize,
+    },
+    /// Explicitly release one deferred acquisition for a future run.
+    Retry {
+        /// Durable deferred acquisition job ID.
+        job_id: i64,
+        /// TOML configuration identifying the application database.
+        #[arg(short, long, default_value = "music-sync.toml")]
+        config: PathBuf,
+    },
+    /// Mark abandoned running acquisitions deferred after confirming no sync is active.
+    RecoverRunning {
+        /// TOML configuration identifying the application database.
+        #[arg(short, long, default_value = "music-sync.toml")]
+        config: PathBuf,
+    },
     /// Claim and process at most one pending or deferred acquisition.
     RunOne {
         /// TOML configuration containing state and managed library directories.
@@ -510,6 +533,81 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn Error>> {
                     summary.memberships_unchanged
                 );
                 println!("Acquisition jobs created: {}", summary.jobs_created);
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Acquisition {
+            command: AcquisitionCommand::History { config, limit },
+        } => {
+            if limit.get() > 1000 {
+                return Err("acquisition history limit must not exceed 1000".into());
+            }
+            let config = AppConfig::from_file(&config)?;
+            let entries =
+                Database::acquisition_history_read_only(&config.database_path(), limit.get())?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&entries)?);
+            } else if entries.is_empty() {
+                println!("No acquisition history.");
+            } else {
+                for entry in entries {
+                    println!(
+                        "Job {}  {}  attempts={}  {}:{}",
+                        entry.job_id,
+                        entry.status,
+                        entry.attempt_count,
+                        entry.provider,
+                        entry.provider_item_id
+                    );
+                    if let Some(message) = entry.latest_message {
+                        println!("  {message}");
+                    }
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Acquisition {
+            command: AcquisitionCommand::Retry { job_id, config },
+        } => {
+            if job_id <= 0 {
+                return Err("acquisition job ID must be greater than zero".into());
+            }
+            let config = AppConfig::from_file(&config)?;
+            let mut database = Database::open(&config.database_path())?;
+            let released = database.retry_deferred_acquisition(job_id)?;
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "job_id": job_id,
+                        "released": released
+                    }))?
+                );
+            } else {
+                println!("Acquisition job: {job_id}");
+                println!("Released:        {released}");
+            }
+            Ok(if released {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(1)
+            })
+        }
+        Command::Acquisition {
+            command: AcquisitionCommand::RecoverRunning { config },
+        } => {
+            let config = AppConfig::from_file(&config)?;
+            let mut database = Database::open(&config.database_path())?;
+            let recovered = database.recover_interrupted_acquisitions()?;
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "recovered": recovered
+                    }))?
+                );
+            } else {
+                println!("Running acquisitions recovered: {recovered}");
             }
             Ok(ExitCode::SUCCESS)
         }

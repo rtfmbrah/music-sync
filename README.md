@@ -45,6 +45,9 @@ cargo run -p music-sync-cli -- acquisition run-pending --max-jobs 100 --config m
 cargo run -p music-sync-cli -- playlist materialize --config music-sync.toml
 cargo run -p music-sync-cli -- sync run --max-jobs 100 --config music-sync.toml
 cargo run -p music-sync-cli -- status --config music-sync.toml
+cargo run -p music-sync-cli -- acquisition history --config music-sync.toml
+cargo run -p music-sync-cli -- acquisition retry 42 --config music-sync.toml
+cargo run -p music-sync-cli -- acquisition recover-running --config music-sync.toml
 ```
 
 The example configuration uses production-style placeholder paths and will report

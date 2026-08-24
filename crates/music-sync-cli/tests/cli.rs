@@ -395,6 +395,14 @@ fn acquisition_run_one_defers_failure_then_commits_and_becomes_idle()
     assert!(!failed.status.success());
     assert!(!library.join("youtube/video1.opus").exists());
 
+    let retry = Command::new(env!("CARGO_BIN_EXE_music-sync"))
+        .args(["--json", "acquisition", "retry", "1", "--config"])
+        .arg(&config)
+        .output()?;
+    let retry_json: serde_json::Value = serde_json::from_slice(&retry.stdout)?;
+    assert!(retry.status.success());
+    assert_eq!(retry_json["released"], true);
+
     fs::write(
         &yt_dlp,
         format!(
@@ -415,6 +423,30 @@ fn acquisition_run_one_defers_failure_then_commits_and_becomes_idle()
     let idle_json: serde_json::Value = serde_json::from_slice(&idle.stdout)?;
     assert!(idle.status.success());
     assert_eq!(idle_json["status"], "idle");
+
+    let succeeded_retry = Command::new(env!("CARGO_BIN_EXE_music-sync"))
+        .args(["--json", "acquisition", "retry", "1", "--config"])
+        .arg(&config)
+        .output()?;
+    let succeeded_retry_json: serde_json::Value = serde_json::from_slice(&succeeded_retry.stdout)?;
+    assert_eq!(succeeded_retry.status.code(), Some(1));
+    assert_eq!(succeeded_retry_json["released"], false);
+    let history = Command::new(env!("CARGO_BIN_EXE_music-sync"))
+        .args(["--json", "acquisition", "history", "--config"])
+        .arg(&config)
+        .output()?;
+    let history_json: serde_json::Value = serde_json::from_slice(&history.stdout)?;
+    assert!(history.status.success());
+    assert_eq!(history_json[0]["status"], "succeeded");
+    assert_eq!(history_json[0]["attempt_count"], 2);
+    assert!(history_json[0]["latest_message"].as_str().is_some());
+    let recover = Command::new(env!("CARGO_BIN_EXE_music-sync"))
+        .args(["--json", "acquisition", "recover-running", "--config"])
+        .arg(&config)
+        .output()?;
+    let recover_json: serde_json::Value = serde_json::from_slice(&recover.stdout)?;
+    assert!(recover.status.success());
+    assert_eq!(recover_json["recovered"], 0);
     Ok(())
 }
 
@@ -512,9 +544,19 @@ fn acquisition_run_pending_is_bounded_and_one_failure_does_not_block_others()
     let repeated = run()?;
     let repeated_json: serde_json::Value = serde_json::from_slice(&repeated.stdout)?;
     assert!(repeated.status.success());
-    assert_eq!(repeated_json["selected"], 1);
+    assert_eq!(repeated_json["selected"], 0);
     assert_eq!(repeated_json["committed"], 0);
-    assert_eq!(repeated_json["failures"].as_array().map(Vec::len), Some(1));
+    assert_eq!(repeated_json["failures"].as_array().map(Vec::len), Some(0));
+
+    let retry = Command::new(env!("CARGO_BIN_EXE_music-sync"))
+        .args(["acquisition", "retry", "2", "--config"])
+        .arg(&config)
+        .output()?;
+    assert!(retry.status.success());
+    let retried = run()?;
+    let retried_json: serde_json::Value = serde_json::from_slice(&retried.stdout)?;
+    assert_eq!(retried_json["selected"], 1);
+    assert_eq!(retried_json["failures"].as_array().map(Vec::len), Some(1));
     Ok(())
 }
 
@@ -864,6 +906,18 @@ fn status_reports_durable_failures_without_modifying_state()
     assert_eq!(report["artifacts"]["healthy"], 0);
     assert_eq!(report["recent_events"].as_array().map(Vec::len), Some(1));
     assert_eq!(report["recent_events"][0]["event"], "acquisition_deferred");
+    let history = Command::new(env!("CARGO_BIN_EXE_music-sync"))
+        .args(["--json", "acquisition", "history", "--config"])
+        .arg(&config)
+        .args(["--limit", "5"])
+        .output()?;
+    let history_report: serde_json::Value = serde_json::from_slice(&history.stdout)?;
+    assert!(history.status.success());
+    assert_eq!(history_report.as_array().map(Vec::len), Some(1));
+    assert_eq!(history_report[0]["job_id"], 1);
+    assert_eq!(history_report[0]["status"], "deferred");
+    assert_eq!(history_report[0]["attempt_count"], 1);
+    assert!(history_report[0]["latest_message"].as_str().is_some());
     assert_eq!(fs::read(&database)?, before_database);
     let mut after_entries = fs::read_dir(&state)?
         .map(|entry| entry.map(|entry| entry.file_name()))

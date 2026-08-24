@@ -95,29 +95,8 @@ impl Database {
         path: &Path,
         recent_event_limit: usize,
     ) -> Result<OperationalStatus, DatabaseError> {
-        let path_text = path
-            .to_str()
-            .ok_or_else(|| DatabaseError::NonUnicodePath(path.to_path_buf()))?;
-        let uri = format!("file:{}?immutable=1", sqlite_uri_path(path_text));
-        let connection = Connection::open_with_flags(
-            uri,
-            OpenFlags::SQLITE_OPEN_READ_ONLY
-                | OpenFlags::SQLITE_OPEN_NO_MUTEX
-                | OpenFlags::SQLITE_OPEN_URI,
-        )
-        .map_err(|source| DatabaseError::Open {
-            path: path.to_path_buf(),
-            source,
-        })?;
-        let version = connection
-            .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
-            .map_err(DatabaseError::Sqlite)?;
-        if version != CURRENT_SCHEMA_VERSION {
-            return Err(DatabaseError::StatusSchemaMismatch {
-                found: version,
-                required: CURRENT_SCHEMA_VERSION,
-            });
-        }
+        let connection = open_immutable_current_schema(path)?;
+        let version = CURRENT_SCHEMA_VERSION;
         let count = |sql: &str| {
             connection
                 .query_row(sql, [], |row| row.get::<_, u64>(0))
@@ -183,6 +162,48 @@ impl Database {
             )?,
             recent_events: events,
         })
+    }
+
+    /// Reads bounded newest-first acquisition history without mutating SQLite state.
+    pub fn acquisition_history_read_only(
+        path: &Path,
+        limit: usize,
+    ) -> Result<Vec<AcquisitionHistoryEntry>, DatabaseError> {
+        let connection = open_immutable_current_schema(path)?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut statement = connection
+            .prepare(
+                "SELECT jobs.id, jobs.status, jobs.attempt_count, jobs.created_at,
+                        jobs.updated_at, provider_items.provider,
+                        provider_items.provider_item_id, provider_items.original_url,
+                        (SELECT events.message FROM events
+                         WHERE events.job_id = jobs.id
+                           AND events.level IN ('warning', 'error')
+                         ORDER BY events.id DESC LIMIT 1)
+                 FROM jobs
+                 JOIN acquisition_jobs ON acquisition_jobs.job_id = jobs.id
+                 JOIN provider_items ON provider_items.id = acquisition_jobs.provider_item_id
+                 WHERE jobs.kind = 'acquire'
+                 ORDER BY jobs.id DESC LIMIT ?1",
+            )
+            .map_err(DatabaseError::Sqlite)?;
+        statement
+            .query_map([limit], |row| {
+                Ok(AcquisitionHistoryEntry {
+                    job_id: row.get(0)?,
+                    status: row.get(1)?,
+                    attempt_count: row.get(2)?,
+                    created_at: row.get(3)?,
+                    updated_at: row.get(4)?,
+                    provider: row.get(5)?,
+                    provider_item_id: row.get(6)?,
+                    original_url: row.get(7)?,
+                    latest_message: row.get(8)?,
+                })
+            })
+            .map_err(DatabaseError::Sqlite)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(DatabaseError::Sqlite)
     }
 
     /// Reports the applied schema version.
@@ -489,7 +510,7 @@ impl Database {
         Ok(summary)
     }
 
-    /// Atomically claims the oldest pending or deferred acquisition job.
+    /// Atomically claims the oldest explicitly pending acquisition job.
     pub fn claim_next_acquisition(&mut self) -> Result<Option<AcquisitionWork>, DatabaseError> {
         let Some(job_id) = self.runnable_acquisition_job_ids(1)?.into_iter().next() else {
             return Ok(None);
@@ -508,7 +529,7 @@ impl Database {
             .prepare(
                 "SELECT jobs.id FROM jobs
                  JOIN acquisition_jobs ON acquisition_jobs.job_id = jobs.id
-                 WHERE jobs.kind = 'acquire' AND jobs.status IN ('pending', 'deferred')
+                 WHERE jobs.kind = 'acquire' AND jobs.status = 'pending'
                  ORDER BY jobs.id LIMIT ?1",
             )
             .map_err(DatabaseError::Sqlite)?;
@@ -519,7 +540,7 @@ impl Database {
             .map_err(DatabaseError::Sqlite)
     }
 
-    /// Atomically claims one specific pending or deferred acquisition job.
+    /// Atomically claims one specific pending acquisition job.
     pub fn claim_acquisition(
         &mut self,
         job_id: i64,
@@ -537,7 +558,7 @@ impl Database {
                  JOIN acquisition_jobs ON acquisition_jobs.job_id = jobs.id
                  JOIN provider_items ON provider_items.id = acquisition_jobs.provider_item_id
                  WHERE jobs.id = ?1 AND jobs.kind = 'acquire'
-                   AND jobs.status IN ('pending', 'deferred')",
+                   AND jobs.status = 'pending'",
                 [job_id],
                 |row| {
                     Ok(AcquisitionWork {
@@ -595,14 +616,71 @@ impl Database {
 
     /// Converts abandoned running acquisitions into explicitly retryable work.
     pub fn recover_interrupted_acquisitions(&mut self) -> Result<u64, DatabaseError> {
-        self.connection
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(DatabaseError::Sqlite)?;
+        let job_ids = {
+            let mut statement = transaction
+                .prepare("SELECT id FROM jobs WHERE kind = 'acquire' AND status = 'running'")
+                .map_err(DatabaseError::Sqlite)?;
+            statement
+                .query_map([], |row| row.get::<_, i64>(0))
+                .map_err(DatabaseError::Sqlite)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(DatabaseError::Sqlite)?
+        };
+        let changed = transaction
             .execute(
                 "UPDATE jobs SET status = 'deferred', updated_at = CURRENT_TIMESTAMP
                  WHERE kind = 'acquire' AND status = 'running'",
                 [],
             )
-            .map(|changed| changed as u64)
-            .map_err(DatabaseError::Sqlite)
+            .map_err(DatabaseError::Sqlite)? as u64;
+        for job_id in job_ids {
+            transaction
+                .execute(
+                    "INSERT INTO events(run_id, job_id, level, component, event, message)
+                     SELECT run_id, id, 'warning', 'acquisition',
+                            'acquisition_interrupted_recovered',
+                            'Operator recovered abandoned running acquisition'
+                     FROM jobs WHERE id = ?1",
+                    [job_id],
+                )
+                .map_err(DatabaseError::Sqlite)?;
+        }
+        transaction.commit().map_err(DatabaseError::Sqlite)?;
+        Ok(changed)
+    }
+
+    /// Explicitly releases one deferred acquisition for a future bounded run.
+    pub fn retry_deferred_acquisition(&mut self, job_id: i64) -> Result<bool, DatabaseError> {
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(DatabaseError::Sqlite)?;
+        let changed = transaction
+            .execute(
+                "UPDATE jobs SET status = 'pending', updated_at = CURRENT_TIMESTAMP
+                 WHERE id = ?1 AND kind = 'acquire' AND status = 'deferred'",
+                [job_id],
+            )
+            .map_err(DatabaseError::Sqlite)?
+            == 1;
+        if changed {
+            transaction
+                .execute(
+                    "INSERT INTO events(run_id, job_id, level, component, event, message)
+                     SELECT run_id, id, 'info', 'acquisition',
+                            'acquisition_retry_requested',
+                            'Operator explicitly released deferred acquisition for retry'
+                     FROM jobs WHERE id = ?1",
+                    [job_id],
+                )
+                .map_err(DatabaseError::Sqlite)?;
+        }
+        transaction.commit().map_err(DatabaseError::Sqlite)?;
+        Ok(changed)
     }
 
     pub(crate) fn prepare_acquisition_commit(
@@ -998,6 +1076,33 @@ fn sqlite_uri_path(path: &str) -> String {
         })
 }
 
+fn open_immutable_current_schema(path: &Path) -> Result<Connection, DatabaseError> {
+    let path_text = path
+        .to_str()
+        .ok_or_else(|| DatabaseError::NonUnicodePath(path.to_path_buf()))?;
+    let uri = format!("file:{}?immutable=1", sqlite_uri_path(path_text));
+    let connection = Connection::open_with_flags(
+        uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .map_err(|source| DatabaseError::Open {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let version = connection
+        .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+        .map_err(DatabaseError::Sqlite)?;
+    if version != CURRENT_SCHEMA_VERSION {
+        return Err(DatabaseError::StatusSchemaMismatch {
+            found: version,
+            required: CURRENT_SCHEMA_VERSION,
+        });
+    }
+    Ok(connection)
+}
+
 fn source_collection_id(
     transaction: &Transaction<'_>,
     source_id: SourceId,
@@ -1243,6 +1348,29 @@ pub struct OperationalEvent {
     pub run_id: Option<i64>,
     /// Related durable job when present.
     pub job_id: Option<i64>,
+}
+
+/// One bounded read-only acquisition history entry.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct AcquisitionHistoryEntry {
+    /// Durable acquisition job ID.
+    pub job_id: i64,
+    /// Current constrained job state.
+    pub status: String,
+    /// Number of actual claims attempted.
+    pub attempt_count: u32,
+    /// SQLite job creation timestamp.
+    pub created_at: String,
+    /// SQLite last transition timestamp.
+    pub updated_at: String,
+    /// Provider adapter name.
+    pub provider: String,
+    /// Provider-owned item identity.
+    pub provider_item_id: String,
+    /// Auditable original provider URL.
+    pub original_url: String,
+    /// Newest persisted event message when present.
+    pub latest_message: Option<String>,
 }
 
 /// Persistence initialization or migration failure.
@@ -1544,6 +1672,9 @@ mod tests {
         assert_eq!(first.attempt, 1);
         assert!(database.defer_acquisition(first.job_id, "temporary provider failure")?);
         assert!(!database.defer_acquisition(first.job_id, "already deferred")?);
+        assert!(database.claim_acquisition(first.job_id)?.is_none());
+        assert!(database.retry_deferred_acquisition(first.job_id)?);
+        assert!(!database.retry_deferred_acquisition(first.job_id)?);
 
         let retry = database
             .claim_next_acquisition()?
@@ -1551,6 +1682,8 @@ mod tests {
         assert_eq!(retry.job_id, first.job_id);
         assert_eq!(retry.attempt, 2);
         assert_eq!(database.recover_interrupted_acquisitions()?, 1);
+        assert!(database.claim_acquisition(first.job_id)?.is_none());
+        assert!(database.retry_deferred_acquisition(first.job_id)?);
 
         let recovered = database
             .claim_next_acquisition()?
@@ -1559,7 +1692,7 @@ mod tests {
         assert_eq!(recovered.attempt, 3);
         assert!(database.defer_acquisition(recovered.job_id, "awaiting artifact validation")?);
         assert_eq!(database.table_count("acquisition_jobs")?, 2);
-        assert_eq!(database.table_count("events")?, 2);
+        assert_eq!(database.table_count("events")?, 5);
         Ok(())
     }
 

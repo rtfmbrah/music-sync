@@ -21,6 +21,11 @@ recent warning/error counts in text or JSON. It creates no WAL/shared-memory fil
 and performs no provider or managed-filesystem access. Because SQLite immutable mode
 deliberately ignores concurrent WAL changes, operators run it between oneshot sync
 invocations rather than concurrently with an active writer.
+`acquisition history` provides bounded newest-first job/provider state with attempt
+counts and the latest persisted warning/error. Deferred jobs require audited
+`acquisition retry`; ordinary timer runs leave them untouched. Explicit
+`acquisition recover-running` converts confirmed abandoned claims to deferred while
+retaining staging evidence.
 
 ## PLANNED
 
@@ -30,8 +35,8 @@ and JSON event output support systemd/non-terminal use. Persistent events includ
 timestamp, level, run/component, recording/source/job identifiers, event name,
 message, and structured decision evidence.
 
-Run/job/attempt transitions permit history, expanded failure listing, and explicitly
-safe retry commands after crashes. Candidate and discovery logs explain both scores
+Expanded run-level history and failure filtering remain planned. Candidate and
+discovery logs explain both scores
 and final decisions, for example metadata compatibility followed by fingerprint
 mismatch and rejection. This is one local application, not a distributed queue.
 

@@ -835,6 +835,7 @@ mod tests {
         );
 
         assert_eq!(database.recover_interrupted_acquisitions()?, 1);
+        assert!(database.retry_deferred_acquisition(work.job_id)?);
         let retry = database
             .claim_next_acquisition()?
             .ok_or("missing recovered work")?;

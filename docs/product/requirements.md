@@ -41,6 +41,8 @@ architecture documents explain implementation boundaries.
   acquisition, and playlist phases while isolating ordinary provider/job failures.
 - Strictly read-only operational status with durable source/membership/job/artifact/
   playlist counts and bounded newest-first warning/error diagnostics.
+- Bounded immutable acquisition history plus audited explicit retry and abandoned-run
+  recovery; deferred work is never automatically retried by timer runs.
 - Executable preservation and replacement policies plus deterministic tests.
 - Nix development shell, task runner, architecture enforcement, and CI-ready check.
 

@@ -51,6 +51,10 @@
 - Status black-box coverage creates a deferred acquisition and proves typed counts
   and its warning event are reported without changing database bytes, SQLite sidecar
   files, library files, or playlist files.
+- Acquisition transition coverage proves deferred jobs are not selected by ordinary
+  runs, explicit retry is audited and attempted later, succeeded work cannot be
+  released again, abandoned running recovery retains staging, and immutable history
+  reports bounded newest-first provider/job failure context.
 - Scenario tests encode removed membership, disappeared remote with healthy local
   media, transient failure, same-title fingerprint mismatch, and repeat idempotency.
 - The architecture check reads Cargo metadata and enforces CLI-to-library dependency

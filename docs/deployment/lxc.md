@@ -188,3 +188,10 @@ state. It reported schema 6, one active source, two resolved active memberships,
 succeeded jobs, two healthy artifacts, and one committed playlist output. The exact
 SQLite SHA-256 and the state-directory file set were identical before and after the
 command, no SQLite sidecars appeared, and `/srv/music` remained non-writable.
+
+Explicit acquisition recovery was validated on 2026-08-24 under
+`/srv/music-sync-v2-test/recovery-20260824`. Two offline acquisitions were forced to
+fail transiently and appeared in newest-first history as deferred with attempt count
+one and their persisted diagnostics. A normal following batch selected zero jobs.
+After explicit `acquisition retry 1`, a bounded batch selected and committed only
+that job; the other remained deferred. Production music remained non-writable.

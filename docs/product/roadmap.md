@@ -56,7 +56,8 @@ in ad hoc TODO documents.
 
 - Bounded `sync run` orchestration and systemd examples (complete).
 - Read-only durable operational status (complete).
-- Run/job history, expanded failure listing, retry, and expanded doctor commands.
+- Acquisition job history and explicit retry/recovery (complete).
+- Run-level history, expanded failure filtering, and expanded doctor commands.
 - Interactive and JSON progress, persistent logs, systemd examples.
 - Least-privilege LXC compatibility/deployment validation in isolated test storage.
 - Production health checks, performance measurement, and repair workflows.
