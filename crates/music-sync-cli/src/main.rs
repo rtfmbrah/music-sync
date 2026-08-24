@@ -22,6 +22,7 @@ use music_sync::content_hash::Sha256FileHasher;
 use music_sync::diagnostics::{CheckStatus, DoctorReport, run_doctor};
 use music_sync::fingerprint::{Fpcalc, reconcile_artifact_fingerprints};
 use music_sync::health::reconcile_artifact_health;
+use music_sync::lyrics::{Lrclib, resolve_lyrics};
 use music_sync::media_probe::Ffprobe;
 use music_sync::metadata::resolve_canonical_metadata;
 use music_sync::musicbrainz::MusicBrainz;
@@ -97,6 +98,11 @@ enum Command {
         #[command(subcommand)]
         command: ArtworkCommand,
     },
+    /// Resolve and materialize adjacent synchronized or plain lyrics.
+    Lyrics {
+        #[command(subcommand)]
+        command: LyricsCommand,
+    },
     /// Materialize Navidrome-compatible playlists from durable collections.
     Playlist {
         #[command(subcommand)]
@@ -156,6 +162,28 @@ enum ArtworkCommand {
         /// Maximum releases attempted once in stable order.
         #[arg(long, default_value = "100")]
         max_releases: NonZeroUsize,
+        /// Per-request HTTP deadline in seconds.
+        #[arg(long, default_value = "30")]
+        timeout_seconds: NonZeroU64,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum LyricsCommand {
+    /// Resolve a bounded set of canonical managed recordings through LRCLIB.
+    Fetch {
+        /// TOML configuration identifying application state and managed library.
+        #[arg(short, long, default_value = "music-sync.toml")]
+        config: PathBuf,
+        /// Meaningful HTTP User-Agent including operator contact information.
+        #[arg(long)]
+        user_agent: String,
+        /// LRCLIB API endpoint; override only for controlled fixtures/mirrors.
+        #[arg(long, default_value = "https://lrclib.net/api")]
+        endpoint: String,
+        /// Maximum recordings attempted once in stable order.
+        #[arg(long, default_value = "100")]
+        max_recordings: NonZeroUsize,
         /// Per-request HTTP deadline in seconds.
         #[arg(long, default_value = "30")]
         timeout_seconds: NonZeroU64,
@@ -499,6 +527,53 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> Result<ExitCode, Box<dyn Error>> {
     match cli.command {
+        Command::Lyrics {
+            command:
+                LyricsCommand::Fetch {
+                    config,
+                    user_agent,
+                    endpoint,
+                    max_recordings,
+                    timeout_seconds,
+                },
+        } => {
+            let config = AppConfig::from_file(&config)?;
+            let mut database = Database::open(&config.database_path())?;
+            let https_only = endpoint.starts_with("https://");
+            if !https_only
+                && !endpoint.starts_with("http://127.0.0.1:")
+                && !endpoint.starts_with("http://[::1]:")
+            {
+                return Err("lyrics endpoint must use HTTPS or loopback HTTP".into());
+            }
+            let provider = Lrclib::with_endpoint(
+                &endpoint,
+                &user_agent,
+                Duration::from_secs(timeout_seconds.get()),
+                if https_only {
+                    Duration::from_millis(300)
+                } else {
+                    Duration::ZERO
+                },
+                https_only,
+            )?;
+            let report = resolve_lyrics(&mut database, &provider, max_recordings.get())?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("Recordings selected: {}", report.selected);
+                println!("Lyrics resolved:     {}", report.resolved);
+                println!("Instrumental:        {}", report.instrumental);
+                println!("Lyrics unavailable:  {}", report.unavailable);
+                println!("Lyrics deferred:     {}", report.deferred);
+                println!("Sidecars committed:  {}", report.sidecars_committed);
+            }
+            Ok(if report.failures.is_empty() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(1)
+            })
+        }
         Command::Artwork {
             command:
                 ArtworkCommand::Fetch {
@@ -840,6 +915,14 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn Error>> {
                 println!("Artwork unavailable:     {}", report.artwork.unavailable);
                 println!("Artwork deferred:        {}", report.artwork.deferred);
                 println!("Artwork cached blobs:    {}", report.artwork.cached_blobs);
+                println!("Lyrics resolved:         {}", report.lyrics.resolved);
+                println!("Lyrics instrumental:     {}", report.lyrics.instrumental);
+                println!("Lyrics unavailable:      {}", report.lyrics.unavailable);
+                println!("Lyrics deferred:         {}", report.lyrics.deferred);
+                println!(
+                    "Lyrics sidecars:         {}",
+                    report.lyrics.committed_outputs
+                );
                 println!("Playlist outputs:        {}", report.playlist_outputs);
                 println!("Recent warning/errors:   {}", report.recent_events.len());
                 for event in report.recent_events {

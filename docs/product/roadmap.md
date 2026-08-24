@@ -45,7 +45,7 @@ in ad hoc TODO documents.
 - MusicBrainz recording/artist/release resolution and field provenance (complete for
   exact recording MBID and unique ISRC lookup with deterministic release context).
 - Cover Art Archive selection and immutable content-addressed cache (complete).
-- Synchronized/plain lyrics and adjacent-file output.
+- Synchronized/plain LRCLIB lyrics with crash-safe adjacent-file output (complete).
 - Source-preserving tag normalization and artwork priority.
 
 ## P4 — Autonomous discovery

@@ -37,10 +37,11 @@ const MIGRATIONS: &[(u32, &str)] = &[
         include_str!("../migrations/0011_metadata_provenance.sql"),
     ),
     (12, include_str!("../migrations/0012_release_artwork.sql")),
+    (13, include_str!("../migrations/0013_lyrics_sidecars.sql")),
 ];
 
 /// Current durable schema version.
-pub const CURRENT_SCHEMA_VERSION: u32 = 12;
+pub const CURRENT_SCHEMA_VERSION: u32 = 13;
 
 /// A connection to music-sync's private application state.
 #[derive(Debug)]
@@ -216,6 +217,23 @@ impl Database {
                     "SELECT COUNT(*) FROM artwork_resolutions WHERE state = 'deferred'",
                 )?,
                 cached_blobs: count("SELECT COUNT(*) FROM artwork_blobs")?,
+            },
+            lyrics: LyricsResolutionCounts {
+                resolved: count(
+                    "SELECT COUNT(*) FROM lyrics_resolutions WHERE state = 'resolved'",
+                )?,
+                instrumental: count(
+                    "SELECT COUNT(*) FROM lyrics_resolutions WHERE state = 'instrumental'",
+                )?,
+                unavailable: count(
+                    "SELECT COUNT(*) FROM lyrics_resolutions WHERE state = 'unavailable'",
+                )?,
+                deferred: count(
+                    "SELECT COUNT(*) FROM lyrics_resolutions WHERE state = 'deferred'",
+                )?,
+                committed_outputs: count(
+                    "SELECT COUNT(*) FROM lyrics_outputs WHERE state = 'committed'",
+                )?,
             },
             playlist_outputs: count(
                 "SELECT COUNT(*) FROM playlist_outputs WHERE sha256 IS NOT NULL",
@@ -776,6 +794,230 @@ impl Database {
             .map_err(DatabaseError::Sqlite)?;
         transaction.commit().map_err(DatabaseError::Sqlite)?;
         Ok(changed)
+    }
+
+    /// Loads managed healthy recordings needing lyrics resolution or sidecar completion.
+    pub fn lyrics_work_candidates(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<LyricsWorkCandidate>, DatabaseError> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT recordings.id, artifacts.id, artifacts.path, artifacts.duration_ms,
+                    title.value, artist.value, release.value,
+                    lyrics_observations.id, lyrics_observations.kind,
+                    lyrics_observations.content, lyrics_outputs.state
+             FROM recordings
+             JOIN artifacts ON artifacts.id = recordings.preferred_artifact_id
+             JOIN metadata_selections title_selection ON title_selection.recording_id =
+                  recordings.id AND title_selection.field = 'title'
+             JOIN metadata_observations title ON title.id = title_selection.observation_id
+             JOIN metadata_selections artist_selection ON artist_selection.recording_id =
+                  recordings.id AND artist_selection.field = 'artist_credit'
+             JOIN metadata_observations artist ON artist.id = artist_selection.observation_id
+             JOIN metadata_selections release_selection ON release_selection.recording_id =
+                  recordings.id AND release_selection.field = 'release'
+             JOIN metadata_observations release ON release.id = release_selection.observation_id
+             LEFT JOIN lyrics_selections ON lyrics_selections.recording_id = recordings.id
+             LEFT JOIN lyrics_observations ON lyrics_observations.id =
+                  lyrics_selections.observation_id
+             LEFT JOIN lyrics_resolutions ON lyrics_resolutions.recording_id = recordings.id
+             LEFT JOIN lyrics_outputs ON lyrics_outputs.recording_id = recordings.id
+             WHERE artifacts.health = 'healthy' AND artifacts.duration_ms > 0
+               AND (EXISTS (SELECT 1 FROM acquisition_commits
+                            WHERE acquisition_commits.final_path = artifacts.path
+                              AND acquisition_commits.status = 'committed')
+                    OR EXISTS (SELECT 1 FROM repair_commits
+                               WHERE repair_commits.final_path = artifacts.path
+                                 AND repair_commits.committed_at IS NOT NULL))
+               AND (lyrics_outputs.recording_id IS NULL OR lyrics_outputs.state = 'prepared')
+               AND (lyrics_selections.recording_id IS NOT NULL
+                    OR lyrics_resolutions.recording_id IS NULL
+                    OR lyrics_resolutions.state = 'deferred')
+             ORDER BY recordings.id LIMIT ?1",
+            )
+            .map_err(DatabaseError::Sqlite)?;
+        statement
+            .query_map([limit], |row| {
+                Ok(LyricsWorkCandidate {
+                    recording_id: row.get(0)?,
+                    artifact_id: row.get(1)?,
+                    artifact_path: PathBuf::from(row.get::<_, String>(2)?),
+                    duration_ms: row.get(3)?,
+                    title: row.get(4)?,
+                    artist_credit: row.get(5)?,
+                    release_title: row.get(6)?,
+                    observation_id: row.get(7)?,
+                    selected_kind: row.get(8)?,
+                    selected_content: row.get(9)?,
+                    output_prepared: row.get::<_, Option<String>>(10)?.as_deref()
+                        == Some("prepared"),
+                })
+            })
+            .map_err(DatabaseError::Sqlite)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(DatabaseError::Sqlite)
+    }
+
+    /// Records unavailable, instrumental, or retryable lyrics state without a sidecar.
+    pub fn record_lyrics_resolution_state(
+        &mut self,
+        recording_id: i64,
+        state: LyricsResolutionState,
+        message: &str,
+        raw_response_json: &str,
+    ) -> Result<(), DatabaseError> {
+        if state == LyricsResolutionState::Resolved {
+            return Err(DatabaseError::InvalidLyricsResolutionTransition);
+        }
+        self.connection
+            .execute(
+                "INSERT INTO lyrics_resolutions(recording_id, state, message, raw_response_json)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(recording_id) DO UPDATE SET state = excluded.state,
+                 message = excluded.message, raw_response_json = excluded.raw_response_json,
+                 updated_at = CURRENT_TIMESTAMP",
+                rusqlite::params![recording_id, state.as_str(), message, raw_response_json],
+            )
+            .map_err(DatabaseError::Sqlite)?;
+        Ok(())
+    }
+
+    /// Persists one validated lyrics observation and explicit selection atomically.
+    pub fn record_resolved_lyrics(
+        &mut self,
+        recording_id: i64,
+        lyrics: &ResolvedLyrics,
+    ) -> Result<i64, DatabaseError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(DatabaseError::Sqlite)?;
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO lyrics_observations(recording_id, provider,
+             provider_entity_id, kind, content, signature_json, raw_response_json)
+             VALUES (?1, 'lrclib', ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    recording_id,
+                    lyrics.provider_entity_id,
+                    lyrics.kind,
+                    lyrics.content,
+                    lyrics.signature_json,
+                    lyrics.raw_response_json
+                ],
+            )
+            .map_err(DatabaseError::Sqlite)?;
+        let observation_id = transaction
+            .query_row(
+                "SELECT id FROM lyrics_observations WHERE recording_id = ?1 AND provider =
+             'lrclib' AND provider_entity_id = ?2 AND kind = ?3",
+                rusqlite::params![recording_id, lyrics.provider_entity_id, lyrics.kind],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(DatabaseError::Sqlite)?;
+        transaction
+            .execute(
+                "INSERT INTO lyrics_selections(recording_id, observation_id) VALUES (?1, ?2)
+             ON CONFLICT(recording_id) DO UPDATE SET observation_id = excluded.observation_id,
+                 selected_at = CURRENT_TIMESTAMP",
+                rusqlite::params![recording_id, observation_id],
+            )
+            .map_err(DatabaseError::Sqlite)?;
+        transaction
+            .execute(
+                "INSERT INTO lyrics_resolutions(recording_id, state, message, raw_response_json)
+             VALUES (?1, 'resolved', 'lyrics validated and selected', ?2)
+             ON CONFLICT(recording_id) DO UPDATE SET state = 'resolved',
+                 message = excluded.message, raw_response_json = excluded.raw_response_json,
+                 updated_at = CURRENT_TIMESTAMP",
+                rusqlite::params![recording_id, lyrics.raw_response_json],
+            )
+            .map_err(DatabaseError::Sqlite)?;
+        transaction.commit().map_err(DatabaseError::Sqlite)?;
+        Ok(observation_id)
+    }
+
+    /// Persists no-clobber sidecar intent before the filesystem effect.
+    pub fn prepare_lyrics_output(
+        &mut self,
+        work: &LyricsWorkCandidate,
+        observation_id: i64,
+        path: &Path,
+        sha256: &str,
+        byte_count: i64,
+    ) -> Result<bool, DatabaseError> {
+        let path = path
+            .to_str()
+            .ok_or_else(|| DatabaseError::NonUnicodePath(path.into()))?;
+        let changed = self
+            .connection
+            .execute(
+                "INSERT OR IGNORE INTO lyrics_outputs(recording_id, observation_id, artifact_id,
+             path, sha256, byte_count, state) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'prepared')",
+                rusqlite::params![
+                    work.recording_id,
+                    observation_id,
+                    work.artifact_id,
+                    path,
+                    sha256,
+                    byte_count
+                ],
+            )
+            .map_err(DatabaseError::Sqlite)?
+            > 0;
+        if !changed {
+            let matches = self
+                .connection
+                .query_row(
+                    "SELECT observation_id = ?2 AND artifact_id = ?3 AND path = ?4 AND
+                        sha256 = ?5 AND byte_count = ?6
+                 FROM lyrics_outputs WHERE recording_id = ?1",
+                    rusqlite::params![
+                        work.recording_id,
+                        observation_id,
+                        work.artifact_id,
+                        path,
+                        sha256,
+                        byte_count
+                    ],
+                    |row| row.get::<_, bool>(0),
+                )
+                .map_err(DatabaseError::Sqlite)?;
+            if !matches {
+                return Err(DatabaseError::LyricsOutputMismatch(work.recording_id));
+            }
+        }
+        Ok(changed)
+    }
+
+    /// Marks a matching prepared sidecar as committed after exact-byte verification.
+    pub fn commit_lyrics_output(&mut self, recording_id: i64) -> Result<(), DatabaseError> {
+        let changed = self
+            .connection
+            .execute(
+                "UPDATE lyrics_outputs SET state = 'committed', committed_at = CURRENT_TIMESTAMP
+             WHERE recording_id = ?1 AND state = 'prepared'",
+                [recording_id],
+            )
+            .map_err(DatabaseError::Sqlite)?;
+        if changed == 0 {
+            let committed = self
+                .connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM lyrics_outputs WHERE recording_id = ?1
+                 AND state = 'committed')",
+                    [recording_id],
+                    |row| row.get::<_, bool>(0),
+                )
+                .map_err(DatabaseError::Sqlite)?;
+            if !committed {
+                return Err(DatabaseError::LyricsOutputNotPrepared(recording_id));
+            }
+        }
+        Ok(())
     }
 
     /// Loads active unhealthy original items in stable order for availability checks.
@@ -2906,6 +3148,8 @@ pub struct OperationalStatus {
     pub metadata: MetadataResolutionCounts,
     /// Release artwork resolution and immutable-cache counts.
     pub artwork: ArtworkResolutionCounts,
+    /// Lyrics resolution and committed adjacent-output counts.
+    pub lyrics: LyricsResolutionCounts,
     /// Playlist outputs with committed exact-byte evidence.
     pub playlist_outputs: u64,
     /// Bounded newest-first warning/error events.
@@ -2998,6 +3242,21 @@ pub struct ArtworkResolutionCounts {
     pub deferred: u64,
     /// Unique content-addressed image blobs.
     pub cached_blobs: u64,
+}
+
+/// Durable lyrics resolution and sidecar counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct LyricsResolutionCounts {
+    /// Recordings with selected text.
+    pub resolved: u64,
+    /// Recordings explicitly identified as instrumental.
+    pub instrumental: u64,
+    /// Recordings without provider lyrics.
+    pub unavailable: u64,
+    /// Recordings awaiting retry.
+    pub deferred: u64,
+    /// Atomically committed owned adjacent sidecars.
+    pub committed_outputs: u64,
 }
 
 /// One bounded persisted warning or error event.
@@ -3255,6 +3514,72 @@ pub struct ArtworkBlob {
     pub mime_type: String,
     /// Exact image length.
     pub byte_count: i64,
+}
+
+/// Managed recording ready for lyrics lookup or prepared-output recovery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LyricsWorkCandidate {
+    /// Durable recording row.
+    pub recording_id: i64,
+    /// Preferred healthy managed artifact.
+    pub artifact_id: i64,
+    /// Absolute audio path.
+    pub artifact_path: PathBuf,
+    /// Structurally probed audio duration.
+    pub duration_ms: i64,
+    /// Selected canonical title.
+    pub title: String,
+    /// Selected canonical artist credit.
+    pub artist_credit: String,
+    /// Selected canonical release title.
+    pub release_title: String,
+    /// Existing selected lyrics observation, when resolution already succeeded.
+    pub observation_id: Option<i64>,
+    /// Existing selected synchronized/plain kind.
+    pub selected_kind: Option<String>,
+    /// Existing selected content.
+    pub selected_content: Option<String>,
+    /// Whether durable output intent predates this run.
+    pub output_prepared: bool,
+}
+
+/// Non-destructive durable lyrics resolution state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LyricsResolutionState {
+    /// Validated text selected.
+    Resolved,
+    /// Provider-confirmed instrumental.
+    Instrumental,
+    /// No current provider record.
+    Unavailable,
+    /// Retryable failure.
+    Deferred,
+}
+
+impl LyricsResolutionState {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Resolved => "resolved",
+            Self::Instrumental => "instrumental",
+            Self::Unavailable => "unavailable",
+            Self::Deferred => "deferred",
+        }
+    }
+}
+
+/// Validated provider lyrics and complete provenance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedLyrics {
+    /// LRCLIB record ID.
+    pub provider_entity_id: String,
+    /// `synchronized` or `plain`.
+    pub kind: String,
+    /// Validated nonempty lyrics text.
+    pub content: String,
+    /// Exact canonical request signature JSON.
+    pub signature_json: String,
+    /// Exact bounded response JSON.
+    pub raw_response_json: String,
 }
 
 /// Original provider object whose active recording artifact needs repair assessment.
@@ -3603,6 +3928,15 @@ pub enum DatabaseError {
     /// Artwork state-only persistence cannot claim a resolved transition.
     #[error("resolved artwork requires validated blob persistence")]
     InvalidArtworkResolutionTransition,
+    /// Lyrics state-only persistence cannot claim a resolved transition.
+    #[error("resolved lyrics require validated observation persistence")]
+    InvalidLyricsResolutionTransition,
+    /// Repeated sidecar preparation contradicted durable intent.
+    #[error("prepared lyrics output does not match recording {0}")]
+    LyricsOutputMismatch(i64),
+    /// Sidecar finalization requires matching prepared intent.
+    #[error("lyrics output is not prepared for recording {0}")]
+    LyricsOutputNotPrepared(i64),
     /// Metadata provider candidate count exceeded durable representation.
     #[error("metadata candidate count exceeds SQLite range")]
     MetadataCandidateCountTooLarge,
@@ -4152,6 +4486,7 @@ mod tests {
         assert_eq!(database.table_count("metadata_observations")?, 4);
         assert_eq!(database.table_count("metadata_selections")?, 4);
         assert!(database.metadata_resolution_candidates(10)?.is_empty());
+        assert!(database.lyrics_work_candidates(10)?.is_empty());
 
         let artwork_candidate = database.artwork_resolution_candidates(10)?.remove(0);
         let artwork = ResolvedArtwork {

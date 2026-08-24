@@ -43,9 +43,22 @@ Selection and provider JSON are persisted only after cache validation. Repeated 
 do no HTTP or filesystem work for resolved or unavailable releases. Artwork enrichment
 does not rewrite audio and does not place files in the library.
 
+Schema version 13 and `lyrics fetch` resolve exact canonical title, artist-credit,
+release, and probed-duration signatures sequentially through LRCLIB. The adapter
+requires an identifying User-Agent, uses a 2 MiB response limit and explicit deadline,
+and treats 404, instrumental, and retryable failures as distinct durable states.
+Returned title, artist, album, and duration must match independently before text is
+accepted. Synchronized lyrics outrank plain text; synchronized content must contain a
+timestamp and all text is NUL-free and bounded.
+
+Adjacent `.lrc` output is restricted to healthy preferred artifacts proven owned by
+a committed acquisition or repair. Adopted files are never mutated. Output intent is
+prepared in SQLite before a same-filesystem no-clobber commit, enabling exact-byte
+crash recovery. Unknown existing sidecars and contradictory prepared bytes are
+preserved and deferred. Repeated committed runs perform no provider or file work.
+
 ## PLANNED
 
-Resolve synchronized or plain lyrics through LRCLIB or another evaluated provider.
 Extend canonical release context with
 track/disc positions through bounded release lookup. Do not model enrichment as
 whichever provider wrote last.

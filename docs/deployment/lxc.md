@@ -237,3 +237,12 @@ immediate repeat used an unreachable endpoint, selected zero work, and still
 succeeded, proving it performed no HTTP request. Status reported one resolved release
 and one cached blob. No file was written to the test library or production library,
 and `/srv/music` remained non-writable.
+
+Lyrics enrichment was validated with the schema-v13 static binary and an LRCLIB-
+compatible loopback fixture under `/srv/music-sync-v2-test/lyrics-20260825`. One
+healthy artifact proven owned by a committed acquisition used selected canonical
+title, artist credit, release, and probed duration. Synchronized lyrics outranked the
+plain response and were atomically committed as an adjacent `.lrc`; the audio bytes
+remained unchanged. An immediate repeat used an unreachable endpoint, selected zero
+work, and succeeded without HTTP. Status reported one resolved recording and one
+committed sidecar. `/srv/music` remained non-writable.

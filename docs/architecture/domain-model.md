@@ -72,12 +72,18 @@ plus append/idempotent field observations, explicit selections, and durable
 resolved/ambiguous/deferred state. Fixed-point confidence and resolution context are
 stored per field; source provider payloads remain separate.
 
+Schema version 12 stores canonical release-artwork resolution, selected provider
+provenance, and immutable SHA-256-addressed blobs in application state.
+
+Schema version 13 stores lyrics observations, explicit selection, resolution state,
+and prepared/committed adjacent-output intent. Automatic sidecars are limited to
+healthy artifacts proven owned by a committed acquisition or repair. Adopted media
+remains read-only.
+
 ## PLANNED
 
-Add artists, releases, external fingerprint/canonical resolutions, metadata
-values/provenance, artwork, lyrics,
-acquisition candidates/attempts, discovery seeds/candidates, and job attempts when a
-real workflow requires each concept. A recording can belong to several releases; a
+Add discovery seeds/candidates and expanded job attempts when a real workflow
+requires each concept. A recording can belong to several releases; a
 single preferred artifact can satisfy multiple provider items and memberships.
 
 Metadata fields carry source, confidence, and resolution context rather than a

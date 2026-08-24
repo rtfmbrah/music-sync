@@ -1330,6 +1330,122 @@ fn artwork_fetch_caches_validated_front_cover_and_repeats_offline()
 }
 
 #[test]
+fn lyrics_fetch_writes_owned_adjacent_sidecar_and_repeats_offline()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let root = tempfile::tempdir()?;
+    let state = root.path().join("state");
+    let library = root.path().join("library");
+    let playlists = root.path().join("playlists");
+    fs::create_dir_all(&state)?;
+    fs::create_dir_all(&library)?;
+    fs::create_dir_all(&playlists)?;
+    let audio = library.join("track.opus");
+    fs::write(&audio, b"owned audio")?;
+    let config = root.path().join("music-sync.toml");
+    fs::write(
+        &config,
+        format!(
+            "state_directory = {:?}\nlibrary_directory = {:?}\nplaylist_directory = {:?}\n",
+            state, library, playlists
+        ),
+    )?;
+    let database = state.join("music-sync.sqlite3");
+    assert!(
+        Command::new(env!("CARGO_BIN_EXE_music-sync"))
+            .args(["source", "add", "https://youtu.be/bootstrap", "--database"])
+            .arg(&database)
+            .output()?
+            .status
+            .success()
+    );
+    let connection = rusqlite::Connection::open(&database)?;
+    connection.execute("INSERT INTO recordings DEFAULT VALUES", [])?;
+    connection.execute("INSERT INTO artifacts(recording_id,path,duration_ms,health) VALUES (1,?1,180000,'healthy')", [audio.to_str().ok_or("path")?])?;
+    connection.execute(
+        "UPDATE recordings SET preferred_artifact_id=1 WHERE id=1",
+        [],
+    )?;
+    connection.execute("INSERT INTO provider_items(provider,provider_item_id,original_url,recording_id) VALUES ('youtube','fixture','https://youtu.be/fixture',1)", [])?;
+    connection.execute(
+        "INSERT INTO sync_runs(status,finished_at) VALUES ('succeeded',CURRENT_TIMESTAMP)",
+        [],
+    )?;
+    connection.execute("INSERT INTO jobs(run_id,kind,status,idempotency_key) VALUES (1,'acquire','succeeded','acquire:youtube:fixture')", [])?;
+    connection.execute(
+        "INSERT INTO acquisition_jobs(job_id,provider_item_id) VALUES (1,1)",
+        [],
+    )?;
+    connection.execute("INSERT INTO acquisition_commits(job_id,staged_path,final_path,sha256,bytes,codec,duration_ms,status,committed_at) VALUES (1,'/tmp/staged',?1,?2,11,'opus',180000,'committed',CURRENT_TIMESTAMP)", rusqlite::params![audio.to_str().ok_or("path")?, "00".repeat(32)])?;
+    for (field, value) in [
+        ("title", "Fixture Track"),
+        ("artist_credit", "Fixture Artist"),
+        ("release", "Fixture Album"),
+    ] {
+        connection.execute("INSERT INTO metadata_observations(recording_id,field,value,source,source_entity_id,confidence_millionths,resolution_context) VALUES (1,?1,?2,'musicbrainz','fixture',1000000,'fixture')", [field,value])?;
+        let id = connection.last_insert_rowid();
+        connection.execute(
+            "INSERT INTO metadata_selections(recording_id,field,observation_id) VALUES (1,?1,?2)",
+            rusqlite::params![field, id],
+        )?;
+    }
+    drop(connection);
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let address = listener.local_addr()?;
+    let server = std::thread::spawn(move || -> Result<(), std::io::Error> {
+        let (mut stream, _) = listener.accept()?;
+        let mut request = [0_u8; 8192];
+        let length = stream.read(&mut request)?;
+        let request = String::from_utf8_lossy(&request[..length]);
+        assert!(request.starts_with("GET /api/get?"));
+        assert!(request.contains("duration=180"));
+        let body = r#"{"id":42,"trackName":"Fixture Track","artistName":"Fixture Artist","albumName":"Fixture Album","duration":180.0,"instrumental":false,"plainLyrics":"Plain line","syncedLyrics":"[00:01.20] Synced line"}"#;
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )?;
+        Ok(())
+    });
+    let run = |endpoint: String| {
+        Command::new(env!("CARGO_BIN_EXE_music-sync"))
+            .args(["--json", "lyrics", "fetch", "--config"])
+            .arg(&config)
+            .args([
+                "--user-agent",
+                "music-sync-test/0.1 (test@example.invalid)",
+                "--endpoint",
+            ])
+            .arg(endpoint)
+            .output()
+    };
+    let first = run(format!("http://{address}/api"))?;
+    server.join().map_err(|_| "server")??;
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&first.stdout)?;
+    assert_eq!(report["sidecars_committed"], 1);
+    assert_eq!(
+        fs::read(library.join("track.lrc"))?,
+        b"[00:01.20] Synced line\n"
+    );
+    let repeat = run("http://127.0.0.1:9/api".into())?;
+    assert!(repeat.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&repeat.stdout)?["selected"],
+        0
+    );
+    assert_eq!(fs::read(&audio)?, b"owned audio");
+    Ok(())
+}
+
+#[test]
 fn library_health_reports_hash_mismatch_without_modifying_media()
 -> Result<(), Box<dyn std::error::Error>> {
     let root = tempfile::tempdir()?;
