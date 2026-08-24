@@ -42,7 +42,8 @@ in ad hoc TODO documents.
 
 ## P3 — Metadata enrichment
 
-- MusicBrainz recording/release resolution and field provenance.
+- MusicBrainz recording/artist/release resolution and field provenance (complete for
+  exact recording MBID and unique ISRC lookup with deterministic release context).
 - Cover Art Archive selection and cache.
 - Synchronized/plain lyrics and adjacent-file output.
 - Source-preserving tag normalization and artwork priority.

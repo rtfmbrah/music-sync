@@ -14,6 +14,8 @@ pub mod fingerprint;
 pub mod health;
 pub mod identity;
 pub mod media_probe;
+pub mod metadata;
+pub mod musicbrainz;
 pub mod persistence;
 pub mod playlist;
 pub mod preservation;

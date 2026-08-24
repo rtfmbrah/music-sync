@@ -1,0 +1,15 @@
+{
+  "isrc": "USABC2412345",
+  "recordings": [
+    {
+      "id": "f59c5520-5f46-4d2c-b2c4-822eabf53419",
+      "title": "Fixture Track",
+      "isrcs": ["USABC2412345"]
+    },
+    {
+      "id": "00000000-1111-2222-3333-444444444444",
+      "title": "Fixture Track (Live)",
+      "isrcs": ["USABC2412345"]
+    }
+  ]
+}

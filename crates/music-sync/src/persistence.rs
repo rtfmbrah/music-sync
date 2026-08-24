@@ -8,6 +8,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, Transactio
 use thiserror::Error;
 
 use crate::acquisition::ValidatedStagedMedia;
+use crate::musicbrainz::{CanonicalRecording, CanonicalRelease};
 use crate::provider::SourceSnapshot;
 use crate::provider::{AddSourceResult, ConfiguredSource, SourceId};
 
@@ -31,10 +32,14 @@ const MIGRATIONS: &[(u32, &str)] = &[
         10,
         include_str!("../migrations/0010_acquisition_canonical_evidence.sql"),
     ),
+    (
+        11,
+        include_str!("../migrations/0011_metadata_provenance.sql"),
+    ),
 ];
 
 /// Current durable schema version.
-pub const CURRENT_SCHEMA_VERSION: u32 = 10;
+pub const CURRENT_SCHEMA_VERSION: u32 = 11;
 
 /// A connection to music-sync's private application state.
 #[derive(Debug)]
@@ -183,6 +188,21 @@ impl Database {
                 )?,
                 verified: count("SELECT COUNT(*) FROM repair_attempts WHERE state = 'verified'")?,
                 committed: count("SELECT COUNT(*) FROM repair_attempts WHERE state = 'committed'")?,
+            },
+            metadata: MetadataResolutionCounts {
+                pending: count(
+                    "SELECT COUNT(*) FROM metadata_resolutions WHERE state = 'pending'",
+                )?,
+                resolved: count(
+                    "SELECT COUNT(*) FROM metadata_resolutions WHERE state = 'resolved'",
+                )?,
+                ambiguous: count(
+                    "SELECT COUNT(*) FROM metadata_resolutions WHERE state = 'ambiguous'",
+                )?,
+                deferred: count(
+                    "SELECT COUNT(*) FROM metadata_resolutions WHERE state = 'deferred'",
+                )?,
+                selected_fields: count("SELECT COUNT(*) FROM metadata_selections")?,
             },
             playlist_outputs: count(
                 "SELECT COUNT(*) FROM playlist_outputs WHERE sha256 IS NOT NULL",
@@ -353,6 +373,278 @@ impl Database {
             )
             .map_err(DatabaseError::Sqlite)?;
         Ok(true)
+    }
+
+    /// Loads stable healthy recordings with strong identity but no resolved metadata.
+    pub fn metadata_resolution_candidates(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<MetadataResolutionCandidate>, DatabaseError> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT recordings.id, recordings.musicbrainz_recording_id, recordings.isrc
+             FROM recordings
+             JOIN artifacts ON artifacts.id = recordings.preferred_artifact_id
+             LEFT JOIN metadata_resolutions ON metadata_resolutions.recording_id = recordings.id
+             WHERE artifacts.health = 'healthy'
+               AND (recordings.musicbrainz_recording_id IS NOT NULL OR recordings.isrc IS NOT NULL)
+               AND (metadata_resolutions.recording_id IS NULL
+                    OR metadata_resolutions.state IN ('pending', 'deferred'))
+             ORDER BY recordings.id LIMIT ?1",
+            )
+            .map_err(DatabaseError::Sqlite)?;
+        statement
+            .query_map([limit], |row| {
+                Ok(MetadataResolutionCandidate {
+                    recording_id: row.get(0)?,
+                    musicbrainz_recording_id: row.get(1)?,
+                    isrc: row.get(2)?,
+                })
+            })
+            .map_err(DatabaseError::Sqlite)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(DatabaseError::Sqlite)
+    }
+
+    /// Records an ambiguous or retryable canonical resolution without changing metadata.
+    pub fn record_metadata_resolution_state(
+        &mut self,
+        recording_id: i64,
+        state: MetadataResolutionState,
+        method: MetadataResolutionMethod,
+        candidate_count: usize,
+        message: &str,
+        raw_response_json: &str,
+    ) -> Result<(), DatabaseError> {
+        if state == MetadataResolutionState::Resolved {
+            return Err(DatabaseError::InvalidMetadataResolutionTransition);
+        }
+        let candidate_count = i64::try_from(candidate_count)
+            .map_err(|_| DatabaseError::MetadataCandidateCountTooLarge)?;
+        self.connection
+            .execute(
+                "INSERT INTO metadata_resolutions(recording_id, state, method,
+                 candidate_count, message, raw_response_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(recording_id) DO UPDATE SET state = excluded.state,
+                 method = excluded.method, candidate_count = excluded.candidate_count,
+                 message = excluded.message, raw_response_json = excluded.raw_response_json,
+                 updated_at = CURRENT_TIMESTAMP",
+                rusqlite::params![
+                    recording_id,
+                    state.as_str(),
+                    method.as_str(),
+                    candidate_count,
+                    message,
+                    raw_response_json
+                ],
+            )
+            .map_err(DatabaseError::Sqlite)?;
+        Ok(())
+    }
+
+    /// Persists one unambiguous MusicBrainz recording and field-level provenance atomically.
+    pub fn record_resolved_metadata(
+        &mut self,
+        candidate: &MetadataResolutionCandidate,
+        method: MetadataResolutionMethod,
+        recording: &CanonicalRecording,
+        selected_release: Option<&CanonicalRelease>,
+        raw_response_json: &str,
+    ) -> Result<MetadataPersistenceSummary, DatabaseError> {
+        if candidate
+            .musicbrainz_recording_id
+            .as_deref()
+            .is_some_and(|id| id != recording.id)
+            || (method == MetadataResolutionMethod::Isrc
+                && candidate
+                    .isrc
+                    .as_ref()
+                    .is_some_and(|isrc| !recording.isrcs.contains(isrc)))
+        {
+            return Err(DatabaseError::MetadataIdentityConflict(
+                candidate.recording_id,
+            ));
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(DatabaseError::Sqlite)?;
+        let exists = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM recordings WHERE id = ?1)",
+                [candidate.recording_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(DatabaseError::Sqlite)?;
+        if !exists {
+            return Err(DatabaseError::RecordingNotFound(candidate.recording_id));
+        }
+        transaction
+            .execute(
+                "UPDATE recordings SET musicbrainz_recording_id = COALESCE(
+                 musicbrainz_recording_id, ?2) WHERE id = ?1",
+                rusqlite::params![candidate.recording_id, recording.id],
+            )
+            .map_err(DatabaseError::Sqlite)?;
+        transaction
+            .execute(
+                "DELETE FROM recording_artist_credits WHERE recording_id = ?1",
+                [candidate.recording_id],
+            )
+            .map_err(DatabaseError::Sqlite)?;
+        for (position, credit) in recording.artist_credit.iter().enumerate() {
+            transaction
+                .execute(
+                    "INSERT INTO artists(musicbrainz_artist_id, canonical_name, sort_name,
+                     disambiguation) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(musicbrainz_artist_id) DO UPDATE SET
+                     canonical_name = excluded.canonical_name,
+                     sort_name = excluded.sort_name,
+                     disambiguation = excluded.disambiguation,
+                     updated_at = CURRENT_TIMESTAMP",
+                    rusqlite::params![
+                        credit.artist_id,
+                        credit.artist_name,
+                        credit.sort_name,
+                        credit.disambiguation
+                    ],
+                )
+                .map_err(DatabaseError::Sqlite)?;
+            let artist_id = transaction
+                .query_row(
+                    "SELECT id FROM artists WHERE musicbrainz_artist_id = ?1",
+                    [&credit.artist_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(DatabaseError::Sqlite)?;
+            transaction
+                .execute(
+                    "INSERT INTO recording_artist_credits(recording_id, position, artist_id,
+                     credited_name, join_phrase) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![
+                        candidate.recording_id,
+                        position as i64,
+                        artist_id,
+                        credit.credited_name,
+                        credit.join_phrase
+                    ],
+                )
+                .map_err(DatabaseError::Sqlite)?;
+        }
+        let release_id = if let Some(release) = selected_release {
+            let secondary_types_json =
+                serde_json::to_string(&release.secondary_types).map_err(DatabaseError::Json)?;
+            transaction
+                .execute(
+                    "INSERT INTO releases(musicbrainz_release_id, release_group_id,
+                     canonical_title, release_date, country, status, primary_type,
+                     secondary_types_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(musicbrainz_release_id) DO UPDATE SET
+                     release_group_id = excluded.release_group_id,
+                     canonical_title = excluded.canonical_title,
+                     release_date = excluded.release_date, country = excluded.country,
+                     status = excluded.status, primary_type = excluded.primary_type,
+                     secondary_types_json = excluded.secondary_types_json,
+                     updated_at = CURRENT_TIMESTAMP",
+                    rusqlite::params![
+                        release.id,
+                        release.release_group_id,
+                        release.title,
+                        release.date,
+                        release.country,
+                        release.status,
+                        release.primary_type,
+                        secondary_types_json
+                    ],
+                )
+                .map_err(DatabaseError::Sqlite)?;
+            let release_id = transaction
+                .query_row(
+                    "SELECT id FROM releases WHERE musicbrainz_release_id = ?1",
+                    [&release.id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(DatabaseError::Sqlite)?;
+            transaction
+                .execute(
+                    "INSERT OR IGNORE INTO recording_releases(recording_id, release_id)
+                 VALUES (?1, ?2)",
+                    rusqlite::params![candidate.recording_id, release_id],
+                )
+                .map_err(DatabaseError::Sqlite)?;
+            Some(release_id)
+        } else {
+            None
+        };
+        let context = match method {
+            MetadataResolutionMethod::RecordingMbid => "exact MusicBrainz recording MBID lookup",
+            MetadataResolutionMethod::Isrc => "unique MusicBrainz recording for normalized ISRC",
+        };
+        let mut observations = 0_u64;
+        observations += upsert_metadata_selection(
+            &transaction,
+            candidate.recording_id,
+            "title",
+            &recording.title,
+            &recording.id,
+            context,
+        )?;
+        let artist_credit = recording
+            .artist_credit
+            .iter()
+            .map(|credit| format!("{}{}", credit.credited_name, credit.join_phrase))
+            .collect::<String>();
+        if !artist_credit.is_empty() {
+            observations += upsert_metadata_selection(
+                &transaction,
+                candidate.recording_id,
+                "artist_credit",
+                &artist_credit,
+                &recording.id,
+                context,
+            )?;
+        }
+        if let Some(release) = selected_release {
+            observations += upsert_metadata_selection(
+                &transaction,
+                candidate.recording_id,
+                "release",
+                &release.title,
+                &release.id,
+                context,
+            )?;
+            if let Some(date) = &release.date {
+                observations += upsert_metadata_selection(
+                    &transaction,
+                    candidate.recording_id,
+                    "release_date",
+                    date,
+                    &release.id,
+                    context,
+                )?;
+            }
+        }
+        transaction
+            .execute(
+                "INSERT INTO metadata_resolutions(recording_id, state, method,
+                 candidate_count, message, raw_response_json)
+             VALUES (?1, 'resolved', ?2, 1, 'canonical metadata resolved', ?3)
+             ON CONFLICT(recording_id) DO UPDATE SET state = 'resolved',
+                 method = excluded.method, candidate_count = 1,
+                 message = excluded.message, raw_response_json = excluded.raw_response_json,
+                 updated_at = CURRENT_TIMESTAMP",
+                rusqlite::params![candidate.recording_id, method.as_str(), raw_response_json],
+            )
+            .map_err(DatabaseError::Sqlite)?;
+        transaction.commit().map_err(DatabaseError::Sqlite)?;
+        Ok(MetadataPersistenceSummary {
+            artists: recording.artist_credit.len() as u64,
+            release_selected: release_id.is_some(),
+            observations_selected: observations,
+        })
     }
 
     /// Loads active unhealthy original items in stable order for availability checks.
@@ -2240,6 +2532,47 @@ fn open_immutable_current_schema(path: &Path) -> Result<Connection, DatabaseErro
     Ok(connection)
 }
 
+fn upsert_metadata_selection(
+    transaction: &Transaction<'_>,
+    recording_id: i64,
+    field: &str,
+    value: &str,
+    source_entity_id: &str,
+    resolution_context: &str,
+) -> Result<u64, DatabaseError> {
+    let inserted = transaction
+        .execute(
+            "INSERT OR IGNORE INTO metadata_observations(recording_id, field, value,
+             source, source_entity_id, confidence_millionths, resolution_context)
+         VALUES (?1, ?2, ?3, 'musicbrainz', ?4, 1000000, ?5)",
+            rusqlite::params![
+                recording_id,
+                field,
+                value,
+                source_entity_id,
+                resolution_context
+            ],
+        )
+        .map_err(DatabaseError::Sqlite)? as u64;
+    let observation_id = transaction
+        .query_row(
+            "SELECT id FROM metadata_observations WHERE recording_id = ?1 AND field = ?2
+         AND source = 'musicbrainz' AND source_entity_id = ?3 AND value = ?4",
+            rusqlite::params![recording_id, field, source_entity_id, value],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(DatabaseError::Sqlite)?;
+    transaction
+        .execute(
+            "INSERT INTO metadata_selections(recording_id, field, observation_id)
+         VALUES (?1, ?2, ?3) ON CONFLICT(recording_id, field) DO UPDATE SET
+             observation_id = excluded.observation_id, selected_at = CURRENT_TIMESTAMP",
+            rusqlite::params![recording_id, field, observation_id],
+        )
+        .map_err(DatabaseError::Sqlite)?;
+    Ok(inserted)
+}
+
 fn source_collection_id(
     transaction: &Transaction<'_>,
     source_id: SourceId,
@@ -2438,6 +2771,8 @@ pub struct OperationalStatus {
     pub repairs: RepairCaseCounts,
     /// Repair candidate attempts grouped by their constrained state.
     pub repair_attempts: RepairAttemptCounts,
+    /// Canonical metadata resolution and selected-field counts.
+    pub metadata: MetadataResolutionCounts,
     /// Playlist outputs with committed exact-byte evidence.
     pub playlist_outputs: u64,
     /// Bounded newest-first warning/error events.
@@ -2502,6 +2837,21 @@ pub struct RepairAttemptCounts {
     pub verified: u64,
     /// Verified candidates committed as healthy preferred artifacts.
     pub committed: u64,
+}
+
+/// Durable canonical metadata resolution counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct MetadataResolutionCounts {
+    /// Explicitly pending recording resolutions.
+    pub pending: u64,
+    /// Unambiguously resolved recordings.
+    pub resolved: u64,
+    /// Strong identifiers with ambiguous provider results.
+    pub ambiguous: u64,
+    /// Retryable provider failures.
+    pub deferred: u64,
+    /// Explicit field selections backed by provenance observations.
+    pub selected_fields: u64,
 }
 
 /// One bounded persisted warning or error event.
@@ -2639,6 +2989,70 @@ pub struct ArtifactFingerprintEvidence {
     pub fingerprint_json: String,
     /// Number of raw values.
     pub value_count: i64,
+}
+
+/// Healthy recording with strong identity selected for canonical metadata lookup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetadataResolutionCandidate {
+    /// Durable canonical recording row.
+    pub recording_id: i64,
+    /// Exact MusicBrainz recording ID when already known.
+    pub musicbrainz_recording_id: Option<String>,
+    /// Normalized embedded ISRC fallback when MBID is absent.
+    pub isrc: Option<String>,
+}
+
+/// Strong lookup method used for one durable resolution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetadataResolutionMethod {
+    /// Exact recording MBID lookup.
+    RecordingMbid,
+    /// Unique recording returned for normalized ISRC.
+    Isrc,
+}
+
+impl MetadataResolutionMethod {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::RecordingMbid => "recording_mbid",
+            Self::Isrc => "isrc",
+        }
+    }
+}
+
+/// Non-destructive durable canonical resolution state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetadataResolutionState {
+    /// Awaiting a provider result.
+    Pending,
+    /// Canonical metadata was selected transactionally.
+    Resolved,
+    /// Strong identifier mapped to multiple recordings.
+    Ambiguous,
+    /// Provider or infrastructure failure requires a later explicit retry.
+    Deferred,
+}
+
+impl MetadataResolutionState {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Resolved => "resolved",
+            Self::Ambiguous => "ambiguous",
+            Self::Deferred => "deferred",
+        }
+    }
+}
+
+/// Transactional canonical metadata persistence effects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct MetadataPersistenceSummary {
+    /// Ordered artist-credit components persisted.
+    pub artists: u64,
+    /// Whether one deterministic release was selected.
+    pub release_selected: bool,
+    /// New field observations selected; repeat may be zero.
+    pub observations_selected: u64,
 }
 
 /// Original provider object whose active recording artifact needs repair assessment.
@@ -2981,6 +3395,18 @@ pub enum DatabaseError {
         /// Provider-owned candidate identity.
         provider_item_id: String,
     },
+    /// Metadata state-only persistence cannot claim a resolved transition.
+    #[error("resolved metadata requires canonical observation persistence")]
+    InvalidMetadataResolutionTransition,
+    /// Metadata provider candidate count exceeded durable representation.
+    #[error("metadata candidate count exceeds SQLite range")]
+    MetadataCandidateCountTooLarge,
+    /// Canonical provider evidence contradicted the target recording identity.
+    #[error("canonical metadata conflicts with recording {0}")]
+    MetadataIdentityConflict(i64),
+    /// Target recording did not exist during canonical metadata persistence.
+    #[error("recording {0} does not exist")]
+    RecordingNotFound(i64),
     /// Commit preparation requires a currently running acquisition.
     #[error("acquisition job is not running: {0}")]
     AcquisitionNotRunning(i64),
@@ -3007,6 +3433,7 @@ pub enum DatabaseError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::musicbrainz::{CanonicalArtistCredit, CanonicalRecording, CanonicalRelease};
     use crate::provider::ProviderItem;
     use serde_json::json;
     use std::os::unix::ffi::OsStringExt;
@@ -3449,6 +3876,77 @@ mod tests {
         )?;
         assert_eq!(state, ("generated".into(), 0));
         assert_eq!(database.schema_version()?, CURRENT_SCHEMA_VERSION);
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_metadata_persists_field_provenance_and_selection_idempotently()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut database = Database::open_in_memory()?;
+        let mbid = "f59c5520-5f46-4d2c-b2c4-822eabf53419";
+        database.connection.execute(
+            "INSERT INTO recordings(musicbrainz_recording_id) VALUES (?1)",
+            [mbid],
+        )?;
+        database.connection.execute(
+            "INSERT INTO artifacts(recording_id, path, health)
+             VALUES (1, '/music/track.opus', 'healthy')",
+            [],
+        )?;
+        database.connection.execute(
+            "UPDATE recordings SET preferred_artifact_id = 1 WHERE id = 1",
+            [],
+        )?;
+        let candidate = database.metadata_resolution_candidates(10)?.remove(0);
+        let release = CanonicalRelease {
+            id: "99999999-8888-7777-6666-555555555555".into(),
+            title: "Fixture Album".into(),
+            date: Some("2024-02-03".into()),
+            country: Some("US".into()),
+            status: Some("Official".into()),
+            release_group_id: Some("12345678-1234-1234-1234-123456789abc".into()),
+            primary_type: Some("Album".into()),
+            secondary_types: Vec::new(),
+        };
+        let recording = CanonicalRecording {
+            id: mbid.into(),
+            title: "Fixture Track".into(),
+            length_ms: Some(180_000),
+            isrcs: vec!["USABC2412345".into()],
+            artist_credit: vec![CanonicalArtistCredit {
+                artist_id: "11111111-2222-3333-4444-555555555555".into(),
+                artist_name: "Fixture Artist".into(),
+                sort_name: Some("Artist, Fixture".into()),
+                disambiguation: None,
+                credited_name: "Fixture Artist".into(),
+                join_phrase: String::new(),
+            }],
+            releases: vec![release.clone()],
+        };
+
+        let first = database.record_resolved_metadata(
+            &candidate,
+            MetadataResolutionMethod::RecordingMbid,
+            &recording,
+            Some(&release),
+            "{\"fixture\":true}",
+        )?;
+        let repeat = database.record_resolved_metadata(
+            &candidate,
+            MetadataResolutionMethod::RecordingMbid,
+            &recording,
+            Some(&release),
+            "{\"fixture\":true}",
+        )?;
+
+        assert_eq!(first.observations_selected, 4);
+        assert_eq!(repeat.observations_selected, 0);
+        assert_eq!(database.table_count("artists")?, 1);
+        assert_eq!(database.table_count("releases")?, 1);
+        assert_eq!(database.table_count("recording_artist_credits")?, 1);
+        assert_eq!(database.table_count("metadata_observations")?, 4);
+        assert_eq!(database.table_count("metadata_selections")?, 4);
+        assert!(database.metadata_resolution_candidates(10)?.is_empty());
         Ok(())
     }
 }

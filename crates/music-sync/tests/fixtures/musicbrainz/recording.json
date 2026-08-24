@@ -1,0 +1,41 @@
+{
+  "id": "f59c5520-5f46-4d2c-b2c4-822eabf53419",
+  "title": "Fixture Track",
+  "length": 180000,
+  "isrcs": ["USABC2412345"],
+  "artist-credit": [
+    {
+      "name": "Fixture Artist",
+      "joinphrase": " feat. ",
+      "artist": {
+        "id": "11111111-2222-3333-4444-555555555555",
+        "name": "Fixture Artist",
+        "sort-name": "Artist, Fixture",
+        "disambiguation": "offline fixture"
+      }
+    },
+    {
+      "name": "Guest",
+      "joinphrase": "",
+      "artist": {
+        "id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        "name": "Guest",
+        "sort-name": "Guest"
+      }
+    }
+  ],
+  "releases": [
+    {
+      "id": "99999999-8888-7777-6666-555555555555",
+      "title": "Fixture Album",
+      "date": "2024-02-03",
+      "country": "US",
+      "status": "Official",
+      "release-group": {
+        "id": "12345678-1234-1234-1234-123456789abc",
+        "primary-type": "Album",
+        "secondary-types": []
+      }
+    }
+  ]
+}

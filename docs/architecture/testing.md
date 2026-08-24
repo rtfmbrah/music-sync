@@ -69,6 +69,10 @@
   exclusive claim and evidence state, real staged download/probe/hash/fingerprint
   composition, canonical/duration/perceptual verification, rejection of staging
   mutation, atomic no-clobber commit, old-path preservation, and idempotent recovery.
+- Canonical metadata tests cover MusicBrainz recording and multi-recording ISRC JSON,
+  exact MBID and unique-ISRC HTTP paths, required User-Agent, loopback-only test HTTP,
+  deterministic release selection, transactional artist/release/field provenance,
+  explicit selections, repeat idempotency, and ambiguous results without live API use.
 - Scenario tests encode removed membership, disappeared remote with healthy local
   media, transient failure, same-title fingerprint mismatch, and repeat idempotency.
 - The architecture check reads Cargo metadata and enforces CLI-to-library dependency

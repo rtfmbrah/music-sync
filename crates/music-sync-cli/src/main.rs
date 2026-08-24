@@ -22,6 +22,8 @@ use music_sync::diagnostics::{CheckStatus, DoctorReport, run_doctor};
 use music_sync::fingerprint::{Fpcalc, reconcile_artifact_fingerprints};
 use music_sync::health::reconcile_artifact_health;
 use music_sync::media_probe::Ffprobe;
+use music_sync::metadata::resolve_canonical_metadata;
+use music_sync::musicbrainz::MusicBrainz;
 use music_sync::persistence::Database;
 use music_sync::playlist::{PlaylistMaterializationReport, materialize_playlists};
 use music_sync::provider::{SourceId, SourceSnapshot, is_supported_youtube_url};
@@ -84,6 +86,11 @@ enum Command {
         #[command(subcommand)]
         command: RepairCommand,
     },
+    /// Resolve canonical recording, artist, and release metadata.
+    Metadata {
+        #[command(subcommand)]
+        command: MetadataCommand,
+    },
     /// Materialize Navidrome-compatible playlists from durable collections.
     Playlist {
         #[command(subcommand)]
@@ -102,6 +109,28 @@ enum Command {
         /// Maximum newest warning/error events to show (1 through 100).
         #[arg(long, default_value = "20")]
         recent_events: NonZeroUsize,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum MetadataCommand {
+    /// Resolve a bounded set of strong recording identities through MusicBrainz.
+    Resolve {
+        /// TOML configuration identifying application state.
+        #[arg(short, long, default_value = "music-sync.toml")]
+        config: PathBuf,
+        /// Meaningful MusicBrainz User-Agent including operator contact information.
+        #[arg(long)]
+        user_agent: String,
+        /// MusicBrainz ws/2 endpoint; override only for controlled fixtures/mirrors.
+        #[arg(long, default_value = "https://musicbrainz.org/ws/2")]
+        endpoint: String,
+        /// Maximum recordings attempted once in stable order.
+        #[arg(long, default_value = "100")]
+        max_recordings: NonZeroUsize,
+        /// Per-request HTTP deadline in seconds.
+        #[arg(long, default_value = "30")]
+        timeout_seconds: NonZeroU64,
     },
 }
 
@@ -442,6 +471,53 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> Result<ExitCode, Box<dyn Error>> {
     match cli.command {
+        Command::Metadata {
+            command:
+                MetadataCommand::Resolve {
+                    config,
+                    user_agent,
+                    endpoint,
+                    max_recordings,
+                    timeout_seconds,
+                },
+        } => {
+            let config = AppConfig::from_file(&config)?;
+            let mut database = Database::open(&config.database_path())?;
+            let https_only = endpoint.starts_with("https://");
+            if !https_only
+                && !endpoint.starts_with("http://127.0.0.1:")
+                && !endpoint.starts_with("http://[::1]:")
+            {
+                return Err("metadata endpoint must use HTTPS or loopback HTTP".into());
+            }
+            let provider = MusicBrainz::with_endpoint(
+                &endpoint,
+                &user_agent,
+                Duration::from_secs(timeout_seconds.get()),
+                if https_only {
+                    Duration::from_secs(1)
+                } else {
+                    Duration::ZERO
+                },
+                https_only,
+            )?;
+            let report =
+                resolve_canonical_metadata(&mut database, &provider, max_recordings.get())?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("Recordings selected:  {}", report.selected);
+                println!("Recordings resolved:  {}", report.resolved);
+                println!("Recordings ambiguous: {}", report.ambiguous);
+                println!("Recordings deferred:  {}", report.deferred);
+                println!("Provider failures:    {}", report.failures.len());
+            }
+            Ok(if report.failures.is_empty() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(1)
+            })
+        }
         Command::Repair {
             command: RepairCommand::Retry { attempt_id, config },
         } => {
@@ -678,6 +754,13 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn Error>> {
                 println!(
                     "Repair attempts committed:{}",
                     report.repair_attempts.committed
+                );
+                println!("Metadata resolved:       {}", report.metadata.resolved);
+                println!("Metadata ambiguous:      {}", report.metadata.ambiguous);
+                println!("Metadata deferred:       {}", report.metadata.deferred);
+                println!(
+                    "Metadata fields selected:{}",
+                    report.metadata.selected_fields
                 );
                 println!("Playlist outputs:        {}", report.playlist_outputs);
                 println!("Recent warning/errors:   {}", report.recent_events.len());

@@ -1093,6 +1093,134 @@ fn repair_verification_and_explicit_commit_preserve_the_lost_artifact_path()
 }
 
 #[test]
+fn metadata_resolve_uses_strong_identity_and_persists_field_provenance()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let root = tempfile::tempdir()?;
+    let state = root.path().join("state");
+    let library = root.path().join("library");
+    let playlists = root.path().join("playlists");
+    fs::create_dir_all(&state)?;
+    fs::create_dir_all(&library)?;
+    fs::create_dir_all(&playlists)?;
+    let config = root.path().join("music-sync.toml");
+    fs::write(
+        &config,
+        format!(
+            "state_directory = {:?}\nlibrary_directory = {:?}\nplaylist_directory = {:?}\n",
+            state, library, playlists
+        ),
+    )?;
+    let database_path = state.join("music-sync.sqlite3");
+    assert!(
+        Command::new(env!("CARGO_BIN_EXE_music-sync"))
+            .args(["source", "add", "https://youtu.be/bootstrap", "--database"])
+            .arg(&database_path)
+            .output()?
+            .status
+            .success()
+    );
+    let mbid = "f59c5520-5f46-4d2c-b2c4-822eabf53419";
+    let connection = rusqlite::Connection::open(&database_path)?;
+    connection.execute(
+        "INSERT INTO recordings(musicbrainz_recording_id) VALUES (?1)",
+        [mbid],
+    )?;
+    connection.execute(
+        "INSERT INTO artifacts(recording_id, path, health)
+         VALUES (1, '/fixture/track.opus', 'healthy')",
+        [],
+    )?;
+    connection.execute(
+        "UPDATE recordings SET preferred_artifact_id = 1 WHERE id = 1",
+        [],
+    )?;
+    connection.execute("INSERT INTO recordings(isrc) VALUES ('USXYZ2412345')", [])?;
+    connection.execute(
+        "INSERT INTO artifacts(recording_id, path, health)
+         VALUES (2, '/fixture/track-two.opus', 'healthy')",
+        [],
+    )?;
+    connection.execute(
+        "UPDATE recordings SET preferred_artifact_id = 2 WHERE id = 2",
+        [],
+    )?;
+    drop(connection);
+
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let address = listener.local_addr()?;
+    let body = include_str!("../../music-sync/tests/fixtures/musicbrainz/recording.json");
+    let second_recording = body
+        .replace(mbid, "01234567-89ab-cdef-0123-456789abcdef")
+        .replace("USABC2412345", "USXYZ2412345")
+        .replace("Fixture Track", "Second Fixture Track");
+    let isrc_body = format!("{{\"isrc\":\"USXYZ2412345\",\"recordings\":[{second_recording}]}}");
+    let server = std::thread::spawn(move || -> Result<(), std::io::Error> {
+        for expected in ["recording", "isrc"] {
+            let (mut stream, _) = listener.accept()?;
+            let mut request = [0_u8; 8_192];
+            let length = stream.read(&mut request)?;
+            let request = String::from_utf8_lossy(&request[..length]);
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains("user-agent: music-sync-test/0.1 (test@example.invalid)")
+            );
+            let response_body = if expected == "recording" {
+                assert!(request.starts_with(&format!("GET /ws/2/recording/{mbid}?")));
+                body
+            } else {
+                assert!(request.starts_with("GET /ws/2/isrc/USXYZ2412345?"));
+                &isrc_body
+            };
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            )?;
+        }
+        Ok(())
+    });
+    let output = Command::new(env!("CARGO_BIN_EXE_music-sync"))
+        .args(["--json", "metadata", "resolve", "--config"])
+        .arg(&config)
+        .args(["--user-agent", "music-sync-test/0.1 (test@example.invalid)"])
+        .arg("--endpoint")
+        .arg(format!("http://{address}/ws/2"))
+        .arg("--max-recordings")
+        .arg("2")
+        .output()?;
+    server.join().map_err(|_| "fixture server panicked")??;
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(report["selected"], 2);
+    assert_eq!(report["resolved"], 2);
+    let connection = rusqlite::Connection::open(&database_path)?;
+    assert_eq!(
+        connection.query_row("SELECT COUNT(*) FROM metadata_selections", [], |row| {
+            row.get::<_, u64>(0)
+        })?,
+        8
+    );
+    assert_eq!(
+        connection.query_row(
+            "SELECT value FROM metadata_observations WHERE field = 'title'",
+            [],
+            |row| row.get::<_, String>(0),
+        )?,
+        "Fixture Track"
+    );
+    Ok(())
+}
+
+#[test]
 fn library_health_reports_hash_mismatch_without_modifying_media()
 -> Result<(), Box<dyn std::error::Error>> {
     let root = tempfile::tempdir()?;

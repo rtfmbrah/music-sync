@@ -219,3 +219,11 @@ commit. Commit created a new no-clobber repair artifact, retained the historical
 bytes and missing artifact row, and playlist materialization changed preference to
 the new path. Status reported one committed attempt, one healthy replacement, and
 one historical missing artifact. `/srv/music` remained non-writable throughout.
+
+Canonical metadata resolution was validated with the schema-v11 static binary and a
+single-request MusicBrainz-compatible loopback fixture against that isolated repaired
+recording. The adapter sent the required application User-Agent, parsed recording,
+ordered artist credit, release, and ISRC JSON, resolved one exact MBID, and selected
+four independently provenanced fields. The immediate repeat selected zero work and
+made no provider request. Status reported one resolved recording and four selected
+fields; `/srv/music` remained non-writable.

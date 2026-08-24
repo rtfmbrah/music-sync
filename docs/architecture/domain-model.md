@@ -67,6 +67,11 @@ through crash-safe acquisition intent. Initial acquisition may populate an unres
 recording with those values; repeated acquisition never silently overwrites a
 contradictory canonical association.
 
+Schema version 11 adds canonical artists/releases and their recording relationships,
+plus append/idempotent field observations, explicit selections, and durable
+resolved/ambiguous/deferred state. Fixed-point confidence and resolution context are
+stored per field; source provider payloads remain separate.
+
 ## PLANNED
 
 Add artists, releases, external fingerprint/canonical resolutions, metadata
