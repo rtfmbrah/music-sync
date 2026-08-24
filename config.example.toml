@@ -1,0 +1,18 @@
+state_directory = "/var/lib/music-sync"
+library_directory = "/srv/music"
+playlist_directory = "/srv/playlists"
+
+[concurrency]
+provider_requests = 2
+downloads = 1
+metadata_requests = 4
+
+[discovery]
+enabled = false
+target_new_tracks_per_day = 8
+max_new_tracks_per_day = 15
+max_tracks_per_artist_per_day = 2
+exploration_ratio = 0.20
+wildcard_ratio = 0.05
+minimum_free_disk_gb = 20
+

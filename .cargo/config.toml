@@ -1,0 +1,3 @@
+[build]
+# Keep Cargo and rust-analyzer output outside path-flake source snapshots.
+target-dir = "../.music-sync-v2-target"

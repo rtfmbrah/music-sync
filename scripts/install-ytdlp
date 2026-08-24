@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly YTDLP_VERSION="2026.08.19"
+readonly YTDLP_SHA256="1fa6733c37ea6fb51c99ad8fe785e7b7e5f3246c9b980230329d4fb72ed8d4d6"
+readonly YTDLP_URL="https://github.com/yt-dlp/yt-dlp/releases/download/${YTDLP_VERSION}/yt-dlp"
+
+if [[ $# -ne 1 || -z "$1" ]]; then
+    echo "usage: scripts/install-ytdlp DESTINATION" >&2
+    exit 2
+fi
+
+destination="$1"
+destination_directory="$(dirname -- "$destination")"
+if [[ ! -d "$destination_directory" ]]; then
+    echo "destination directory does not exist: $destination_directory" >&2
+    exit 2
+fi
+
+temporary="$(mktemp "${destination}.tmp.XXXXXX")"
+cleanup() {
+    rm -f -- "$temporary"
+}
+trap cleanup EXIT
+
+curl --fail --location --silent --show-error "$YTDLP_URL" --output "$temporary"
+printf '%s  %s\n' "$YTDLP_SHA256" "$temporary" | sha256sum --check --status
+chmod 0755 "$temporary"
+mv -- "$temporary" "$destination"
+trap - EXIT
+
+actual_version="$("$destination" --version)"
+if [[ "$actual_version" != "$YTDLP_VERSION" ]]; then
+    echo "installed yt-dlp reported unexpected version: $actual_version" >&2
+    exit 1
+fi
+echo "installed yt-dlp $actual_version at $destination"
