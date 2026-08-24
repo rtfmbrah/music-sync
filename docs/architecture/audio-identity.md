@@ -24,13 +24,24 @@ because insufficient infrastructure evidence is not corruption. Successful check
 refresh structural properties and exact SHA-256. No health result starts replacement
 search in this phase.
 
+Schema version 7 stores bounded raw Chromaprint algorithm-2 evidence separately from
+exact artifact hashes. `library fingerprint` and the automatic post-acquisition sync
+phase select healthy artifacts in stable bounded order, reject paths outside the
+configured library and symbolic links, invoke `fpcalc` with explicit output, time,
+and audio-length bounds, and retain prior evidence when one extraction fails.
+Repeating the same extraction bound is idempotent.
+
+Raw comparison requires at least 120 overlapping values, searches at most 120 values
+of alignment, permits at most two average differing bits per value, and requires
+durations within three seconds. These deliberately strict near-identity thresholds
+produce match, mismatch, or insufficient-evidence results; they do not identify
+covers or infer identity from names.
+
 ## PLANNED
 
-Use `fpcalc`/Chromaprint to derive perceptual fingerprints and a documented comparison
-method, retaining reference fingerprints after acquisition. AcoustID and MusicBrainz
-may corroborate embedded canonical evidence. Persist file hashes for integrity, not as perceptual
-identity. Duration and qualifiers filter versions before a temporary candidate is
-downloaded and fingerprinted.
+AcoustID and MusicBrainz may corroborate embedded canonical evidence. Persist file
+hashes for integrity, not as perceptual identity. Duration and qualifiers filter
+versions before a temporary candidate is downloaded and fingerprinted.
 
 Pipeline:
 

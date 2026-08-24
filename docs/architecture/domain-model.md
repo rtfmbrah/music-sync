@@ -45,9 +45,15 @@ owned playlist output paths with the SHA-256 of their last committed bytes. Exis
 recordings are backfilled only when exactly one healthy artifact is unambiguous.
 Initial acquisitions set preference only when none exists.
 
+Schema version 7 stores one raw algorithm-2 Chromaprint observation per artifact,
+including its extraction-length bound, reported duration, value count, serialized
+values, and refresh timestamp. It remains artifact evidence rather than a recording
+identifier and is retained independently from provider availability.
+
 ## PLANNED
 
-Add artists, releases, fingerprints, metadata values/provenance, artwork, lyrics,
+Add artists, releases, external fingerprint/canonical resolutions, metadata
+values/provenance, artwork, lyrics,
 acquisition candidates/attempts, discovery seeds/candidates, and job attempts when a
 real workflow requires each concept. A recording can belong to several releases; a
 single preferred artifact can satisfy multiple provider items and memberships.

@@ -200,3 +200,9 @@ Bounded artifact health was validated against the isolated recovered artifact. T
 static binary reported one selected healthy artifact with no state change or failure.
 Its exact media SHA-256 was identical before and after the check, and production
 music remained non-writable.
+
+Raw Chromaprint persistence was validated with the schema-v7 static binary and a
+deterministic `fpcalc` fixture against the two isolated sync artifacts. The first
+bounded pass recorded two fingerprints; the identical repeat reported both
+unchanged. Exact media hashes matched before and after, operational status reported
+schema 7 and two healthy artifacts, and `/srv/music` remained non-writable.

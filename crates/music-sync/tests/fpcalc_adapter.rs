@@ -1,0 +1,68 @@
+//! Deterministic subprocess tests for bounded Chromaprint extraction.
+
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
+use std::time::{Duration, Instant};
+
+use music_sync::fingerprint::{FingerprintError, Fingerprinter, Fpcalc};
+
+fn executable(directory: &Path, body: &str) -> Result<std::path::PathBuf, std::io::Error> {
+    let path = directory.join("fpcalc");
+    fs::write(&path, format!("#!/bin/sh\nset -eu\n{body}\n"))?;
+    let mut permissions = fs::metadata(&path)?.permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&path, permissions)?;
+    Ok(path)
+}
+
+#[test]
+fn extracts_raw_bounded_fingerprint() -> Result<(), Box<dyn std::error::Error>> {
+    let root = tempfile::tempdir()?;
+    let media = root.path().join("audio.opus");
+    fs::write(&media, b"fixture")?;
+    let program = executable(
+        root.path(),
+        "test \"$1\" = -raw\ntest \"$2\" = -json\ntest \"$3\" = -algorithm\ntest \"$4\" = 2\ntest \"$5\" = -length\ntest \"$6\" = 60\nprintf '%s' '{\"duration\":2.5,\"fingerprint\":[1,2,3]}'",
+    )?;
+
+    let result = Fpcalc::new(program, Duration::from_secs(1), 60).fingerprint(&media)?;
+
+    assert_eq!(result.duration_ms, 2_500);
+    assert_eq!(result.values, [1, 2, 3]);
+    Ok(())
+}
+
+#[test]
+fn reports_nonzero_failure() -> Result<(), Box<dyn std::error::Error>> {
+    let root = tempfile::tempdir()?;
+    let media = root.path().join("audio.opus");
+    fs::write(&media, b"fixture")?;
+    let program = executable(root.path(), "printf '%s' 'decode failed' >&2\nexit 4")?;
+
+    let result = Fpcalc::new(program, Duration::from_secs(1), 60).fingerprint(&media);
+
+    assert!(matches!(
+        result,
+        Err(FingerprintError::Failed {
+            code: Some(4),
+            stderr
+        }) if stderr == "decode failed"
+    ));
+    Ok(())
+}
+
+#[test]
+fn kills_subprocess_after_deadline() -> Result<(), Box<dyn std::error::Error>> {
+    let root = tempfile::tempdir()?;
+    let media = root.path().join("audio.opus");
+    fs::write(&media, b"fixture")?;
+    let program = executable(root.path(), "exec sleep 5")?;
+    let started = Instant::now();
+
+    let result = Fpcalc::new(program, Duration::from_millis(30), 60).fingerprint(&media);
+
+    assert!(matches!(result, Err(FingerprintError::Timeout(_))));
+    assert!(started.elapsed() < Duration::from_secs(2));
+    Ok(())
+}

@@ -21,10 +21,14 @@ const MIGRATIONS: &[(u32, &str)] = &[
         include_str!("../migrations/0005_acquisition_commits.sql"),
     ),
     (6, include_str!("../migrations/0006_playlist_outputs.sql")),
+    (
+        7,
+        include_str!("../migrations/0007_artifact_fingerprints.sql"),
+    ),
 ];
 
 /// Current durable schema version.
-pub const CURRENT_SCHEMA_VERSION: u32 = 6;
+pub const CURRENT_SCHEMA_VERSION: u32 = 7;
 
 /// A connection to music-sync's private application state.
 #[derive(Debug)]
@@ -238,6 +242,94 @@ impl Database {
                 })
             })
             .collect()
+    }
+
+    /// Loads healthy artifacts in stable order for fingerprint reconciliation.
+    pub fn artifact_fingerprint_candidates(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<ArtifactFingerprintCandidate>, DatabaseError> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT artifacts.id, artifacts.path,
+                        artifact_fingerprints.max_seconds,
+                        artifact_fingerprints.fingerprint_json
+                 FROM artifacts
+                 LEFT JOIN artifact_fingerprints ON
+                           artifact_fingerprints.artifact_id = artifacts.id
+                 WHERE artifacts.health = 'healthy'
+                 ORDER BY artifacts.id LIMIT ?1",
+            )
+            .map_err(DatabaseError::Sqlite)?;
+        statement
+            .query_map([limit], |row| {
+                Ok(ArtifactFingerprintCandidate {
+                    artifact_id: row.get(0)?,
+                    path: PathBuf::from(row.get::<_, String>(1)?),
+                    prior_max_seconds: row.get(2)?,
+                    prior_fingerprint_json: row.get(3)?,
+                })
+            })
+            .map_err(DatabaseError::Sqlite)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(DatabaseError::Sqlite)
+    }
+
+    /// Upserts exact raw fingerprint evidence and reports whether bytes changed.
+    pub fn record_artifact_fingerprint(
+        &mut self,
+        evidence: &ArtifactFingerprintEvidence,
+    ) -> Result<bool, DatabaseError> {
+        let prior = self
+            .connection
+            .query_row(
+                "SELECT algorithm, max_seconds, duration_ms, fingerprint_json
+                 FROM artifact_fingerprints WHERE artifact_id = ?1",
+                [evidence.artifact_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(DatabaseError::Sqlite)?;
+        let current = (
+            2_i64,
+            i64::from(evidence.max_seconds),
+            evidence.duration_ms,
+            evidence.fingerprint_json.clone(),
+        );
+        if prior.as_ref() == Some(&current) {
+            return Ok(false);
+        }
+        self.connection
+            .execute(
+                "INSERT INTO artifact_fingerprints(
+                     artifact_id, algorithm, max_seconds, duration_ms,
+                     fingerprint_json, value_count)
+                 VALUES (?1, 2, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(artifact_id) DO UPDATE SET
+                     algorithm = 2, max_seconds = excluded.max_seconds,
+                     duration_ms = excluded.duration_ms,
+                     fingerprint_json = excluded.fingerprint_json,
+                     value_count = excluded.value_count,
+                     updated_at = CURRENT_TIMESTAMP",
+                rusqlite::params![
+                    evidence.artifact_id,
+                    evidence.max_seconds,
+                    evidence.duration_ms,
+                    evidence.fingerprint_json,
+                    evidence.value_count
+                ],
+            )
+            .map_err(DatabaseError::Sqlite)?;
+        Ok(true)
     }
 
     /// Persists one conservative artifact-health observation transactionally.
@@ -1537,6 +1629,34 @@ pub struct ArtifactHealthObservation {
     pub sample_rate_hz: Option<i64>,
     /// Structurally observed channel count.
     pub channels: Option<i64>,
+}
+
+/// Healthy artifact selected for bounded fingerprint reconciliation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactFingerprintCandidate {
+    /// Durable artifact ID.
+    pub artifact_id: i64,
+    /// Registered media path.
+    pub path: PathBuf,
+    /// Prior extraction bound when fingerprinted.
+    pub prior_max_seconds: Option<i64>,
+    /// Prior raw fingerprint JSON when present.
+    pub prior_fingerprint_json: Option<String>,
+}
+
+/// Persistable raw Chromaprint evidence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactFingerprintEvidence {
+    /// Durable artifact ID.
+    pub artifact_id: i64,
+    /// Algorithm-2 extraction audio bound.
+    pub max_seconds: u32,
+    /// fpcalc duration in milliseconds.
+    pub duration_ms: i64,
+    /// JSON array containing raw unsigned fingerprint values.
+    pub fingerprint_json: String,
+    /// Number of raw values.
+    pub value_count: i64,
 }
 
 /// Persistence initialization or migration failure.

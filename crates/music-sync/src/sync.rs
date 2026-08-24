@@ -7,6 +7,10 @@ use thiserror::Error;
 
 use crate::acquisition::{AcquisitionBatchReport, AcquisitionRunError, run_pending_acquisitions};
 use crate::content_hash::ContentHasher;
+use crate::fingerprint::{
+    FingerprintReconciliationError, FingerprintReport, Fingerprinter,
+    reconcile_artifact_fingerprints,
+};
 use crate::media_probe::MediaProbe;
 use crate::persistence::{Database, DatabaseError, SnapshotReconciliationSummary};
 use crate::playlist::{PlaylistError, PlaylistMaterializationReport, materialize_playlists};
@@ -18,10 +22,13 @@ pub fn run_sync(
     database: &mut Database,
     directories: SyncDirectories<'_>,
     boundaries: SyncBoundaries<'_>,
-    maximum_jobs: usize,
+    limits: SyncLimits,
 ) -> Result<SyncRunReport, SyncRunError> {
-    if maximum_jobs == 0 {
-        return Err(SyncRunError::InvalidJobLimit);
+    if limits.maximum_jobs == 0
+        || limits.maximum_fingerprints == 0
+        || limits.fingerprint_audio_seconds == 0
+    {
+        return Err(SyncRunError::InvalidLimits);
     }
     let sources = database.list_sources(false)?;
     let mut source_results = Vec::with_capacity(sources.len());
@@ -47,12 +54,20 @@ pub fn run_sync(
         boundaries.acquisition_adapter,
         boundaries.probe,
         boundaries.hasher,
-        maximum_jobs,
+        limits.maximum_jobs,
+    )?;
+    let fingerprints = reconcile_artifact_fingerprints(
+        database,
+        directories.library,
+        boundaries.fingerprinter,
+        limits.maximum_fingerprints,
+        limits.fingerprint_audio_seconds,
     )?;
     let playlists = materialize_playlists(database, directories.library, directories.playlists)?;
     Ok(SyncRunReport {
         sources: source_results,
         acquisitions,
+        fingerprints,
         playlists,
     })
 }
@@ -78,6 +93,19 @@ pub struct SyncBoundaries<'a> {
     pub probe: &'a dyn MediaProbe,
     /// Exact-byte content hashing boundary.
     pub hasher: &'a dyn ContentHasher,
+    /// Perceptual fingerprint extraction boundary.
+    pub fingerprinter: &'a dyn Fingerprinter,
+}
+
+/// Explicit non-zero work bounds for one synchronization run.
+#[derive(Debug, Clone, Copy)]
+pub struct SyncLimits {
+    /// Maximum pending acquisitions attempted once.
+    pub maximum_jobs: usize,
+    /// Maximum healthy artifacts fingerprint-reconciled.
+    pub maximum_fingerprints: usize,
+    /// Maximum audio seconds consumed per fingerprint.
+    pub fingerprint_audio_seconds: u32,
 }
 
 /// Structured result of one complete bounded synchronization cycle.
@@ -87,6 +115,8 @@ pub struct SyncRunReport {
     pub sources: Vec<SourceSyncResult>,
     /// Bounded acquisition snapshot result.
     pub acquisitions: AcquisitionBatchReport,
+    /// Automatic raw fingerprint reconciliation after acquisition.
+    pub fingerprints: FingerprintReport,
     /// Atomic playlist materialization result.
     pub playlists: PlaylistMaterializationReport,
 }
@@ -99,6 +129,7 @@ impl SyncRunReport {
             .iter()
             .all(|result| matches!(result, SourceSyncResult::Reconciled { .. }))
             && self.acquisitions.failures.is_empty()
+            && self.fingerprints.failures.is_empty()
             && self.playlists.failures.is_empty()
     }
 }
@@ -126,15 +157,18 @@ pub enum SourceSyncResult {
 /// Fatal failure preventing completion of all synchronization phases.
 #[derive(Debug, Error)]
 pub enum SyncRunError {
-    /// A sync run must always bound acquisition work.
-    #[error("maximum acquisition jobs must be greater than zero")]
-    InvalidJobLimit,
+    /// A sync run must always bound acquisition and fingerprint work.
+    #[error("sync acquisition and fingerprint limits must be greater than zero")]
+    InvalidLimits,
     /// Durable state access or reconciliation failed.
     #[error(transparent)]
     Database(#[from] DatabaseError),
     /// Acquisition orchestration encountered a fatal database failure.
     #[error(transparent)]
     Acquisition(#[from] AcquisitionRunError),
+    /// Fingerprint orchestration encountered a fatal durable-state failure.
+    #[error(transparent)]
+    Fingerprint(#[from] FingerprintReconciliationError),
     /// Playlist orchestration encountered a fatal database failure.
     #[error(transparent)]
     Playlist(#[from] PlaylistError),

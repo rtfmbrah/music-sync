@@ -20,7 +20,8 @@ in ad hoc TODO documents.
 - Bounded artifact hashes and exact-byte duplicate evidence (complete).
 - Embedded canonical-tag validation (complete).
 - Initial transactional, idempotent adoption apply (complete).
-- Persisted/external/perceptual identity evidence and adoption reconciliation.
+- Persisted raw perceptual identity evidence and bounded adoption reconciliation
+  (complete); external canonical resolution remains planned.
 - Source/provider model and stored `yt-dlp` fixtures (complete).
 - Inspect-only YouTube video/playlist enumeration with typed errors (complete).
 - Persistent source add/list/deactivate/reactivate lifecycle (complete).
@@ -31,8 +32,8 @@ in ad hoc TODO documents.
 
 - Crash-safe acquisition jobs and recovery (complete for initial yt-dlp/ffprobe/hash
   acquisition; interrupted staging is retained).
-- `yt-dlp`, `ffprobe`, `ffmpeg`, hash, and `fpcalc` adapters (yt-dlp, ffprobe, and
-  hash complete; ffmpeg/fpcalc planned).
+- `yt-dlp`, `ffprobe`, `ffmpeg`, hash, and `fpcalc` adapters (yt-dlp, ffprobe, hash,
+  and bounded raw fpcalc complete; ffmpeg planned).
 - Artifact probing and health reconciliation (complete).
 - Conservative candidate pipeline and perceptual identity thresholds.
 - Fixture-backed unavailable/transient/provider-change scenarios.

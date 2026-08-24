@@ -19,13 +19,14 @@ use music_sync::adoption::{
 use music_sync::config::AppConfig;
 use music_sync::content_hash::Sha256FileHasher;
 use music_sync::diagnostics::{CheckStatus, DoctorReport, run_doctor};
+use music_sync::fingerprint::{Fpcalc, reconcile_artifact_fingerprints};
 use music_sync::health::reconcile_artifact_health;
 use music_sync::media_probe::Ffprobe;
 use music_sync::persistence::Database;
 use music_sync::playlist::{PlaylistMaterializationReport, materialize_playlists};
 use music_sync::provider::{SourceId, SourceSnapshot, is_supported_youtube_url};
 use music_sync::sync::{
-    SourceSyncResult, SyncBoundaries, SyncDirectories, SyncRunReport, run_sync,
+    SourceSyncResult, SyncBoundaries, SyncDirectories, SyncLimits, SyncRunReport, run_sync,
 };
 use music_sync::yt_dlp::YtDlp;
 use tracing::{error, info};
@@ -120,6 +121,18 @@ enum SyncCommand {
         /// Per-job ffprobe deadline in seconds.
         #[arg(long, default_value = "30")]
         probe_timeout_seconds: NonZeroU64,
+        /// Maximum healthy artifacts fingerprint-reconciled after acquisition.
+        #[arg(long, default_value = "100")]
+        max_fingerprints: NonZeroUsize,
+        /// Maximum audio seconds consumed per fingerprint.
+        #[arg(long, default_value = "120")]
+        fingerprint_audio_seconds: NonZeroU64,
+        /// fpcalc executable path.
+        #[arg(long, default_value = "fpcalc")]
+        fpcalc: PathBuf,
+        /// Per-artifact fpcalc deadline in seconds.
+        #[arg(long, default_value = "60")]
+        fingerprint_timeout_seconds: NonZeroU64,
     },
 }
 
@@ -258,6 +271,24 @@ enum SourceCommand {
 
 #[derive(Debug, Subcommand)]
 enum LibraryCommand {
+    /// Derive bounded raw Chromaprint evidence for healthy registered artifacts.
+    Fingerprint {
+        /// TOML configuration containing state and library directories.
+        #[arg(short, long, default_value = "music-sync.toml")]
+        config: PathBuf,
+        /// Maximum healthy artifacts selected in stable ID order.
+        #[arg(long, default_value = "100")]
+        max_artifacts: NonZeroUsize,
+        /// Maximum audio seconds fingerprinted per artifact.
+        #[arg(long, default_value = "120")]
+        max_audio_seconds: NonZeroU64,
+        /// fpcalc executable path.
+        #[arg(long, default_value = "fpcalc")]
+        fpcalc: PathBuf,
+        /// Per-artifact fpcalc deadline in seconds.
+        #[arg(long, default_value = "60")]
+        timeout_seconds: NonZeroU64,
+    },
     /// Reconcile registered artifact health without modifying media files.
     Health {
         /// TOML configuration containing state and library directories.
@@ -366,6 +397,49 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn Error>> {
             let report = run_doctor(&config);
             render_doctor(&report, cli.json)?;
             Ok(if report.is_healthy() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(1)
+            })
+        }
+        Command::Library {
+            command:
+                LibraryCommand::Fingerprint {
+                    config,
+                    max_artifacts,
+                    max_audio_seconds,
+                    fpcalc,
+                    timeout_seconds,
+                },
+        } => {
+            let maximum_audio_seconds = u32::try_from(max_audio_seconds.get())
+                .map_err(|_| "maximum fingerprint audio seconds exceeds u32")?;
+            let config = AppConfig::from_file(&config)?;
+            let mut database = Database::open(&config.database_path())?;
+            let adapter = Fpcalc::new(
+                fpcalc,
+                Duration::from_secs(timeout_seconds.get()),
+                maximum_audio_seconds,
+            );
+            let report = reconcile_artifact_fingerprints(
+                &mut database,
+                &config.library_directory,
+                &adapter,
+                max_artifacts.get(),
+                maximum_audio_seconds,
+            )?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("Artifacts selected: {}", report.selected);
+                println!("Fingerprints recorded: {}", report.recorded);
+                println!("Fingerprints unchanged: {}", report.unchanged);
+                println!("Fingerprint failures: {}", report.failures.len());
+                for failure in &report.failures {
+                    println!("  Artifact {}: {}", failure.artifact_id, failure.message);
+                }
+            }
+            Ok(if report.failures.is_empty() {
                 ExitCode::SUCCESS
             } else {
                 ExitCode::from(1)
@@ -768,6 +842,10 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn Error>> {
                     source_timeout_seconds,
                     download_timeout_seconds,
                     probe_timeout_seconds,
+                    max_fingerprints,
+                    fingerprint_audio_seconds,
+                    fpcalc,
+                    fingerprint_timeout_seconds,
                 },
         } => {
             let config = AppConfig::from_file(&config)?;
@@ -779,6 +857,13 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn Error>> {
             let acquisition_adapter =
                 YtDlp::new(yt_dlp, Duration::from_secs(download_timeout_seconds.get()));
             let probe = Ffprobe::new(ffprobe, Duration::from_secs(probe_timeout_seconds.get()));
+            let fingerprint_audio_seconds = u32::try_from(fingerprint_audio_seconds.get())
+                .map_err(|_| "maximum fingerprint audio seconds exceeds u32")?;
+            let fingerprinter = Fpcalc::new(
+                fpcalc,
+                Duration::from_secs(fingerprint_timeout_seconds.get()),
+                fingerprint_audio_seconds,
+            );
             let report = run_sync(
                 &mut database,
                 SyncDirectories {
@@ -791,8 +876,13 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn Error>> {
                     acquisition_adapter: &acquisition_adapter,
                     probe: &probe,
                     hasher: &Sha256FileHasher,
+                    fingerprinter: &fingerprinter,
                 },
-                max_jobs.get(),
+                SyncLimits {
+                    maximum_jobs: max_jobs.get(),
+                    maximum_fingerprints: max_fingerprints.get(),
+                    fingerprint_audio_seconds,
+                },
             )?;
             render_sync_run(&report, cli.json)?;
             Ok(if report.is_successful() {
@@ -825,6 +915,8 @@ fn render_sync_run(report: &SyncRunReport, json: bool) -> Result<(), serde_json:
     println!("Jobs selected:      {}", report.acquisitions.selected);
     println!("Jobs committed:     {}", report.acquisitions.committed);
     println!("Jobs failed:        {}", report.acquisitions.failures.len());
+    println!("Fingerprints saved: {}", report.fingerprints.recorded);
+    println!("Fingerprint errors: {}", report.fingerprints.failures.len());
     println!("Playlists written:  {}", report.playlists.playlists.len());
     println!("Playlists failed:   {}", report.playlists.failures.len());
     Ok(())

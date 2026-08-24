@@ -58,6 +58,9 @@
 - Artifact-health tests prove stable bounded checking, healthy/missing/hash-mismatch
   classification, unchanged media bytes, persistent corrupt evidence, and prior
   healthy-state preservation when probing fails.
+- Raw fingerprint tests cover bounded fpcalc arguments/output/deadlines, schema-v7
+  persistence, repeat idempotency, automatic sync extraction, isolated failures, and
+  strict aligned/duration-aware comparison without live services.
 - Scenario tests encode removed membership, disappeared remote with healthy local
   media, transient failure, same-title fingerprint mismatch, and repeat idempotency.
 - The architecture check reads Cargo metadata and enforces CLI-to-library dependency

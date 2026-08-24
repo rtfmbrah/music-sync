@@ -601,7 +601,6 @@ fn playlist_materialization_is_atomic_idempotent_and_tracks_active_membership()
     let mut permissions = fs::metadata(&ffprobe)?.permissions();
     permissions.set_mode(0o700);
     fs::set_permissions(&ffprobe, permissions)?;
-
     let run = |arguments: &[&str]| {
         Command::new(env!("CARGO_BIN_EXE_music-sync"))
             .arg("--json")
@@ -754,6 +753,7 @@ fn sync_run_completes_all_phases_and_isolates_one_source_failure()
     let marker = root.path().join("fail-source-two");
     let yt_dlp = root.path().join("yt-dlp");
     let ffprobe = root.path().join("ffprobe");
+    let fpcalc = root.path().join("fpcalc");
     fs::write(
         &yt_dlp,
         format!(
@@ -765,7 +765,11 @@ fn sync_run_completes_all_phases_and_isolates_one_source_failure()
         &ffprobe,
         "#!/bin/sh\nprintf '%s' '{\"streams\":[{\"codec_type\":\"audio\",\"codec_name\":\"opus\"}],\"format\":{\"duration\":\"1.5\"}}'\n",
     )?;
-    for executable in [&yt_dlp, &ffprobe] {
+    fs::write(
+        &fpcalc,
+        "#!/bin/sh\nprintf '%s' '{\"duration\":1.5,\"fingerprint\":[1,2,3]}'\n",
+    )?;
+    for executable in [&yt_dlp, &ffprobe, &fpcalc] {
         let mut permissions = fs::metadata(executable)?.permissions();
         permissions.set_mode(0o700);
         fs::set_permissions(executable, permissions)?;
@@ -788,6 +792,8 @@ fn sync_run_completes_all_phases_and_isolates_one_source_failure()
             .arg(&yt_dlp)
             .arg("--ffprobe")
             .arg(&ffprobe)
+            .arg("--fpcalc")
+            .arg(&fpcalc)
             .output()
     };
 
@@ -796,6 +802,7 @@ fn sync_run_completes_all_phases_and_isolates_one_source_failure()
     assert!(first.status.success());
     assert_eq!(first_report["sources"].as_array().map(Vec::len), Some(2));
     assert_eq!(first_report["acquisitions"]["committed"], 2);
+    assert_eq!(first_report["fingerprints"]["recorded"], 2);
     assert_eq!(
         first_report["playlists"]["playlists"]
             .as_array()
@@ -812,6 +819,7 @@ fn sync_run_completes_all_phases_and_isolates_one_source_failure()
     assert_eq!(partial_report["sources"][0]["status"], "reconciled");
     assert_eq!(partial_report["sources"][1]["status"], "failed");
     assert_eq!(partial_report["acquisitions"]["selected"], 0);
+    assert_eq!(partial_report["fingerprints"]["unchanged"], 2);
     assert_eq!(
         partial_report["playlists"]["failures"]
             .as_array()
@@ -951,6 +959,7 @@ fn library_health_reports_hash_mismatch_without_modifying_media()
     )?;
     let database = state.join("music-sync.sqlite3");
     let ffprobe = root.path().join("ffprobe");
+    let fpcalc = root.path().join("fpcalc");
     fs::write(
         &ffprobe,
         "#!/bin/sh\nprintf '%s' '{\"streams\":[{\"codec_type\":\"audio\",\"codec_name\":\"opus\"}],\"format\":{\"duration\":\"1.5\"}}'\n",
@@ -958,6 +967,13 @@ fn library_health_reports_hash_mismatch_without_modifying_media()
     let mut permissions = fs::metadata(&ffprobe)?.permissions();
     permissions.set_mode(0o700);
     fs::set_permissions(&ffprobe, permissions)?;
+    fs::write(
+        &fpcalc,
+        "#!/bin/sh\nprintf '%s' '{\"duration\":1.5,\"fingerprint\":[1,2,3,4]}'\n",
+    )?;
+    let mut permissions = fs::metadata(&fpcalc)?.permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&fpcalc, permissions)?;
     assert!(
         Command::new(env!("CARGO_BIN_EXE_music-sync"))
             .args(["library", "adopt"])
@@ -981,6 +997,30 @@ fn library_health_reports_hash_mismatch_without_modifying_media()
     assert!(first.status.success());
     assert_eq!(first_report["healthy"], 1);
     assert_eq!(first_report["changed"], 1);
+
+    let fingerprint = || {
+        Command::new(env!("CARGO_BIN_EXE_music-sync"))
+            .args(["--json", "library", "fingerprint", "--config"])
+            .arg(&config)
+            .args([
+                "--max-artifacts",
+                "1",
+                "--max-audio-seconds",
+                "60",
+                "--fpcalc",
+            ])
+            .arg(&fpcalc)
+            .output()
+    };
+    let fingerprinted = fingerprint()?;
+    let fingerprinted_report: serde_json::Value = serde_json::from_slice(&fingerprinted.stdout)?;
+    assert!(fingerprinted.status.success());
+    assert_eq!(fingerprinted_report["recorded"], 1);
+    let fingerprint_repeat = fingerprint()?;
+    let fingerprint_repeat_report: serde_json::Value =
+        serde_json::from_slice(&fingerprint_repeat.stdout)?;
+    assert!(fingerprint_repeat.status.success());
+    assert_eq!(fingerprint_repeat_report["unchanged"], 1);
 
     fs::write(&media, b"externally changed audio")?;
     let second = run()?;
