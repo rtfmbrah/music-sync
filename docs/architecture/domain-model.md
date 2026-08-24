@@ -50,6 +50,12 @@ including its extraction-length bound, reported duration, value count, serialize
 values, and refresh timestamp. It remains artifact evidence rather than a recording
 identifier and is retained independently from provider availability.
 
+Schema version 8 adds durable `repair_cases` and `repair_attempts`. Cases reference
+the canonical recording, permanently unavailable original provider object, and the
+preserved unhealthy reference artifact. Attempts retain provider candidates and an
+explicit generated/rejected/unresolved/verified/committed state; candidate search is
+not folded into acquisition or recording identity.
+
 ## PLANNED
 
 Add artists, releases, external fingerprint/canonical resolutions, metadata

@@ -61,6 +61,10 @@
 - Raw fingerprint tests cover bounded fpcalc arguments/output/deadlines, schema-v7
   persistence, repeat idempotency, automatic sync extraction, isolated failures, and
   strict aligned/duration-aware comparison without live services.
+- Repair persistence tests prove transient failures cannot create cases, every
+  permanent-loss/health/membership/fingerprint prerequisite is required, generated
+  candidates remain unverified and idempotent, recovered health cancels a case, and
+  renewed loss can reopen it.
 - Scenario tests encode removed membership, disappeared remote with healthy local
   media, transient failure, same-title fingerprint mismatch, and repeat idempotency.
 - The architecture check reads Cargo metadata and enforces CLI-to-library dependency

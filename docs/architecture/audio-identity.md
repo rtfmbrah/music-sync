@@ -37,6 +37,15 @@ durations within three seconds. These deliberately strict near-identity threshol
 produce match, mismatch, or insufficient-evidence results; they do not identify
 covers or infer identity from names.
 
+Schema version 8 separates repair cases and candidate attempts from acquisition jobs.
+The explicit `repair assess` workflow checks only active provider items whose
+preferred artifact is already missing or corrupt. A durable eligible case requires a
+direct, explicitly permanent provider failure and retained raw reference fingerprint;
+transient/authentication/rate-limit/extraction failures create no case. Recovered
+health, membership removal, or restored provider availability cancels an unresolved
+case. `repair generate` performs bounded title-based search but stores every result
+as generated-only evidence; search position and text confer no identity trust.
+
 ## PLANNED
 
 AcoustID and MusicBrainz may corroborate embedded canonical evidence. Persist file

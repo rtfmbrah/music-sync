@@ -25,10 +25,11 @@ const MIGRATIONS: &[(u32, &str)] = &[
         7,
         include_str!("../migrations/0007_artifact_fingerprints.sql"),
     ),
+    (8, include_str!("../migrations/0008_repair_cases.sql")),
 ];
 
 /// Current durable schema version.
-pub const CURRENT_SCHEMA_VERSION: u32 = 7;
+pub const CURRENT_SCHEMA_VERSION: u32 = 8;
 
 /// A connection to music-sync's private application state.
 #[derive(Debug)]
@@ -160,6 +161,12 @@ impl Database {
                 healthy: count("SELECT COUNT(*) FROM artifacts WHERE health = 'healthy'")?,
                 missing: count("SELECT COUNT(*) FROM artifacts WHERE health = 'missing'")?,
                 corrupt: count("SELECT COUNT(*) FROM artifacts WHERE health = 'corrupt'")?,
+            },
+            repairs: RepairCaseCounts {
+                eligible: count("SELECT COUNT(*) FROM repair_cases WHERE state = 'eligible'")?,
+                unresolved: count("SELECT COUNT(*) FROM repair_cases WHERE state = 'unresolved'")?,
+                verified: count("SELECT COUNT(*) FROM repair_cases WHERE state = 'verified'")?,
+                cancelled: count("SELECT COUNT(*) FROM repair_cases WHERE state = 'cancelled'")?,
             },
             playlist_outputs: count(
                 "SELECT COUNT(*) FROM playlist_outputs WHERE sha256 IS NOT NULL",
@@ -330,6 +337,310 @@ impl Database {
             )
             .map_err(DatabaseError::Sqlite)?;
         Ok(true)
+    }
+
+    /// Loads active unhealthy original items in stable order for availability checks.
+    pub fn repair_original_candidates(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<RepairOriginalCandidate>, DatabaseError> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT DISTINCT provider_items.id, provider_items.provider,
+                        provider_items.provider_item_id, provider_items.original_url,
+                        provider_items.availability, artifacts.id, artifacts.health
+                 FROM provider_items
+                 JOIN collection_memberships ON
+                      collection_memberships.provider_item_id = provider_items.id
+                     AND collection_memberships.active = 1
+                 JOIN recordings ON recordings.id = provider_items.recording_id
+                 JOIN artifacts ON artifacts.id = recordings.preferred_artifact_id
+                 WHERE artifacts.health IN ('missing', 'corrupt')
+                 ORDER BY provider_items.id LIMIT ?1",
+            )
+            .map_err(DatabaseError::Sqlite)?;
+        let rows = statement
+            .query_map([limit], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            })
+            .map_err(DatabaseError::Sqlite)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(DatabaseError::Sqlite)?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(RepairOriginalCandidate {
+                    provider_item_id: row.0,
+                    provider: row.1,
+                    provider_owned_id: row.2,
+                    original_url: row.3,
+                    availability: ProviderAvailability::parse(&row.4)?,
+                    artifact_id: row.5,
+                    artifact_health: ArtifactHealth::parse(&row.6)?,
+                })
+            })
+            .collect()
+    }
+
+    /// Records a classified original-provider observation without inferring permanence.
+    pub fn record_provider_availability(
+        &mut self,
+        provider_item_id: i64,
+        availability: ProviderAvailability,
+        message: &str,
+    ) -> Result<bool, DatabaseError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(DatabaseError::Sqlite)?;
+        let prior = transaction
+            .query_row(
+                "SELECT availability FROM provider_items WHERE id = ?1",
+                [provider_item_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(DatabaseError::Sqlite)?
+            .ok_or(DatabaseError::ProviderItemNotFound(provider_item_id))?;
+        if prior == ProviderAvailability::PermanentlyUnavailable.as_str()
+            && availability == ProviderAvailability::TransientFailure
+        {
+            return Ok(false);
+        }
+        if prior == availability.as_str() {
+            return Ok(false);
+        }
+        transaction
+            .execute(
+                "UPDATE provider_items SET availability = ?2 WHERE id = ?1",
+                rusqlite::params![provider_item_id, availability.as_str()],
+            )
+            .map_err(DatabaseError::Sqlite)?;
+        transaction
+            .execute(
+                "INSERT INTO events(level, component, event, message, context_json)
+                 VALUES (?1, 'repair', 'provider_availability_observed', ?2,
+                         json_object('provider_item_id', ?3, 'availability', ?4))",
+                rusqlite::params![
+                    if availability == ProviderAvailability::PermanentlyUnavailable {
+                        "warning"
+                    } else {
+                        "info"
+                    },
+                    message,
+                    provider_item_id,
+                    availability.as_str()
+                ],
+            )
+            .map_err(DatabaseError::Sqlite)?;
+        transaction.commit().map_err(DatabaseError::Sqlite)?;
+        Ok(true)
+    }
+
+    /// Reconciles durable repair eligibility from conservative persisted evidence.
+    pub fn reconcile_repair_eligibility(
+        &mut self,
+        limit: usize,
+    ) -> Result<RepairEligibilitySummary, DatabaseError> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(DatabaseError::Sqlite)?;
+        let cancelled = transaction
+            .execute(
+                "UPDATE repair_cases SET state = 'cancelled', updated_at = CURRENT_TIMESTAMP
+                 WHERE state IN ('eligible', 'unresolved') AND NOT EXISTS (
+                     SELECT 1 FROM provider_items
+                     JOIN collection_memberships ON
+                          collection_memberships.provider_item_id = provider_items.id
+                         AND collection_memberships.active = 1
+                     JOIN recordings ON recordings.id = provider_items.recording_id
+                     JOIN artifacts ON artifacts.id = repair_cases.reference_artifact_id
+                     JOIN artifact_fingerprints ON
+                          artifact_fingerprints.artifact_id = artifacts.id
+                     WHERE provider_items.id = repair_cases.original_provider_item_id
+                       AND provider_items.availability = 'permanently_unavailable'
+                       AND artifacts.health IN ('missing', 'corrupt')
+                 )",
+                [],
+            )
+            .map_err(DatabaseError::Sqlite)?;
+        let eligible_ids = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT DISTINCT provider_items.id, recordings.id, artifacts.id
+                     FROM provider_items
+                     JOIN collection_memberships ON
+                          collection_memberships.provider_item_id = provider_items.id
+                         AND collection_memberships.active = 1
+                     JOIN recordings ON recordings.id = provider_items.recording_id
+                     JOIN artifacts ON artifacts.id = recordings.preferred_artifact_id
+                     JOIN artifact_fingerprints ON
+                          artifact_fingerprints.artifact_id = artifacts.id
+                     WHERE provider_items.availability = 'permanently_unavailable'
+                       AND artifacts.health IN ('missing', 'corrupt')
+                     ORDER BY provider_items.id LIMIT ?1",
+                )
+                .map_err(DatabaseError::Sqlite)?;
+            statement
+                .query_map([limit], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })
+                .map_err(DatabaseError::Sqlite)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(DatabaseError::Sqlite)?
+        };
+        let mut inserted = 0_u64;
+        let mut reopened = 0_u64;
+        let mut unchanged = 0_u64;
+        for (provider_item_id, recording_id, artifact_id) in eligible_ids {
+            let prior = transaction
+                .query_row(
+                    "SELECT state FROM repair_cases WHERE original_provider_item_id = ?1",
+                    [provider_item_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(DatabaseError::Sqlite)?;
+            match prior.as_deref() {
+                None => {
+                    transaction
+                        .execute(
+                            "INSERT INTO repair_cases(recording_id, original_provider_item_id,
+                             reference_artifact_id) VALUES (?1, ?2, ?3)",
+                            rusqlite::params![recording_id, provider_item_id, artifact_id],
+                        )
+                        .map_err(DatabaseError::Sqlite)?;
+                    inserted += 1;
+                }
+                Some("cancelled") => {
+                    transaction
+                        .execute(
+                            "UPDATE repair_cases SET recording_id = ?2, reference_artifact_id = ?3,
+                             state = 'eligible', updated_at = CURRENT_TIMESTAMP
+                         WHERE original_provider_item_id = ?1",
+                            rusqlite::params![provider_item_id, recording_id, artifact_id],
+                        )
+                        .map_err(DatabaseError::Sqlite)?;
+                    reopened += 1;
+                }
+                Some(_) => unchanged += 1,
+            }
+        }
+        transaction.commit().map_err(DatabaseError::Sqlite)?;
+        Ok(RepairEligibilitySummary {
+            inserted,
+            reopened,
+            unchanged,
+            cancelled: cancelled as u64,
+        })
+    }
+
+    /// Loads bounded eligible repair cases with retained reference evidence.
+    pub fn eligible_repair_cases(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<EligibleRepairCase>, DatabaseError> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT repair_cases.id, repair_cases.recording_id,
+                    repair_cases.original_provider_item_id, provider_items.source_title,
+                    recordings.musicbrainz_recording_id, recordings.isrc,
+                    artifacts.duration_ms, artifact_fingerprints.max_seconds,
+                    artifact_fingerprints.duration_ms,
+                    artifact_fingerprints.fingerprint_json
+             FROM repair_cases
+             JOIN provider_items ON provider_items.id = repair_cases.original_provider_item_id
+             JOIN recordings ON recordings.id = repair_cases.recording_id
+             JOIN artifacts ON artifacts.id = repair_cases.reference_artifact_id
+             JOIN artifact_fingerprints ON
+                  artifact_fingerprints.artifact_id = repair_cases.reference_artifact_id
+             WHERE repair_cases.state = 'eligible'
+             ORDER BY repair_cases.id LIMIT ?1",
+            )
+            .map_err(DatabaseError::Sqlite)?;
+        statement
+            .query_map([limit], |row| {
+                Ok(EligibleRepairCase {
+                    case_id: row.get(0)?,
+                    recording_id: row.get(1)?,
+                    original_provider_item_id: row.get(2)?,
+                    source_title: row.get(3)?,
+                    musicbrainz_recording_id: row.get(4)?,
+                    isrc: row.get(5)?,
+                    reference_duration_ms: row.get(6)?,
+                    fingerprint_max_seconds: row.get(7)?,
+                    fingerprint_duration_ms: row.get(8)?,
+                    fingerprint_json: row.get(9)?,
+                })
+            })
+            .map_err(DatabaseError::Sqlite)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(DatabaseError::Sqlite)
+    }
+
+    /// Stores search-generated candidates as unverified audit evidence.
+    pub fn record_repair_candidates(
+        &mut self,
+        case_id: i64,
+        candidates: &[crate::provider::ProviderItem],
+    ) -> Result<u64, DatabaseError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(DatabaseError::Sqlite)?;
+        let state = transaction
+            .query_row(
+                "SELECT state FROM repair_cases WHERE id = ?1",
+                [case_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(DatabaseError::Sqlite)?
+            .ok_or(DatabaseError::RepairCaseNotFound(case_id))?;
+        if state != "eligible" && state != "unresolved" {
+            return Err(DatabaseError::RepairCaseNotEligible(case_id));
+        }
+        let mut inserted = 0_u64;
+        for candidate in candidates {
+            let metadata =
+                serde_json::to_string(&candidate.raw_metadata).map_err(DatabaseError::Json)?;
+            inserted += transaction
+                .execute(
+                    "INSERT OR IGNORE INTO repair_attempts(
+                     repair_case_id, candidate_provider, candidate_provider_item_id,
+                     candidate_url, state, reason, candidate_metadata_json)
+                 VALUES (?1, 'youtube', ?2, ?3, 'generated',
+                         'search generated only; independent identity not yet verified', ?4)",
+                    rusqlite::params![case_id, candidate.provider_item_id, candidate.url, metadata],
+                )
+                .map_err(DatabaseError::Sqlite)? as u64;
+        }
+        transaction
+            .execute(
+                "UPDATE repair_cases SET state = 'unresolved', updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?1",
+                [case_id],
+            )
+            .map_err(DatabaseError::Sqlite)?;
+        transaction.commit().map_err(DatabaseError::Sqlite)?;
+        Ok(inserted)
     }
 
     /// Persists one conservative artifact-health observation transactionally.
@@ -1488,6 +1799,8 @@ pub struct OperationalStatus {
     pub jobs: JobStatusCounts,
     /// Physical artifact counts by constrained health.
     pub artifacts: ArtifactHealthCounts,
+    /// Repair cases grouped by their conservative durable state.
+    pub repairs: RepairCaseCounts,
     /// Playlist outputs with committed exact-byte evidence.
     pub playlist_outputs: u64,
     /// Bounded newest-first warning/error events.
@@ -1520,6 +1833,19 @@ pub struct ArtifactHealthCounts {
     pub missing: u64,
     /// Artifacts known to be structurally corrupt.
     pub corrupt: u64,
+}
+
+/// Durable repair-case counts by constrained state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct RepairCaseCounts {
+    /// Cases satisfying every persisted prerequisite for candidate generation.
+    pub eligible: u64,
+    /// Cases retaining insufficient candidate evidence.
+    pub unresolved: u64,
+    /// Cases with an independently verified candidate awaiting or completing commit.
+    pub verified: u64,
+    /// Cases made ineligible by recovered health, membership, or availability.
+    pub cancelled: u64,
 }
 
 /// One bounded persisted warning or error event.
@@ -1659,6 +1985,100 @@ pub struct ArtifactFingerprintEvidence {
     pub value_count: i64,
 }
 
+/// Original provider object whose active recording artifact needs repair assessment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepairOriginalCandidate {
+    /// Durable provider-item row ID.
+    pub provider_item_id: i64,
+    /// Provider adapter name.
+    pub provider: String,
+    /// Provider-owned object ID.
+    pub provider_owned_id: String,
+    /// Auditable original URL checked directly.
+    pub original_url: String,
+    /// Previously persisted availability.
+    pub availability: ProviderAvailability,
+    /// Preferred reference artifact retaining identity evidence.
+    pub artifact_id: i64,
+    /// Missing or corrupt local state.
+    pub artifact_health: ArtifactHealth,
+}
+
+/// Constrained provider availability persisted independently from artifact health.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderAvailability {
+    /// Availability has not been checked.
+    Unknown,
+    /// The original provider object is usable.
+    Available,
+    /// Evidence is insufficient due to a retryable or infrastructure failure.
+    TransientFailure,
+    /// The provider explicitly and definitively reported permanent loss.
+    PermanentlyUnavailable,
+}
+
+impl ProviderAvailability {
+    fn parse(value: &str) -> Result<Self, DatabaseError> {
+        match value {
+            "unknown" => Ok(Self::Unknown),
+            "available" => Ok(Self::Available),
+            "transient_failure" => Ok(Self::TransientFailure),
+            "permanently_unavailable" => Ok(Self::PermanentlyUnavailable),
+            unexpected => Err(DatabaseError::InvalidProviderAvailability(
+                unexpected.into(),
+            )),
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Available => "available",
+            Self::TransientFailure => "transient_failure",
+            Self::PermanentlyUnavailable => "permanently_unavailable",
+        }
+    }
+}
+
+/// Durable effects from one bounded repair-eligibility reconciliation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct RepairEligibilitySummary {
+    /// Newly created eligible cases.
+    pub inserted: u64,
+    /// Previously cancelled cases made eligible again.
+    pub reopened: u64,
+    /// Existing active cases whose eligibility remains unchanged.
+    pub unchanged: u64,
+    /// Cases cancelled because a safety prerequisite no longer holds.
+    pub cancelled: u64,
+}
+
+/// Eligible repair case retaining canonical, duration, and fingerprint references.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EligibleRepairCase {
+    /// Durable repair-case ID.
+    pub case_id: i64,
+    /// Canonical recording row targeted by repair.
+    pub recording_id: i64,
+    /// Definitively unavailable original provider row.
+    pub original_provider_item_id: i64,
+    /// Provider title usable only for candidate generation.
+    pub source_title: Option<String>,
+    /// Optional canonical MusicBrainz recording identity.
+    pub musicbrainz_recording_id: Option<String>,
+    /// Optional canonical ISRC evidence.
+    pub isrc: Option<String>,
+    /// Structural duration from the reference artifact.
+    pub reference_duration_ms: Option<i64>,
+    /// Audio seconds used for reference fingerprint extraction.
+    pub fingerprint_max_seconds: i64,
+    /// Duration reported alongside the retained reference fingerprint.
+    pub fingerprint_duration_ms: i64,
+    /// Serialized raw algorithm-2 fingerprint values.
+    pub fingerprint_json: String,
+}
+
 /// Persistence initialization or migration failure.
 #[derive(Debug, Error)]
 pub enum DatabaseError {
@@ -1746,6 +2166,18 @@ pub enum DatabaseError {
     /// Durable artifact health violated the constrained schema vocabulary.
     #[error("invalid durable artifact health: {0}")]
     InvalidArtifactHealth(String),
+    /// Durable provider availability violated the constrained schema vocabulary.
+    #[error("invalid durable provider availability: {0}")]
+    InvalidProviderAvailability(String),
+    /// A provider item did not exist during availability persistence.
+    #[error("provider item {0} does not exist")]
+    ProviderItemNotFound(i64),
+    /// A repair case did not exist during candidate persistence.
+    #[error("repair case {0} does not exist")]
+    RepairCaseNotFound(i64),
+    /// Candidate generation cannot mutate a terminal or cancelled repair case.
+    #[error("repair case {0} is not eligible for candidate generation")]
+    RepairCaseNotEligible(i64),
     /// Commit preparation requires a currently running acquisition.
     #[error("acquisition job is not running: {0}")]
     AcquisitionNotRunning(i64),
@@ -2020,6 +2452,104 @@ mod tests {
 
         assert_eq!(database.schema_version()?, CURRENT_SCHEMA_VERSION);
         assert_eq!(database.table_count("acquisition_jobs")?, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn repair_eligibility_requires_every_conservative_prerequisite()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut database = Database::open_in_memory()?;
+        database
+            .connection
+            .execute("INSERT INTO recordings DEFAULT VALUES", [])?;
+        database.connection.execute(
+            "INSERT INTO artifacts(recording_id, path, health)
+             VALUES (1, '/music/missing.opus', 'missing')",
+            [],
+        )?;
+        database.connection.execute(
+            "UPDATE recordings SET preferred_artifact_id = 1 WHERE id = 1",
+            [],
+        )?;
+        database.connection.execute(
+            "INSERT INTO provider_items(provider, provider_item_id, original_url,
+                 recording_id) VALUES ('youtube', 'original',
+                 'https://youtu.be/original', 1)",
+            [],
+        )?;
+        database.connection.execute(
+            "INSERT INTO collections(provider, provider_collection_id, name)
+             VALUES ('youtube', 'fixture', 'Fixture')",
+            [],
+        )?;
+        database.connection.execute(
+            "INSERT INTO collection_memberships(collection_id, provider_item_id, active)
+             VALUES (1, 1, 1)",
+            [],
+        )?;
+        database.record_artifact_fingerprint(&ArtifactFingerprintEvidence {
+            artifact_id: 1,
+            max_seconds: 120,
+            duration_ms: 180_000,
+            fingerprint_json: "[1,2,3]".into(),
+            value_count: 3,
+        })?;
+
+        let candidates = database.repair_original_candidates(10)?;
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].availability, ProviderAvailability::Unknown);
+        assert_eq!(database.reconcile_repair_eligibility(10)?.inserted, 0);
+        assert!(database.record_provider_availability(
+            1,
+            ProviderAvailability::TransientFailure,
+            "provider timeout"
+        )?);
+        assert_eq!(database.reconcile_repair_eligibility(10)?.inserted, 0);
+
+        assert!(database.record_provider_availability(
+            1,
+            ProviderAvailability::PermanentlyUnavailable,
+            "provider explicitly reports deleted"
+        )?);
+        assert_eq!(database.reconcile_repair_eligibility(10)?.inserted, 1);
+        assert_eq!(database.reconcile_repair_eligibility(10)?.unchanged, 1);
+        assert!(!database.record_provider_availability(
+            1,
+            ProviderAvailability::TransientFailure,
+            "later provider timeout does not erase definitive evidence"
+        )?);
+        assert_eq!(
+            database.repair_original_candidates(10)?[0].availability,
+            ProviderAvailability::PermanentlyUnavailable
+        );
+        let eligible = database.eligible_repair_cases(10)?;
+        assert_eq!(eligible.len(), 1);
+        let candidate = ProviderItem {
+            provider_item_id: "candidate".into(),
+            url: "https://youtu.be/candidate".into(),
+            title: Some("Text is generation only".into()),
+            duration_ms: Some(180_000),
+            raw_metadata: json!({"id": "candidate"}),
+        };
+        assert_eq!(
+            database
+                .record_repair_candidates(eligible[0].case_id, std::slice::from_ref(&candidate),)?,
+            1
+        );
+        assert_eq!(
+            database.record_repair_candidates(eligible[0].case_id, &[candidate])?,
+            0
+        );
+        assert_eq!(database.table_count("repair_attempts")?, 1);
+
+        database
+            .connection
+            .execute("UPDATE artifacts SET health = 'healthy' WHERE id = 1", [])?;
+        assert_eq!(database.reconcile_repair_eligibility(10)?.cancelled, 1);
+        database
+            .connection
+            .execute("UPDATE artifacts SET health = 'missing' WHERE id = 1", [])?;
+        assert_eq!(database.reconcile_repair_eligibility(10)?.reopened, 1);
         Ok(())
     }
 

@@ -25,6 +25,7 @@ use music_sync::media_probe::Ffprobe;
 use music_sync::persistence::Database;
 use music_sync::playlist::{PlaylistMaterializationReport, materialize_playlists};
 use music_sync::provider::{SourceId, SourceSnapshot, is_supported_youtube_url};
+use music_sync::repair::{assess_repair_eligibility, generate_repair_candidates};
 use music_sync::sync::{
     SourceSyncResult, SyncBoundaries, SyncDirectories, SyncLimits, SyncRunReport, run_sync,
 };
@@ -75,6 +76,11 @@ enum Command {
         #[command(subcommand)]
         command: AcquisitionCommand,
     },
+    /// Assess and process conservative lost-media repair cases.
+    Repair {
+        #[command(subcommand)]
+        command: RepairCommand,
+    },
     /// Materialize Navidrome-compatible playlists from durable collections.
     Playlist {
         #[command(subcommand)]
@@ -93,6 +99,43 @@ enum Command {
         /// Maximum newest warning/error events to show (1 through 100).
         #[arg(long, default_value = "20")]
         recent_events: NonZeroUsize,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum RepairCommand {
+    /// Check unhealthy originals and persist only definitive repair eligibility.
+    Assess {
+        /// TOML configuration identifying the application database.
+        #[arg(short, long, default_value = "music-sync.toml")]
+        config: PathBuf,
+        /// Maximum unhealthy originals checked once in stable order.
+        #[arg(long, default_value = "100")]
+        max_items: NonZeroUsize,
+        /// yt-dlp executable path.
+        #[arg(long, default_value = "yt-dlp")]
+        yt_dlp: PathBuf,
+        /// Per-original provider deadline in seconds.
+        #[arg(long, default_value = "60")]
+        timeout_seconds: NonZeroU64,
+    },
+    /// Generate search candidates without treating text results as identity evidence.
+    Generate {
+        /// TOML configuration identifying the application database.
+        #[arg(short, long, default_value = "music-sync.toml")]
+        config: PathBuf,
+        /// Maximum eligible repair cases processed once.
+        #[arg(long, default_value = "20")]
+        max_cases: NonZeroUsize,
+        /// Maximum provider candidates retained per case.
+        #[arg(long, default_value = "5")]
+        max_candidates: NonZeroUsize,
+        /// yt-dlp executable path.
+        #[arg(long, default_value = "yt-dlp")]
+        yt_dlp: PathBuf,
+        /// Per-search provider deadline in seconds.
+        #[arg(long, default_value = "60")]
+        timeout_seconds: NonZeroU64,
     },
 }
 
@@ -347,6 +390,99 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> Result<ExitCode, Box<dyn Error>> {
     match cli.command {
+        Command::Repair {
+            command:
+                RepairCommand::Generate {
+                    config,
+                    max_cases,
+                    max_candidates,
+                    yt_dlp,
+                    timeout_seconds,
+                },
+        } => {
+            if max_candidates.get() > 50 {
+                return Err("maximum repair candidates per case must not exceed 50".into());
+            }
+            let config = AppConfig::from_file(&config)?;
+            let mut database = Database::open(&config.database_path())?;
+            let adapter = YtDlp::new(yt_dlp, Duration::from_secs(timeout_seconds.get()));
+            let report = generate_repair_candidates(
+                &mut database,
+                &adapter,
+                max_cases.get(),
+                max_candidates.get(),
+            )?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("Repair cases selected: {}", report.selected_cases);
+                println!("Candidates generated:  {}", report.generated);
+                println!("Generation failures:   {}", report.failures.len());
+                for failure in &report.failures {
+                    println!(
+                        "  Provider item {}: {}",
+                        failure.provider_item_id, failure.message
+                    );
+                }
+            }
+            Ok(if report.failures.is_empty() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(1)
+            })
+        }
+        Command::Repair {
+            command:
+                RepairCommand::Assess {
+                    config,
+                    max_items,
+                    yt_dlp,
+                    timeout_seconds,
+                },
+        } => {
+            let config = AppConfig::from_file(&config)?;
+            let mut database = Database::open(&config.database_path())?;
+            let adapter = YtDlp::new(yt_dlp, Duration::from_secs(timeout_seconds.get()));
+            let report = assess_repair_eligibility(&mut database, &adapter, max_items.get())?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("Originals selected:              {}", report.selected);
+                println!("Originals available:             {}", report.available);
+                println!(
+                    "Originals permanently unavailable: {}",
+                    report.permanently_unavailable
+                );
+                println!(
+                    "Availability changes:            {}",
+                    report.availability_changed
+                );
+                println!(
+                    "Repair cases inserted:           {}",
+                    report.eligibility.inserted
+                );
+                println!(
+                    "Repair cases reopened:           {}",
+                    report.eligibility.reopened
+                );
+                println!(
+                    "Repair cases cancelled:          {}",
+                    report.eligibility.cancelled
+                );
+                println!("Assessment failures:             {}", report.failures.len());
+                for failure in &report.failures {
+                    println!(
+                        "  Provider item {}: {}",
+                        failure.provider_item_id, failure.message
+                    );
+                }
+            }
+            Ok(if report.failures.is_empty() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(1)
+            })
+        }
         Command::Status {
             config,
             recent_events,
@@ -380,6 +516,10 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn Error>> {
                 println!("Artifacts unknown:       {}", report.artifacts.unknown);
                 println!("Artifacts missing:       {}", report.artifacts.missing);
                 println!("Artifacts corrupt:       {}", report.artifacts.corrupt);
+                println!("Repairs eligible:        {}", report.repairs.eligible);
+                println!("Repairs unresolved:      {}", report.repairs.unresolved);
+                println!("Repairs verified:        {}", report.repairs.verified);
+                println!("Repairs cancelled:       {}", report.repairs.cancelled);
                 println!("Playlist outputs:        {}", report.playlist_outputs);
                 println!("Recent warning/errors:   {}", report.recent_events.len());
                 for event in report.recent_events {
