@@ -55,7 +55,8 @@ in ad hoc TODO documents.
 ## P5 — Operations and deployment
 
 - Bounded `sync run` orchestration and systemd examples (complete).
-- Run/job history, failures, retry, status, and expanded doctor commands.
+- Read-only durable operational status (complete).
+- Run/job history, expanded failure listing, retry, and expanded doctor commands.
 - Interactive and JSON progress, persistent logs, systemd examples.
 - Least-privilege LXC compatibility/deployment validation in isolated test storage.
 - Production health checks, performance measurement, and repair workflows.

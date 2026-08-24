@@ -39,6 +39,8 @@ architecture documents explain implementation boundaries.
   healthy artifacts, with unresolved-entry reporting and no-clobber first writes.
 - One bounded timer-friendly sync command composing active-source reconciliation,
   acquisition, and playlist phases while isolating ordinary provider/job failures.
+- Strictly read-only operational status with durable source/membership/job/artifact/
+  playlist counts and bounded newest-first warning/error diagnostics.
 - Executable preservation and replacement policies plus deterministic tests.
 - Nix development shell, task runner, architecture enforcement, and CI-ready check.
 

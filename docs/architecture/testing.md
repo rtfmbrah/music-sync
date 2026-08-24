@@ -48,6 +48,9 @@
 - Full sync CLI coverage proves all phases complete in one invocation, repeats avoid
   downloads, and one transient source failure preserves its prior membership while
   unrelated reconciliation and playlist work continue.
+- Status black-box coverage creates a deferred acquisition and proves typed counts
+  and its warning event are reported without changing database bytes, SQLite sidecar
+  files, library files, or playlist files.
 - Scenario tests encode removed membership, disappeared remote with healthy local
   media, transient failure, same-title fingerprint mismatch, and repeat idempotency.
 - The architecture check reads Cargo metadata and enforces CLI-to-library dependency

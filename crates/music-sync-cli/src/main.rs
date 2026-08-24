@@ -83,6 +83,15 @@ enum Command {
         #[command(subcommand)]
         command: SyncCommand,
     },
+    /// Show read-only durable operational state without contacting providers.
+    Status {
+        /// TOML configuration identifying the application database.
+        #[arg(short, long, default_value = "music-sync.toml")]
+        config: PathBuf,
+        /// Maximum newest warning/error events to show (1 through 100).
+        #[arg(long, default_value = "20")]
+        recent_events: NonZeroUsize,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -268,6 +277,50 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> Result<ExitCode, Box<dyn Error>> {
     match cli.command {
+        Command::Status {
+            config,
+            recent_events,
+        } => {
+            if recent_events.get() > 100 {
+                return Err("recent event limit must not exceed 100".into());
+            }
+            let config = AppConfig::from_file(&config)?;
+            let report = Database::operational_status_read_only(
+                &config.database_path(),
+                recent_events.get(),
+            )?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("Schema version:          {}", report.schema_version);
+                println!("Sources active:          {}", report.active_sources);
+                println!("Sources inactive:        {}", report.inactive_sources);
+                println!("Collections:             {}", report.collections);
+                println!("Memberships active:      {}", report.active_memberships);
+                println!(
+                    "Memberships unresolved:  {}",
+                    report.unresolved_active_memberships
+                );
+                println!("Jobs pending:            {}", report.jobs.pending);
+                println!("Jobs running:            {}", report.jobs.running);
+                println!("Jobs succeeded:          {}", report.jobs.succeeded);
+                println!("Jobs failed:             {}", report.jobs.failed);
+                println!("Jobs deferred:           {}", report.jobs.deferred);
+                println!("Artifacts healthy:       {}", report.artifacts.healthy);
+                println!("Artifacts unknown:       {}", report.artifacts.unknown);
+                println!("Artifacts missing:       {}", report.artifacts.missing);
+                println!("Artifacts corrupt:       {}", report.artifacts.corrupt);
+                println!("Playlist outputs:        {}", report.playlist_outputs);
+                println!("Recent warning/errors:   {}", report.recent_events.len());
+                for event in report.recent_events {
+                    println!(
+                        "  {} {} {} {}: {}",
+                        event.created_at, event.level, event.component, event.event, event.message
+                    );
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Doctor { config } => {
             info!(config = %config.display(), "running local diagnostics");
             let config = AppConfig::from_file(&config)?;

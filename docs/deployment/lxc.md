@@ -182,3 +182,9 @@ remained non-writable. Local `systemd-analyze verify` parsed the example units a
 then reported the expected missing `/opt/music-sync/bin/music-sync`, because the
 examples are deliberately not installed on the development host. A complete unit
 verification remains a deployment-time check after adapting and installing paths.
+
+Read-only operational status was validated against that completed isolated sync
+state. It reported schema 6, one active source, two resolved active memberships, two
+succeeded jobs, two healthy artifacts, and one committed playlist output. The exact
+SQLite SHA-256 and the state-directory file set were identical before and after the
+command, no SQLite sidecars appeared, and `/srv/music` remained non-writable.

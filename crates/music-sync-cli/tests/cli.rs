@@ -782,3 +782,95 @@ fn sync_run_completes_all_phases_and_isolates_one_source_failure()
     );
     Ok(())
 }
+
+#[test]
+fn status_reports_durable_failures_without_modifying_state()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = tempfile::tempdir()?;
+    let state = root.path().join("state");
+    let library = root.path().join("library");
+    let playlists = root.path().join("playlists");
+    fs::create_dir_all(&state)?;
+    fs::create_dir_all(&library)?;
+    fs::create_dir_all(&playlists)?;
+    let config = root.path().join("music-sync.toml");
+    fs::write(
+        &config,
+        format!(
+            "state_directory = {:?}\nlibrary_directory = {:?}\nplaylist_directory = {:?}\n",
+            state, library, playlists
+        ),
+    )?;
+    let database = state.join("music-sync.sqlite3");
+    let yt_dlp = root.path().join("yt-dlp");
+    let ffprobe = root.path().join("ffprobe");
+    fs::write(
+        &yt_dlp,
+        "#!/bin/sh\ncase \" $* \" in *' --dump-single-json '*) printf '%s' '{\"id\":\"one\",\"webpage_url\":\"https://youtu.be/one\",\"title\":\"One\"}' ;; *) printf '%s' 'temporary failure' >&2; exit 1 ;; esac\n",
+    )?;
+    fs::write(&ffprobe, "#!/bin/sh\nexit 1\n")?;
+    for executable in [&yt_dlp, &ffprobe] {
+        let mut permissions = fs::metadata(executable)?.permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(executable, permissions)?;
+    }
+    assert!(
+        Command::new(env!("CARGO_BIN_EXE_music-sync"))
+            .args(["source", "add", "https://youtu.be/one", "--database"])
+            .arg(&database)
+            .output()?
+            .status
+            .success()
+    );
+    assert!(
+        Command::new(env!("CARGO_BIN_EXE_music-sync"))
+            .args(["source", "reconcile", "1", "--database"])
+            .arg(&database)
+            .arg("--yt-dlp")
+            .arg(&yt_dlp)
+            .output()?
+            .status
+            .success()
+    );
+    assert!(
+        !Command::new(env!("CARGO_BIN_EXE_music-sync"))
+            .args(["acquisition", "run-one", "--config"])
+            .arg(&config)
+            .arg("--yt-dlp")
+            .arg(&yt_dlp)
+            .arg("--ffprobe")
+            .arg(&ffprobe)
+            .output()?
+            .status
+            .success()
+    );
+    let before_database = fs::read(&database)?;
+    let mut before_entries = fs::read_dir(&state)?
+        .map(|entry| entry.map(|entry| entry.file_name()))
+        .collect::<Result<Vec<_>, _>>()?;
+    before_entries.sort();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_music-sync"))
+        .args(["--json", "status", "--config"])
+        .arg(&config)
+        .args(["--recent-events", "5"])
+        .output()?;
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert!(output.status.success());
+    assert_eq!(report["active_sources"], 1);
+    assert_eq!(report["active_memberships"], 1);
+    assert_eq!(report["unresolved_active_memberships"], 1);
+    assert_eq!(report["jobs"]["deferred"], 1);
+    assert_eq!(report["artifacts"]["healthy"], 0);
+    assert_eq!(report["recent_events"].as_array().map(Vec::len), Some(1));
+    assert_eq!(report["recent_events"][0]["event"], "acquisition_deferred");
+    assert_eq!(fs::read(&database)?, before_database);
+    let mut after_entries = fs::read_dir(&state)?
+        .map(|entry| entry.map(|entry| entry.file_name()))
+        .collect::<Result<Vec<_>, _>>()?;
+    after_entries.sort();
+    assert_eq!(after_entries, before_entries);
+    assert!(playlists.read_dir()?.next().is_none());
+    assert!(library.read_dir()?.next().is_none());
+    Ok(())
+}

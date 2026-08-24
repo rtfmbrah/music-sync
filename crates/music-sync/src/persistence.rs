@@ -90,6 +90,101 @@ impl Database {
         Ok(DatabaseInspection { version })
     }
 
+    /// Reads a bounded operational summary without creating, migrating, or writing state.
+    pub fn operational_status_read_only(
+        path: &Path,
+        recent_event_limit: usize,
+    ) -> Result<OperationalStatus, DatabaseError> {
+        let path_text = path
+            .to_str()
+            .ok_or_else(|| DatabaseError::NonUnicodePath(path.to_path_buf()))?;
+        let uri = format!("file:{}?immutable=1", sqlite_uri_path(path_text));
+        let connection = Connection::open_with_flags(
+            uri,
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_URI,
+        )
+        .map_err(|source| DatabaseError::Open {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let version = connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+            .map_err(DatabaseError::Sqlite)?;
+        if version != CURRENT_SCHEMA_VERSION {
+            return Err(DatabaseError::StatusSchemaMismatch {
+                found: version,
+                required: CURRENT_SCHEMA_VERSION,
+            });
+        }
+        let count = |sql: &str| {
+            connection
+                .query_row(sql, [], |row| row.get::<_, u64>(0))
+                .map_err(DatabaseError::Sqlite)
+        };
+        let mut statement = connection
+            .prepare(
+                "SELECT created_at, level, component, event, message, run_id, job_id
+                 FROM events
+                 WHERE level IN ('warning', 'error')
+                 ORDER BY id DESC LIMIT ?1",
+            )
+            .map_err(DatabaseError::Sqlite)?;
+        let limit = i64::try_from(recent_event_limit).unwrap_or(i64::MAX);
+        let events = statement
+            .query_map([limit], |row| {
+                Ok(OperationalEvent {
+                    created_at: row.get(0)?,
+                    level: row.get(1)?,
+                    component: row.get(2)?,
+                    event: row.get(3)?,
+                    message: row.get(4)?,
+                    run_id: row.get(5)?,
+                    job_id: row.get(6)?,
+                })
+            })
+            .map_err(DatabaseError::Sqlite)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(DatabaseError::Sqlite)?;
+        Ok(OperationalStatus {
+            schema_version: version,
+            active_sources: count("SELECT COUNT(*) FROM sources WHERE active = 1")?,
+            inactive_sources: count("SELECT COUNT(*) FROM sources WHERE active = 0")?,
+            collections: count("SELECT COUNT(*) FROM collections")?,
+            active_memberships: count(
+                "SELECT COUNT(*) FROM collection_memberships WHERE active = 1",
+            )?,
+            unresolved_active_memberships: count(
+                "SELECT COUNT(*)
+                 FROM collection_memberships
+                 JOIN provider_items ON provider_items.id =
+                      collection_memberships.provider_item_id
+                 LEFT JOIN recordings ON recordings.id = provider_items.recording_id
+                 LEFT JOIN artifacts ON artifacts.id = recordings.preferred_artifact_id
+                 WHERE collection_memberships.active = 1
+                   AND (artifacts.id IS NULL OR artifacts.health != 'healthy')",
+            )?,
+            jobs: JobStatusCounts {
+                pending: count("SELECT COUNT(*) FROM jobs WHERE status = 'pending'")?,
+                running: count("SELECT COUNT(*) FROM jobs WHERE status = 'running'")?,
+                succeeded: count("SELECT COUNT(*) FROM jobs WHERE status = 'succeeded'")?,
+                failed: count("SELECT COUNT(*) FROM jobs WHERE status = 'failed'")?,
+                deferred: count("SELECT COUNT(*) FROM jobs WHERE status = 'deferred'")?,
+            },
+            artifacts: ArtifactHealthCounts {
+                unknown: count("SELECT COUNT(*) FROM artifacts WHERE health = 'unknown'")?,
+                healthy: count("SELECT COUNT(*) FROM artifacts WHERE health = 'healthy'")?,
+                missing: count("SELECT COUNT(*) FROM artifacts WHERE health = 'missing'")?,
+                corrupt: count("SELECT COUNT(*) FROM artifacts WHERE health = 'corrupt'")?,
+            },
+            playlist_outputs: count(
+                "SELECT COUNT(*) FROM playlist_outputs WHERE sha256 IS NOT NULL",
+            )?,
+            recent_events: events,
+        })
+    }
+
     /// Reports the applied schema version.
     pub fn schema_version(&self) -> Result<u32, DatabaseError> {
         self.connection
@@ -889,6 +984,20 @@ impl Database {
     }
 }
 
+fn sqlite_uri_path(path: &str) -> String {
+    use std::fmt::Write;
+
+    path.bytes()
+        .fold(String::with_capacity(path.len()), |mut output, byte| {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'_' | b'.' | b'~') {
+                output.push(char::from(byte));
+            } else {
+                let _ = write!(output, "%{byte:02X}");
+            }
+            output
+        })
+}
+
 fn source_collection_id(
     transaction: &Transaction<'_>,
     source_id: SourceId,
@@ -1064,6 +1173,78 @@ pub struct DatabaseInspection {
     pub version: u32,
 }
 
+/// Read-only durable operational summary.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct OperationalStatus {
+    /// Durable schema version read from SQLite.
+    pub schema_version: u32,
+    /// Configured sources eligible for synchronization.
+    pub active_sources: u64,
+    /// Preserved but inactive configured sources.
+    pub inactive_sources: u64,
+    /// Durable provider collections.
+    pub collections: u64,
+    /// Currently active collection memberships.
+    pub active_memberships: u64,
+    /// Active memberships lacking a preferred healthy artifact.
+    pub unresolved_active_memberships: u64,
+    /// Durable job counts by constrained state.
+    pub jobs: JobStatusCounts,
+    /// Physical artifact counts by constrained health.
+    pub artifacts: ArtifactHealthCounts,
+    /// Playlist outputs with committed exact-byte evidence.
+    pub playlist_outputs: u64,
+    /// Bounded newest-first warning/error events.
+    pub recent_events: Vec<OperationalEvent>,
+}
+
+/// Durable job counts by state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct JobStatusCounts {
+    /// Jobs not yet claimed.
+    pub pending: u64,
+    /// Jobs claimed by an incomplete process.
+    pub running: u64,
+    /// Successfully completed jobs.
+    pub succeeded: u64,
+    /// Terminally failed jobs.
+    pub failed: u64,
+    /// Retryable jobs deferred after an ordinary failure.
+    pub deferred: u64,
+}
+
+/// Physical artifact counts by health state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct ArtifactHealthCounts {
+    /// Artifacts not yet health-reconciled.
+    pub unknown: u64,
+    /// Structurally accepted local artifacts.
+    pub healthy: u64,
+    /// Artifacts recorded but absent from storage.
+    pub missing: u64,
+    /// Artifacts known to be structurally corrupt.
+    pub corrupt: u64,
+}
+
+/// One bounded persisted warning or error event.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct OperationalEvent {
+    /// SQLite creation timestamp.
+    pub created_at: String,
+    /// Persisted event severity.
+    pub level: String,
+    /// Emitting subsystem.
+    pub component: String,
+    /// Stable event name.
+    pub event: String,
+    /// Human-readable diagnostic.
+    pub message: String,
+    /// Related synchronization run when present.
+    pub run_id: Option<i64>,
+    /// Related durable job when present.
+    pub job_id: Option<i64>,
+}
+
 /// Persistence initialization or migration failure.
 #[derive(Debug, Error)]
 pub enum DatabaseError {
@@ -1107,6 +1288,14 @@ pub enum DatabaseError {
         found: u32,
         /// Highest version supported by this build.
         supported: u32,
+    },
+    /// Read-only status requires the current schema because it never migrates state.
+    #[error("database schema {found} does not match status schema {required}")]
+    StatusSchemaMismatch {
+        /// Version found on disk.
+        found: u32,
+        /// Version required by this build's status queries.
+        required: u32,
     },
     /// Migration bookkeeping was inconsistent.
     #[error("migration {0} was already recorded")]

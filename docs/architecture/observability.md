@@ -15,6 +15,12 @@ diagnostics in both text and JSON.
 results. It returns a nonzero status for isolated failures only after all safe phases
 have completed, making timer alerts truthful without turning one failure into global
 work starvation.
+`status` opens current-schema SQLite state through an immutable read-only connection
+and reports source, membership, job, artifact-health, playlist-output, and bounded
+recent warning/error counts in text or JSON. It creates no WAL/shared-memory files
+and performs no provider or managed-filesystem access. Because SQLite immutable mode
+deliberately ignores concurrent WAL changes, operators run it between oneshot sync
+invocations rather than concurrently with an active writer.
 
 ## PLANNED
 
@@ -24,7 +30,7 @@ and JSON event output support systemd/non-terminal use. Persistent events includ
 timestamp, level, run/component, recording/source/job identifiers, event name,
 message, and structured decision evidence.
 
-Run/job/attempt transitions permit status, history, failure listing, and explicitly
+Run/job/attempt transitions permit history, expanded failure listing, and explicitly
 safe retry commands after crashes. Candidate and discovery logs explain both scores
 and final decisions, for example metadata compatibility followed by fingerprint
 mismatch and rejection. This is one local application, not a distributed queue.
