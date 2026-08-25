@@ -8,6 +8,8 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, Transactio
 use thiserror::Error;
 
 use crate::acquisition::ValidatedStagedMedia;
+use crate::config::DiscoveryConfig;
+use crate::discovery::{DiscoveryLane, Recommendation, score as discovery_score};
 use crate::musicbrainz::{CanonicalRecording, CanonicalRelease};
 use crate::provider::SourceSnapshot;
 use crate::provider::{AddSourceResult, ConfiguredSource, SourceId};
@@ -42,10 +44,11 @@ const MIGRATIONS: &[(u32, &str)] = &[
         14,
         include_str!("../migrations/0014_metadata_materialization.sql"),
     ),
+    (15, include_str!("../migrations/0015_discovery.sql")),
 ];
 
 /// Current durable schema version.
-pub const CURRENT_SCHEMA_VERSION: u32 = 14;
+pub const CURRENT_SCHEMA_VERSION: u32 = 15;
 
 /// A connection to music-sync's private application state.
 #[derive(Debug)]
@@ -248,6 +251,21 @@ impl Database {
                 )?,
                 deferred: count(
                     "SELECT COUNT(*) FROM metadata_materialization_states WHERE state='deferred'",
+                )?,
+            },
+            discovery: DiscoveryCounts {
+                approved: count(
+                    "SELECT COUNT(*) FROM discovery_candidates WHERE state='approved'",
+                )?,
+                queued: count("SELECT COUNT(*) FROM discovery_candidates WHERE state='queued'")?,
+                unresolved: count(
+                    "SELECT COUNT(*) FROM discovery_candidates WHERE state='unresolved'",
+                )?,
+                acquired: count(
+                    "SELECT COUNT(*) FROM discovery_candidates WHERE state='acquired'",
+                )?,
+                budget_rejected: count(
+                    "SELECT COUNT(*) FROM discovery_candidates WHERE state='budget_rejected'",
                 )?,
             },
             playlist_outputs: count(
@@ -1322,6 +1340,235 @@ impl Database {
             artifact_id,
             inserted: true,
         })
+    }
+
+    /// Persists one explainable discovery run and enforces every hard budget transactionally.
+    pub fn record_discovery_candidates(
+        &mut self,
+        provider: &str,
+        recommendations: &[Recommendation],
+        config: &DiscoveryConfig,
+        free_bytes: u64,
+        required_free_bytes: u64,
+    ) -> Result<DiscoveryPersistenceReport, DatabaseError> {
+        let to_i64 =
+            |value: u64| i64::try_from(value).map_err(|_| DatabaseError::DiscoveryCountTooLarge);
+        let maximum = u64::from(config.max_new_tracks_per_day);
+        let target = u64::from(config.target_new_tracks_per_day);
+        let per_artist = u64::from(config.max_tracks_per_artist_per_day);
+        let (exploration, wildcard) =
+            discovery_lane_budgets(maximum, config.exploration_ratio, config.wildcard_ratio);
+        let adjacent = maximum.saturating_sub(exploration).saturating_sub(wildcard);
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(DatabaseError::Sqlite)?;
+        transaction.execute("INSERT INTO discovery_runs(status,maximum_tracks,per_artist_maximum,exploration_maximum,wildcard_maximum,free_bytes,required_free_bytes) VALUES ('running',?1,?2,?3,?4,?5,?6)",rusqlite::params![to_i64(maximum)?,to_i64(per_artist)?,to_i64(exploration)?,to_i64(wildcard)?,to_i64(free_bytes)?,to_i64(required_free_bytes)?]).map_err(DatabaseError::Sqlite)?;
+        let run_id = transaction.last_insert_rowid();
+        let count = |sql: &str| {
+            transaction
+                .query_row(sql, [], |row| row.get::<_, u64>(0))
+                .map_err(DatabaseError::Sqlite)
+        };
+        let mut daily = count(
+            "SELECT COUNT(*) FROM discovery_candidates WHERE date(created_at)=date('now') AND state IN ('approved','queued','acquired')",
+        )?;
+        let mut lane_adjacent = count(
+            "SELECT COUNT(*) FROM discovery_candidates WHERE date(created_at)=date('now') AND lane='adjacent' AND state IN ('approved','queued','acquired')",
+        )?;
+        let mut lane_exploration = count(
+            "SELECT COUNT(*) FROM discovery_candidates WHERE date(created_at)=date('now') AND lane='exploration' AND state IN ('approved','queued','acquired')",
+        )?;
+        let mut lane_wildcard = count(
+            "SELECT COUNT(*) FROM discovery_candidates WHERE date(created_at)=date('now') AND lane='wildcard' AND state IN ('approved','queued','acquired')",
+        )?;
+        let mut report = DiscoveryPersistenceReport {
+            run_id,
+            ..Default::default()
+        };
+        for recommendation in recommendations {
+            let existing=transaction.query_row("SELECT EXISTS(SELECT 1 FROM recordings WHERE musicbrainz_recording_id=?1) OR EXISTS(SELECT 1 FROM discovery_candidates WHERE musicbrainz_recording_id=?1 AND state IN ('approved','queued','acquired'))",[&recommendation.recording_mbid],|row|row.get::<_,bool>(0)).map_err(DatabaseError::Sqlite)?;
+            let artist_today = if let Some(artist) = &recommendation.artist_mbid {
+                transaction.query_row("SELECT COUNT(*) FROM discovery_candidates WHERE date(created_at)=date('now') AND musicbrainz_artist_id=?1 AND state IN ('approved','queued','acquired')",[artist],|row|row.get::<_,u64>(0)).map_err(DatabaseError::Sqlite)?
+            } else {
+                transaction.query_row("SELECT COUNT(*) FROM discovery_candidates WHERE date(created_at)=date('now') AND musicbrainz_artist_id IS NULL AND state IN ('approved','queued','acquired')",[],|row|row.get::<_,u64>(0)).map_err(DatabaseError::Sqlite)?
+            };
+            let lane_used = match recommendation.lane {
+                DiscoveryLane::Adjacent => lane_adjacent,
+                DiscoveryLane::Exploration => lane_exploration,
+                DiscoveryLane::Wildcard => lane_wildcard,
+            };
+            let lane_max = match recommendation.lane {
+                DiscoveryLane::Adjacent => adjacent,
+                DiscoveryLane::Exploration => exploration,
+                DiscoveryLane::Wildcard => wildcard,
+            };
+            let (state, reason) = if existing {
+                ("duplicate", "recording MBID already exists or is queued")
+            } else if free_bytes < required_free_bytes {
+                ("budget_rejected", "minimum free storage guard failed")
+            } else if daily >= maximum || daily >= target {
+                ("budget_rejected", "daily target or hard maximum reached")
+            } else if artist_today >= per_artist {
+                ("budget_rejected", "daily per-artist maximum reached")
+            } else if lane_used >= lane_max {
+                ("budget_rejected", "daily exploration-lane maximum reached")
+            } else {
+                (
+                    "approved",
+                    "all canonical deduplication and safety budgets passed",
+                )
+            };
+            let explanation = serde_json::json!({"formula":"provider_score*0.7 + seed_weight*0.3","provider_score_millionths":recommendation.provider_score_millionths,"seed_weight_millionths":recommendation.seed_weight_millionths,"reasons":recommendation.reasons});
+            transaction.execute("INSERT INTO discovery_candidates(run_id,musicbrainz_recording_id,musicbrainz_artist_id,lane,provider,provider_score_millionths,taste_score_millionths,explanation_json,state,decision_reason) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",rusqlite::params![run_id,recommendation.recording_mbid,recommendation.artist_mbid,recommendation.lane.as_str(),provider,recommendation.provider_score_millionths,discovery_score(recommendation),explanation.to_string(),state,reason]).map_err(DatabaseError::Sqlite)?;
+            match state {
+                "approved" => {
+                    report.approved += 1;
+                    daily += 1;
+                    match recommendation.lane {
+                        DiscoveryLane::Adjacent => lane_adjacent += 1,
+                        DiscoveryLane::Exploration => lane_exploration += 1,
+                        DiscoveryLane::Wildcard => lane_wildcard += 1,
+                    }
+                }
+                "duplicate" => report.duplicates += 1,
+                _ => report.budget_rejected += 1,
+            }
+        }
+        transaction.execute("UPDATE discovery_runs SET status='succeeded',finished_at=CURRENT_TIMESTAMP WHERE id=?1",[run_id]).map_err(DatabaseError::Sqlite)?;
+        transaction.commit().map_err(DatabaseError::Sqlite)?;
+        Ok(report)
+    }
+
+    /// Replaces active Navidrome favorite seeds using exact local recording MBIDs.
+    pub fn replace_navidrome_seeds(
+        &mut self,
+        recording_mbids: &[String],
+    ) -> Result<DiscoverySeedReport, DatabaseError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(DatabaseError::Sqlite)?;
+        transaction
+            .execute(
+                "UPDATE discovery_seeds SET active=0,updated_at=CURRENT_TIMESTAMP WHERE origin='navidrome_favorite'",
+                [],
+            )
+            .map_err(DatabaseError::Sqlite)?;
+        let mut report = DiscoverySeedReport::default();
+        let unique = recording_mbids.iter().collect::<BTreeSet<_>>();
+        for mbid in unique {
+            let recording_id = transaction
+                .query_row(
+                    "SELECT id FROM recordings WHERE musicbrainz_recording_id=?1",
+                    [mbid],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .map_err(DatabaseError::Sqlite)?;
+            if let Some(recording_id) = recording_id {
+                transaction.execute("INSERT INTO discovery_seeds(recording_id,origin,weight_millionths,active,updated_at) VALUES (?1,'navidrome_favorite',1000000,1,CURRENT_TIMESTAMP) ON CONFLICT(recording_id) DO UPDATE SET origin='navidrome_favorite',weight_millionths=1000000,active=1,updated_at=CURRENT_TIMESTAMP", [recording_id]).map_err(DatabaseError::Sqlite)?;
+                report.matched += 1;
+            } else {
+                report.unmatched += 1;
+            }
+        }
+        transaction.commit().map_err(DatabaseError::Sqlite)?;
+        Ok(report)
+    }
+
+    /// Loads approved discovery candidates in stable order for evidence routing.
+    pub fn approved_discovery_candidates(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<ApprovedDiscoveryCandidate>, DatabaseError> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut statement = self.connection.prepare(
+            "SELECT id,musicbrainz_recording_id FROM discovery_candidates WHERE state='approved' ORDER BY id LIMIT ?1",
+        ).map_err(DatabaseError::Sqlite)?;
+        statement
+            .query_map([limit], |row| {
+                Ok(ApprovedDiscoveryCandidate {
+                    id: row.get(0)?,
+                    recording_mbid: row.get(1)?,
+                })
+            })
+            .map_err(DatabaseError::Sqlite)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(DatabaseError::Sqlite)
+    }
+
+    /// Atomically creates a discovery-owned provider item and pending acquisition assertion.
+    pub fn queue_discovery_acquisition(
+        &mut self,
+        candidate: &ApprovedDiscoveryCandidate,
+        route: &DiscoveryAcquisitionRoute,
+    ) -> Result<i64, DatabaseError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(DatabaseError::Sqlite)?;
+        let state = transaction
+            .query_row(
+                "SELECT state FROM discovery_candidates WHERE id=?1",
+                [candidate.id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(DatabaseError::Sqlite)?;
+        if state.as_deref() != Some("approved") {
+            return Err(DatabaseError::DiscoveryCandidateNotApproved(candidate.id));
+        }
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO recordings(musicbrainz_recording_id,isrc) VALUES (?1,?2)",
+                rusqlite::params![candidate.recording_mbid, route.canonical_isrc],
+            )
+            .map_err(DatabaseError::Sqlite)?;
+        let recording_id = transaction
+            .query_row(
+                "SELECT id FROM recordings WHERE musicbrainz_recording_id=?1",
+                [&candidate.recording_mbid],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(DatabaseError::Sqlite)?;
+        transaction.execute("INSERT INTO provider_items(provider,provider_item_id,original_url,source_metadata_json,availability,recording_id) VALUES ('youtube',?1,?2,?3,'available',?4) ON CONFLICT(provider,provider_item_id) DO NOTHING",rusqlite::params![route.provider_item_id,route.url,route.assertion_json,recording_id]).map_err(DatabaseError::Sqlite)?;
+        let provider_item_id=transaction.query_row("SELECT id,recording_id FROM provider_items WHERE provider='youtube' AND provider_item_id=?1",[&route.provider_item_id],|row|Ok((row.get::<_,i64>(0)?,row.get::<_,Option<i64>>(1)?))).map_err(DatabaseError::Sqlite)?;
+        if provider_item_id.1 != Some(recording_id) {
+            return Err(DatabaseError::ProviderItemRecordingConflict);
+        }
+        transaction
+            .execute("INSERT INTO sync_runs(status) VALUES ('succeeded')", [])
+            .map_err(DatabaseError::Sqlite)?;
+        let run_id = transaction.last_insert_rowid();
+        let key = format!("acquire:youtube:{}", route.provider_item_id);
+        transaction.execute("INSERT OR IGNORE INTO jobs(run_id,kind,status,idempotency_key) VALUES (?1,'acquire','pending',?2)",rusqlite::params![run_id,key]).map_err(DatabaseError::Sqlite)?;
+        let job_id = transaction
+            .query_row(
+                "SELECT id FROM jobs WHERE idempotency_key=?1",
+                [key],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(DatabaseError::Sqlite)?;
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO acquisition_jobs(job_id,provider_item_id) VALUES (?1,?2)",
+                rusqlite::params![job_id, provider_item_id.0],
+            )
+            .map_err(DatabaseError::Sqlite)?;
+        transaction.execute("INSERT INTO discovery_acquisition_assertions(candidate_id,provider_item_id,recording_id,relationship_source,canonical_duration_ms,canonical_isrc,assertion_json) VALUES (?1,?2,?3,'musicbrainz_recording_url',?4,?5,?6)",rusqlite::params![candidate.id,provider_item_id.0,recording_id,route.canonical_duration_ms,route.canonical_isrc,route.assertion_json]).map_err(DatabaseError::Sqlite)?;
+        transaction.execute("UPDATE discovery_candidates SET state='queued',decision_reason='canonical MusicBrainz recording URL relationship verified',updated_at=CURRENT_TIMESTAMP WHERE id=?1",[candidate.id]).map_err(DatabaseError::Sqlite)?;
+        transaction.commit().map_err(DatabaseError::Sqlite)?;
+        Ok(job_id)
+    }
+
+    /// Marks an approved candidate unresolved without creating provider work.
+    pub fn mark_discovery_unresolved(
+        &mut self,
+        candidate_id: i64,
+        reason: &str,
+    ) -> Result<bool, DatabaseError> {
+        Ok(self.connection.execute("UPDATE discovery_candidates SET state='unresolved',decision_reason=?2,updated_at=CURRENT_TIMESTAMP WHERE id=?1 AND state='approved'",rusqlite::params![candidate_id,reason]).map_err(DatabaseError::Sqlite)?==1)
     }
 
     /// Loads active unhealthy original items in stable order for availability checks.
@@ -2779,6 +3026,37 @@ impl Database {
         if !running {
             return Err(DatabaseError::AcquisitionNotRunning(job_id));
         }
+        let discovery_assertion = transaction
+            .query_row(
+                "SELECT recordings.musicbrainz_recording_id,
+                        discovery_acquisition_assertions.canonical_isrc,
+                        discovery_acquisition_assertions.canonical_duration_ms
+                 FROM acquisition_jobs
+                 JOIN discovery_acquisition_assertions ON
+                      discovery_acquisition_assertions.provider_item_id=acquisition_jobs.provider_item_id
+                 JOIN recordings ON recordings.id=discovery_acquisition_assertions.recording_id
+                 WHERE acquisition_jobs.job_id=?1",
+                [job_id],
+                |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, Option<u64>>(2)?)),
+            )
+            .optional()
+            .map_err(DatabaseError::Sqlite)?;
+        if let Some((canonical_mbid, canonical_isrc, canonical_duration)) = discovery_assertion {
+            let identity_matches = canonical_mbid
+                .as_ref()
+                .zip(validated.musicbrainz_recording_id.as_ref())
+                .is_some_and(|(left, right)| left == right)
+                || canonical_isrc
+                    .as_ref()
+                    .zip(validated.isrc.as_ref())
+                    .is_some_and(|(left, right)| left == right);
+            let duration_matches = canonical_duration
+                .zip(validated.duration_ms)
+                .is_some_and(|(left, right)| left.abs_diff(right) <= 2_000);
+            if !identity_matches || !duration_matches {
+                return Err(DatabaseError::DiscoveryAcquisitionEvidenceMismatch(job_id));
+            }
+        }
         let inserted = transaction
             .execute(
                 "INSERT OR IGNORE INTO acquisition_commits(
@@ -3002,6 +3280,10 @@ impl Database {
                 [job_id],
             )
             .map_err(DatabaseError::Sqlite)?;
+        transaction.execute(
+            "UPDATE discovery_candidates SET state='acquired',decision_reason='verified acquisition committed',updated_at=CURRENT_TIMESTAMP WHERE id=(SELECT candidate_id FROM discovery_acquisition_assertions WHERE provider_item_id=?1)",
+            [commit.9],
+        ).map_err(DatabaseError::Sqlite)?;
         transaction.commit().map_err(DatabaseError::Sqlite)?;
         Ok(ArtifactPersistenceResult {
             recording_id,
@@ -3166,6 +3448,23 @@ impl Database {
         }
         transaction.commit().map_err(DatabaseError::Sqlite)
     }
+}
+
+fn discovery_lane_budgets(maximum: u64, exploration_ratio: f64, wildcard_ratio: f64) -> (u64, u64) {
+    let quota = |ratio: f64| {
+        if maximum == 0 || ratio == 0.0 {
+            0
+        } else {
+            ((maximum as f64) * ratio).round().max(1.0) as u64
+        }
+    };
+    let mut exploration = quota(exploration_ratio).min(maximum);
+    let wildcard = quota(wildcard_ratio).min(maximum.saturating_sub(exploration));
+    if wildcard_ratio > 0.0 && wildcard == 0 && exploration > 0 {
+        exploration -= 1;
+        return (exploration, 1);
+    }
+    (exploration, wildcard)
 }
 
 fn sqlite_uri_path(path: &str) -> String {
@@ -3456,6 +3755,8 @@ pub struct OperationalStatus {
     pub lyrics: LyricsResolutionCounts,
     /// Source-preserving canonical tag materialization counts.
     pub metadata_materializations: MetadataMaterializationCounts,
+    /// Autonomous discovery decisions and routing counts.
+    pub discovery: DiscoveryCounts,
     /// Playlist outputs with committed exact-byte evidence.
     pub playlist_outputs: u64,
     /// Bounded newest-first warning/error events.
@@ -3574,6 +3875,67 @@ pub struct MetadataMaterializationCounts {
     pub committed: u64,
     /// Failures excluded until explicit retry.
     pub deferred: u64,
+}
+
+/// Durable autonomous-discovery counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct DiscoveryCounts {
+    /// Approved canonical recommendations.
+    pub approved: u64,
+    /// Candidates queued through verified acquisition routing.
+    pub queued: u64,
+    /// Candidates lacking sufficient acquisition evidence.
+    pub unresolved: u64,
+    /// Successfully acquired discovery recordings.
+    pub acquired: u64,
+    /// Candidates rejected by hard budgets.
+    pub budget_rejected: u64,
+}
+
+/// Transactional effects of one discovery run.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct DiscoveryPersistenceReport {
+    /// Durable run ID.
+    pub run_id: i64,
+    /// Approved candidates.
+    pub approved: u64,
+    /// Exact canonical duplicates.
+    pub duplicates: u64,
+    /// Hard-budget rejections.
+    pub budget_rejected: u64,
+}
+
+/// Result of importing read-only taste signals.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct DiscoverySeedReport {
+    /// Signals exactly matched to local canonical recordings.
+    pub matched: u64,
+    /// Signals without an existing local canonical recording.
+    pub unmatched: u64,
+}
+
+/// Approved canonical candidate awaiting provider relationship evidence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovedDiscoveryCandidate {
+    /// Durable candidate ID.
+    pub id: i64,
+    /// Exact MusicBrainz recording MBID.
+    pub recording_mbid: String,
+}
+
+/// Strong recording-level provider route ready for durable acquisition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveryAcquisitionRoute {
+    /// Provider-owned YouTube video ID.
+    pub provider_item_id: String,
+    /// Exact relationship URL.
+    pub url: String,
+    /// Canonical duration required for staged verification.
+    pub canonical_duration_ms: u64,
+    /// Unique canonical ISRC when available.
+    pub canonical_isrc: Option<String>,
+    /// Auditable bounded relationship evidence.
+    pub assertion_json: String,
 }
 
 /// One bounded persisted warning or error event.
@@ -4311,6 +4673,18 @@ pub enum DatabaseError {
     /// Repeated hidden staging reservation contradicted its durable path.
     #[error("metadata staging path does not match recording {0}")]
     MetadataStagingMismatch(i64),
+    /// Discovery counts exceeded SQLite integer representation.
+    #[error("discovery count exceeds SQLite range")]
+    DiscoveryCountTooLarge,
+    /// Discovery candidate was no longer approved when routing attempted.
+    #[error("discovery candidate {0} is not approved")]
+    DiscoveryCandidateNotApproved(i64),
+    /// Discovery staging lacked exact canonical identity or compatible duration.
+    #[error("discovery acquisition evidence does not match assertion for job {0}")]
+    DiscoveryAcquisitionEvidenceMismatch(i64),
+    /// Existing provider identity belongs to another canonical recording.
+    #[error("provider item already belongs to another canonical recording")]
+    ProviderItemRecordingConflict,
     /// Metadata provider candidate count exceeded durable representation.
     #[error("metadata candidate count exceeds SQLite range")]
     MetadataCandidateCountTooLarge,
@@ -4346,6 +4720,41 @@ pub enum DatabaseError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discovery_lane_budgets_retain_small_nonzero_lanes() {
+        assert_eq!(discovery_lane_budgets(15, 0.20, 0.05), (3, 1));
+        assert_eq!(discovery_lane_budgets(3, 0.34, 0.33), (1, 1));
+        assert_eq!(discovery_lane_budgets(1, 0.5, 0.5), (0, 1));
+    }
+
+    #[test]
+    fn navidrome_seed_import_is_exact_and_replaces_active_set()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut database = Database::open_in_memory()?;
+        let first = "11111111-1111-1111-1111-111111111111";
+        let second = "22222222-2222-2222-2222-222222222222";
+        database.connection.execute(
+            "INSERT INTO recordings(musicbrainz_recording_id) VALUES (?1)",
+            [first],
+        )?;
+        let report =
+            database.replace_navidrome_seeds(&[first.into(), second.into(), first.into()])?;
+        assert_eq!(report.matched, 1);
+        assert_eq!(report.unmatched, 1);
+        assert_eq!(database.table_count("discovery_seeds")?, 1);
+        let empty = database.replace_navidrome_seeds(&[])?;
+        assert_eq!(empty, DiscoverySeedReport::default());
+        assert_eq!(
+            database.connection.query_row(
+                "SELECT active FROM discovery_seeds WHERE recording_id=1",
+                [],
+                |row| row.get::<_, u32>(0),
+            )?,
+            0
+        );
+        Ok(())
+    }
     use crate::musicbrainz::{CanonicalArtistCredit, CanonicalRecording, CanonicalRelease};
     use crate::provider::ProviderItem;
     use serde_json::json;
@@ -4835,6 +5244,7 @@ mod tests {
                 join_phrase: String::new(),
             }],
             releases: vec![release.clone()],
+            url_relations: Vec::new(),
         };
 
         let first = database.record_resolved_metadata(

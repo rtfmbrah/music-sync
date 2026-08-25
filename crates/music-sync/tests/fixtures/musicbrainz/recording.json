@@ -24,6 +24,13 @@
       }
     }
   ],
+  "relations": [
+    {
+      "type": "video",
+      "target-type": "url",
+      "url": { "resource": "https://youtu.be/fixture_video" }
+    }
+  ],
   "releases": [
     {
       "id": "99999999-8888-7777-6666-555555555555",

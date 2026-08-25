@@ -5,6 +5,114 @@ use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
 #[test]
+fn discovery_run_and_route_require_canonical_relationship_evidence()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let root = tempfile::tempdir()?;
+    let library = root.path().join("library");
+    fs::create_dir(&library)?;
+    let config = root.path().join("config.toml");
+    fs::write(
+        &config,
+        format!(
+            "state_directory = {:?}\nlibrary_directory = {:?}\nplaylist_directory = {:?}\n[discovery]\nenabled = true\ntarget_new_tracks_per_day = 1\nmax_new_tracks_per_day = 1\nmax_tracks_per_artist_per_day = 1\nexploration_ratio = 0.0\nwildcard_ratio = 0.0\nminimum_free_disk_gb = 0\nlistenbrainz_user = \"fixture\"\n",
+            root.path().join("state"),
+            library,
+            root.path().join("playlists")
+        ),
+    )?;
+    let listen = TcpListener::bind("127.0.0.1:0")?;
+    let listen_url = format!("http://{}", listen.local_addr()?);
+    let listen_thread = std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listen.accept() {
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request);
+            let body = r#"{"payload":{"mbids":[{"recording_mbid":"11111111-2222-3333-4444-555555555555","score":1.0}]}}"#;
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+        }
+    });
+    let discovery = Command::new(env!("CARGO_BIN_EXE_music-sync"))
+        .args(["--json", "discovery", "run", "--config"])
+        .arg(&config)
+        .args([
+            "--user-agent",
+            "fixture@example.invalid",
+            "--listenbrainz-endpoint",
+            &listen_url,
+        ])
+        .output()?;
+    listen_thread
+        .join()
+        .map_err(|_| "ListenBrainz fixture thread panicked")?;
+    assert!(
+        discovery.status.success(),
+        "{}",
+        String::from_utf8_lossy(&discovery.stderr)
+    );
+
+    let musicbrainz = TcpListener::bind("127.0.0.1:0")?;
+    let musicbrainz_url = format!("http://{}", musicbrainz.local_addr()?);
+    let mb_thread = std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = musicbrainz.accept() {
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request);
+            let body = r#"{"id":"11111111-2222-3333-4444-555555555555","title":"Exact","length":180000,"isrcs":["USABC2412345"],"relations":[{"type":"video","target-type":"url","url":{"resource":"https://youtu.be/Exact_video"}}]}"#;
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+        }
+    });
+    let route = Command::new(env!("CARGO_BIN_EXE_music-sync"))
+        .args(["--json", "discovery", "route", "--config"])
+        .arg(&config)
+        .args([
+            "--user-agent",
+            "fixture@example.invalid",
+            "--endpoint",
+            &musicbrainz_url,
+        ])
+        .output()?;
+    mb_thread
+        .join()
+        .map_err(|_| "MusicBrainz fixture thread panicked")?;
+    assert!(
+        route.status.success(),
+        "{}",
+        String::from_utf8_lossy(&route.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&route.stdout)?;
+    assert_eq!(report["queued"], 1);
+    let connection = rusqlite::Connection::open(root.path().join("state/music-sync.sqlite3"))?;
+    assert_eq!(
+        connection.query_row(
+            "SELECT COUNT(*) FROM discovery_acquisition_assertions",
+            [],
+            |row| row.get::<_, u64>(0)
+        )?,
+        1
+    );
+    assert_eq!(
+        connection.query_row(
+            "SELECT COUNT(*) FROM jobs WHERE kind='acquire' AND status='pending'",
+            [],
+            |row| row.get::<_, u64>(0)
+        )?,
+        1
+    );
+    Ok(())
+}
+
+#[test]
 fn help_describes_only_implemented_commands() -> Result<(), Box<dyn std::error::Error>> {
     let output = Command::new(env!("CARGO_BIN_EXE_music-sync"))
         .arg("--help")

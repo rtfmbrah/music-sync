@@ -50,11 +50,15 @@ in ad hoc TODO documents.
 
 ## P4 — Autonomous discovery
 
-- Seeds and recommendation-provider boundaries.
-- Deduplication and explainable taste scoring.
-- Navidrome listening-signal reader without database mutation.
-- Growth/storage/artist budgets and tunable exploration.
-- Automated verified acquisition through the P2 pipeline.
+- Seeds and recommendation-provider boundaries (complete for Navidrome favorites and
+  ListenBrainz collaborative filtering).
+- Deduplication and explainable taste scoring (complete).
+- Navidrome listening-signal reader without database mutation (complete for exact
+  recording-MBID favorites).
+- Growth/storage/artist budgets and tunable exploration (complete).
+- Automated verified acquisition through the P2 pipeline (complete for exact
+  MusicBrainz recording-level YouTube relationships and independent staged
+  MBID/ISRC plus duration verification; isolated LXC acceptance remains).
 
 ## P5 — Operations and deployment
 

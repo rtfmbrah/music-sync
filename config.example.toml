@@ -15,4 +15,6 @@ max_tracks_per_artist_per_day = 2
 exploration_ratio = 0.20
 wildcard_ratio = 0.05
 minimum_free_disk_gb = 20
-
+# listenbrainz_user = "your-public-listenbrainz-user"
+# navidrome_url = "https://music.example.invalid"
+# navidrome_user = "music-sync-readonly"

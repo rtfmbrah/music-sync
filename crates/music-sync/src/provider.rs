@@ -47,6 +47,30 @@ pub fn is_supported_youtube_url(url: &str) -> bool {
     .any(|prefix| url.starts_with(prefix))
 }
 
+/// Extracts a conservative provider-owned video ID from a supported YouTube URL.
+#[must_use]
+pub fn youtube_video_id(url: &str) -> Option<String> {
+    if !is_supported_youtube_url(url) {
+        return None;
+    }
+    let candidate = if let Some(value) = url.strip_prefix("https://youtu.be/") {
+        value.split(['?', '#', '/']).next()
+    } else {
+        url.split_once('?').and_then(|(_, query)| {
+            query.split('&').find_map(|part| {
+                part.strip_prefix("v=")
+                    .map(|value| value.split('#').next().unwrap_or_default())
+            })
+        })
+    }?;
+    (!candidate.is_empty()
+        && candidate.len() <= 64
+        && candidate
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')))
+    .then(|| candidate.to_owned())
+}
+
 /// One remote provider object; this is not a canonical recording identity.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ProviderItem {
@@ -109,6 +133,14 @@ mod tests {
         assert!(!is_supported_youtube_url(
             "http://www.youtube.com/watch?v=abc"
         ));
+        assert_eq!(
+            youtube_video_id("https://www.youtube.com/watch?v=Abc_12-x&list=test").as_deref(),
+            Some("Abc_12-x")
+        );
+        assert_eq!(
+            youtube_video_id("https://youtu.be/Abc_12-x?t=4").as_deref(),
+            Some("Abc_12-x")
+        );
         assert!(!is_supported_youtube_url("https://example.com/watch?v=abc"));
         assert!(!is_supported_youtube_url(
             "https://youtube.com.example.com/watch?v=abc"

@@ -19,7 +19,7 @@ pub struct AppConfig {
     /// Bounded concurrency settings for external work.
     #[serde(default)]
     pub concurrency: ConcurrencyConfig,
-    /// Autonomous discovery policy. Discovery is not implemented yet.
+    /// Autonomous discovery policy.
     #[serde(default)]
     pub discovery: DiscoveryConfig,
 }
@@ -46,7 +46,7 @@ impl Default for ConcurrencyConfig {
     }
 }
 
-/// Configurable limits for future autonomous discovery.
+/// Configurable limits for autonomous discovery.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DiscoveryConfig {
@@ -64,6 +64,12 @@ pub struct DiscoveryConfig {
     pub wildcard_ratio: f64,
     /// Storage guardrail for future acquisitions.
     pub minimum_free_disk_gb: u64,
+    /// Public ListenBrainz user whose recommendations are read.
+    pub listenbrainz_user: Option<String>,
+    /// Read-only Navidrome/Subsonic API base URL for favorite seeds.
+    pub navidrome_url: Option<String>,
+    /// Navidrome user paired with token/salt secrets from the process environment.
+    pub navidrome_user: Option<String>,
 }
 
 impl Default for DiscoveryConfig {
@@ -76,6 +82,9 @@ impl Default for DiscoveryConfig {
             exploration_ratio: 0.20,
             wildcard_ratio: 0.05,
             minimum_free_disk_gb: 20,
+            listenbrainz_user: None,
+            navidrome_url: None,
+            navidrome_user: None,
         }
     }
 }
@@ -117,6 +126,30 @@ impl AppConfig {
             return Err(ConfigError::Invalid(
                 "discovery target cannot exceed the daily maximum".into(),
             ));
+        }
+        if self.discovery.enabled {
+            if self.discovery.max_new_tracks_per_day == 0
+                || self.discovery.max_tracks_per_artist_per_day == 0
+            {
+                return Err(ConfigError::Invalid(
+                    "enabled discovery budgets must be greater than zero".into(),
+                ));
+            }
+            if self
+                .discovery
+                .listenbrainz_user
+                .as_deref()
+                .is_none_or(|user| user.trim().is_empty())
+            {
+                return Err(ConfigError::Invalid(
+                    "enabled discovery requires a ListenBrainz user".into(),
+                ));
+            }
+            if self.discovery.navidrome_url.is_some() != self.discovery.navidrome_user.is_some() {
+                return Err(ConfigError::Invalid(
+                    "Navidrome discovery URL and user must be configured together".into(),
+                ));
+            }
         }
         let exploration = self.discovery.exploration_ratio;
         let wildcard = self.discovery.wildcard_ratio;

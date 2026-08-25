@@ -66,6 +66,14 @@ staging is separately namespaced by durable attempt. A later explicit commit reh
 staging before preparing intent, creates a new repair artifact path, and preserves the
 old missing/corrupt path and row indefinitely.
 
+Discovery acquisition adds a stricter assertion before prepared commit. An approved
+recording MBID is routed only when MusicBrainz returns the exact recording, a
+canonical duration, and exactly one recording-level supported YouTube URL. The
+staged file must then carry either that exact recording MBID or the recording's sole
+canonical ISRC, and its duration must be within two seconds. The relationship and
+canonical values are persisted before the job is queued. Missing, ambiguous, or
+contradictory evidence cannot create or commit an artifact.
+
 ## PLANNED
 
 Every attempt uses a job-specific temporary directory on a filesystem that supports

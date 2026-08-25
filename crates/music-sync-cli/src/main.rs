@@ -20,12 +20,16 @@ use music_sync::artwork::{CoverArtArchive, resolve_release_artwork};
 use music_sync::config::AppConfig;
 use music_sync::content_hash::Sha256FileHasher;
 use music_sync::diagnostics::{CheckStatus, DoctorReport, run_doctor};
+use music_sync::discovery::{DfFreeSpace, run_discovery};
+use music_sync::discovery_routing::route_approved_discovery;
 use music_sync::fingerprint::{Fpcalc, reconcile_artifact_fingerprints};
 use music_sync::health::reconcile_artifact_health;
+use music_sync::listenbrainz::ListenBrainz;
 use music_sync::lyrics::{Lrclib, resolve_lyrics};
 use music_sync::media_probe::Ffprobe;
 use music_sync::metadata::resolve_canonical_metadata;
 use music_sync::musicbrainz::MusicBrainz;
+use music_sync::navidrome::NavidromeFavorites;
 use music_sync::persistence::Database;
 use music_sync::playlist::{PlaylistMaterializationReport, materialize_playlists};
 use music_sync::provider::{SourceId, SourceSnapshot, is_supported_youtube_url};
@@ -104,6 +108,11 @@ enum Command {
         #[command(subcommand)]
         command: LyricsCommand,
     },
+    /// Generate explainable recommendations within hard safety budgets.
+    Discovery {
+        #[command(subcommand)]
+        command: DiscoveryCommand,
+    },
     /// Materialize Navidrome-compatible playlists from durable collections.
     Playlist {
         #[command(subcommand)]
@@ -122,6 +131,49 @@ enum Command {
         /// Maximum newest warning/error events to show (1 through 100).
         #[arg(long, default_value = "20")]
         recent_events: NonZeroUsize,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum DiscoveryCommand {
+    /// Import optional Navidrome favorites, then run one bounded ListenBrainz pass.
+    Run {
+        /// TOML configuration identifying state, library, and discovery policy.
+        #[arg(short, long, default_value = "music-sync.toml")]
+        config: PathBuf,
+        /// Meaningful HTTP User-Agent including operator contact information.
+        #[arg(long)]
+        user_agent: String,
+        /// ListenBrainz endpoint; override only for controlled fixtures/mirrors.
+        #[arg(long, default_value = "https://api.listenbrainz.org")]
+        listenbrainz_endpoint: String,
+        /// Maximum recommendations fetched and considered once.
+        #[arg(long, default_value = "100")]
+        max_candidates: NonZeroUsize,
+        /// HTTP deadline in seconds.
+        #[arg(long, default_value = "30")]
+        timeout_seconds: NonZeroU64,
+        /// `df` executable used for the free-storage guard.
+        #[arg(long, default_value = "df")]
+        df: PathBuf,
+    },
+    /// Route approved candidates only through canonical recording URL relationships.
+    Route {
+        /// TOML configuration identifying application state.
+        #[arg(short, long, default_value = "music-sync.toml")]
+        config: PathBuf,
+        /// Meaningful MusicBrainz User-Agent including operator contact information.
+        #[arg(long)]
+        user_agent: String,
+        /// MusicBrainz endpoint; override only for controlled fixtures/mirrors.
+        #[arg(long, default_value = "https://musicbrainz.org/ws/2")]
+        endpoint: String,
+        /// Maximum approved candidates considered once.
+        #[arg(long, default_value = "20")]
+        max_candidates: NonZeroUsize,
+        /// Per-request HTTP deadline in seconds.
+        #[arg(long, default_value = "30")]
+        timeout_seconds: NonZeroU64,
     },
 }
 
@@ -557,6 +609,135 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> Result<ExitCode, Box<dyn Error>> {
     match cli.command {
+        Command::Discovery {
+            command:
+                DiscoveryCommand::Route {
+                    config,
+                    user_agent,
+                    endpoint,
+                    max_candidates,
+                    timeout_seconds,
+                },
+        } => {
+            let config = AppConfig::from_file(&config)?;
+            if !config.discovery.enabled {
+                return Err("discovery routing requires discovery.enabled=true".into());
+            }
+            let mut database = Database::open(&config.database_path())?;
+            let provider = MusicBrainz::with_endpoint(
+                &endpoint,
+                &user_agent,
+                Duration::from_secs(timeout_seconds.get()),
+                if endpoint.starts_with("http://127.0.0.1:")
+                    || endpoint.starts_with("http://[::1]:")
+                {
+                    Duration::ZERO
+                } else {
+                    Duration::from_secs(1)
+                },
+                !endpoint.starts_with("http://127.0.0.1:")
+                    && !endpoint.starts_with("http://[::1]:"),
+            )?;
+            let report = route_approved_discovery(&mut database, &provider, max_candidates.get())?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("Candidates selected: {}", report.selected);
+                println!("Acquisitions queued: {}", report.queued);
+                println!("Unresolved:          {}", report.unresolved);
+                println!("Provider deferred:   {}", report.deferred);
+            }
+            Ok(if report.failures.is_empty() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(1)
+            })
+        }
+        Command::Discovery {
+            command:
+                DiscoveryCommand::Run {
+                    config,
+                    user_agent,
+                    listenbrainz_endpoint,
+                    max_candidates,
+                    timeout_seconds,
+                    df,
+                },
+        } => {
+            let config = AppConfig::from_file(&config)?;
+            if !config.discovery.enabled {
+                if cli.json {
+                    println!("{}", serde_json::json!({"disabled": true}));
+                } else {
+                    println!("Discovery is disabled; no provider or database was contacted.");
+                }
+                return Ok(ExitCode::SUCCESS);
+            }
+            let mut database = Database::open(&config.database_path())?;
+            let mut seed_report = None;
+            if let (Some(url), Some(user)) = (
+                config.discovery.navidrome_url.as_deref(),
+                config.discovery.navidrome_user.as_deref(),
+            ) {
+                let token = std::env::var("NAVIDROME_TOKEN")?;
+                let salt = std::env::var("NAVIDROME_SALT")?;
+                let adapter = NavidromeFavorites::new(
+                    url,
+                    user,
+                    &token,
+                    &salt,
+                    Duration::from_secs(timeout_seconds.get()),
+                )?;
+                seed_report = Some(database.replace_navidrome_seeds(&adapter.recording_mbids()?)?);
+            }
+            let listenbrainz_user = config
+                .discovery
+                .listenbrainz_user
+                .as_deref()
+                .ok_or("enabled discovery requires a ListenBrainz user")?;
+            let provider = ListenBrainz::with_endpoint(
+                &listenbrainz_endpoint,
+                listenbrainz_user,
+                &user_agent,
+                Duration::from_secs(timeout_seconds.get()),
+                config.discovery.exploration_ratio,
+                config.discovery.wildcard_ratio,
+                !listenbrainz_endpoint.starts_with("http://127.0.0.1:")
+                    && !listenbrainz_endpoint.starts_with("http://[::1]:"),
+            )?;
+            let report = run_discovery(
+                &mut database,
+                &provider,
+                &DfFreeSpace::new(df),
+                &config.library_directory,
+                &config.discovery,
+                max_candidates.get(),
+            )?;
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &serde_json::json!({"seeds": seed_report, "discovery": report})
+                    )?
+                );
+            } else {
+                if let Some(seeds) = seed_report {
+                    println!("Navidrome seeds matched:   {}", seeds.matched);
+                    println!("Navidrome seeds unmatched: {}", seeds.unmatched);
+                }
+                println!("Recommendations received: {}", report.received);
+                println!("Candidates approved:      {}", report.persistence.approved);
+                println!(
+                    "Canonical duplicates:     {}",
+                    report.persistence.duplicates
+                );
+                println!(
+                    "Budget rejected:          {}",
+                    report.persistence.budget_rejected
+                );
+            }
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Metadata {
             command:
                 MetadataCommand::RetryMaterialize {

@@ -47,6 +47,17 @@ pub struct CanonicalRecording {
     pub artist_credit: Vec<CanonicalArtistCredit>,
     /// Releases exposed by the recording lookup.
     pub releases: Vec<CanonicalRelease>,
+    /// Recording-level external URL relationships retained for verified routing.
+    pub url_relations: Vec<CanonicalUrlRelation>,
+}
+
+/// One canonical recording-to-URL relationship.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalUrlRelation {
+    /// MusicBrainz relationship type.
+    pub relation_type: String,
+    /// Exact external resource URL.
+    pub resource: String,
 }
 
 /// One ordered artist-credit component.
@@ -165,7 +176,7 @@ impl CanonicalMetadataProvider for MusicBrainz {
             _ => return Err(MusicBrainzError::InvalidIdentifier),
         };
         let url = format!(
-            "{}/{path}?inc=artist-credits+isrcs+releases+release-groups&fmt=json",
+            "{}/{path}?inc=artist-credits+isrcs+releases+release-groups+url-rels&fmt=json",
             self.base_url
         );
         let bytes = self.paced_get(&url)?;
@@ -253,6 +264,19 @@ impl TryFrom<RecordingResponse> for CanonicalRecording {
                 .collect(),
             artist_credit,
             releases,
+            url_relations: value
+                .relations
+                .into_iter()
+                .filter(|relation| relation.target_type == "url")
+                .filter_map(|relation| {
+                    let resource = relation.url?.resource;
+                    (!relation.relation_type.trim().is_empty() && !resource.trim().is_empty())
+                        .then_some(CanonicalUrlRelation {
+                            relation_type: relation.relation_type,
+                            resource,
+                        })
+                })
+                .collect(),
         })
     }
 }
@@ -290,6 +314,22 @@ struct RecordingResponse {
     artist_credit: Vec<ArtistCreditResponse>,
     #[serde(default)]
     releases: Vec<ReleaseResponse>,
+    #[serde(default)]
+    relations: Vec<UrlRelationResponse>,
+}
+
+#[derive(Deserialize)]
+struct UrlRelationResponse {
+    #[serde(rename = "type")]
+    relation_type: String,
+    #[serde(rename = "target-type")]
+    target_type: String,
+    url: Option<UrlTargetResponse>,
+}
+
+#[derive(Deserialize)]
+struct UrlTargetResponse {
+    resource: String,
 }
 
 #[derive(Deserialize)]
@@ -375,6 +415,8 @@ mod tests {
         assert_eq!(recording.artist_credit.len(), 2);
         assert_eq!(recording.artist_credit[0].join_phrase, " feat. ");
         assert_eq!(recording.releases.len(), 1);
+        assert_eq!(recording.url_relations.len(), 1);
+        assert_eq!(recording.url_relations[0].relation_type, "video");
         assert_eq!(recording.releases[0].primary_type.as_deref(), Some("Album"));
         Ok(())
     }

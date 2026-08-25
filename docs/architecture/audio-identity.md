@@ -17,6 +17,12 @@ Acquisition staging can now retain a SHA-256 digest after structural audio
 validation. This proves exact artifact bytes only; it is deliberately not used as
 perceptual or canonical recording evidence.
 
+For autonomous discovery, a curated MusicBrainz recording-to-URL relationship is
+the provider-object assertion, not the audio identity proof. The downloaded file
+must independently expose the asserted recording MBID or unique canonical ISRC and
+match canonical duration within two seconds before the ordinary crash-safe commit
+can be prepared. Text and recommendation rank never enter this comparison.
+
 `library health` checks registered artifacts in stable bounded order without media
 mutation. Absent paths become missing; non-regular paths and exact-hash mismatch
 become corrupt. Probe, permission, and hashing failures leave prior health unchanged
