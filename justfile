@@ -33,7 +33,11 @@ test-architecture:
 
 # Validate deployment shell scripts without network or side effects.
 test-scripts:
-    bash -n scripts/install-ytdlp crates/music-sync/tests/fixtures/acquisition/*.sh crates/music-sync/tests/fixtures/repair/*.sh crates/music-sync/tests/fixtures/tag/*.sh
+    bash -n scripts/install-ytdlp deploy/install-release.sh deploy/rollback-release.sh crates/music-sync/tests/fixtures/acquisition/*.sh crates/music-sync/tests/fixtures/repair/*.sh crates/music-sync/tests/fixtures/tag/*.sh
+
+# Run the deterministic complete-service performance regression gate.
+test-performance:
+    cargo test -p music-sync-cli --test cli complete_service_runs_every_offline_phase_and_repeats_idempotently -- --exact
 
 # Apply safe formatter and Clippy suggestions.
 fix:
@@ -41,7 +45,7 @@ fix:
     cargo clippy --workspace --all-targets --all-features --fix --allow-dirty --allow-staged
 
 # Canonical deterministic local and CI verification.
-check: fmt-check lint test test-architecture test-scripts
+check: fmt-check lint test test-architecture test-scripts test-performance
 
 # Build a portable static x86_64 Linux release binary for Debian-like targets.
 build-portable:

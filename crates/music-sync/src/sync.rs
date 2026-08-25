@@ -12,7 +12,9 @@ use crate::fingerprint::{
     reconcile_artifact_fingerprints,
 };
 use crate::media_probe::MediaProbe;
-use crate::persistence::{Database, DatabaseError, SnapshotReconciliationSummary};
+use crate::persistence::{
+    Database, DatabaseError, ServicePhaseStatus, SnapshotReconciliationSummary,
+};
 use crate::playlist::{PlaylistError, PlaylistMaterializationReport, materialize_playlists};
 use crate::provider::SourceId;
 use crate::yt_dlp::YtDlp;
@@ -20,6 +22,7 @@ use crate::yt_dlp::YtDlp;
 /// Runs all bounded phases required for one ordinary synchronization cycle.
 pub fn run_sync(
     database: &mut Database,
+    service_run_id: i64,
     directories: SyncDirectories<'_>,
     boundaries: SyncBoundaries<'_>,
     limits: SyncLimits,
@@ -30,12 +33,25 @@ pub fn run_sync(
     {
         return Err(SyncRunError::InvalidLimits);
     }
-    let sources = database.list_sources(false)?;
+    database.start_service_phase(service_run_id, "sources", 0)?;
+    let sources = match database.list_sources(false) {
+        Ok(sources) => sources,
+        Err(error) => {
+            finish_failed_phase(database, service_run_id, "sources", &error)?;
+            return Err(error.into());
+        }
+    };
     let mut source_results = Vec::with_capacity(sources.len());
     for source in sources {
         match boundaries.source_adapter.enumerate(&source.url) {
             Ok(snapshot) => {
-                let summary = database.reconcile_source_snapshot(source.id, &snapshot)?;
+                let summary = match database.reconcile_source_snapshot(source.id, &snapshot) {
+                    Ok(summary) => summary,
+                    Err(error) => {
+                        finish_failed_phase(database, service_run_id, "sources", &error)?;
+                        return Err(error.into());
+                    }
+                };
                 source_results.push(SourceSyncResult::Reconciled {
                     source_id: source.id,
                     summary,
@@ -47,7 +63,22 @@ pub fn run_sync(
             }),
         }
     }
-    let acquisitions = run_pending_acquisitions(
+    let source_success = source_results
+        .iter()
+        .all(|result| matches!(result, SourceSyncResult::Reconciled { .. }));
+    database.finish_service_phase(
+        service_run_id,
+        "sources",
+        if source_success {
+            ServicePhaseStatus::Succeeded
+        } else {
+            ServicePhaseStatus::Partial
+        },
+        &serde_json::to_value(&source_results).map_err(DatabaseError::Json)?,
+        None,
+    )?;
+    database.start_service_phase(service_run_id, "acquisitions", 1)?;
+    let acquisitions = match run_pending_acquisitions(
         database,
         directories.state,
         directories.library,
@@ -55,21 +86,91 @@ pub fn run_sync(
         boundaries.probe,
         boundaries.hasher,
         limits.maximum_jobs,
+    ) {
+        Ok(report) => report,
+        Err(error) => {
+            finish_failed_phase(database, service_run_id, "acquisitions", &error)?;
+            return Err(error.into());
+        }
+    };
+    database.finish_service_phase(
+        service_run_id,
+        "acquisitions",
+        if acquisitions.failures.is_empty() {
+            ServicePhaseStatus::Succeeded
+        } else {
+            ServicePhaseStatus::Partial
+        },
+        &serde_json::to_value(&acquisitions).map_err(DatabaseError::Json)?,
+        None,
     )?;
-    let fingerprints = reconcile_artifact_fingerprints(
+    database.start_service_phase(service_run_id, "fingerprints", 2)?;
+    let fingerprints = match reconcile_artifact_fingerprints(
         database,
         directories.library,
         boundaries.fingerprinter,
         limits.maximum_fingerprints,
         limits.fingerprint_audio_seconds,
+    ) {
+        Ok(report) => report,
+        Err(error) => {
+            finish_failed_phase(database, service_run_id, "fingerprints", &error)?;
+            return Err(error.into());
+        }
+    };
+    database.finish_service_phase(
+        service_run_id,
+        "fingerprints",
+        if fingerprints.failures.is_empty() {
+            ServicePhaseStatus::Succeeded
+        } else {
+            ServicePhaseStatus::Partial
+        },
+        &serde_json::to_value(&fingerprints).map_err(DatabaseError::Json)?,
+        None,
     )?;
-    let playlists = materialize_playlists(database, directories.library, directories.playlists)?;
+    database.start_service_phase(service_run_id, "playlists", 3)?;
+    let playlists =
+        match materialize_playlists(database, directories.library, directories.playlists) {
+            Ok(report) => report,
+            Err(error) => {
+                finish_failed_phase(database, service_run_id, "playlists", &error)?;
+                return Err(error.into());
+            }
+        };
+    database.finish_service_phase(
+        service_run_id,
+        "playlists",
+        if playlists.failures.is_empty() {
+            ServicePhaseStatus::Succeeded
+        } else {
+            ServicePhaseStatus::Partial
+        },
+        &serde_json::to_value(&playlists).map_err(DatabaseError::Json)?,
+        None,
+    )?;
     Ok(SyncRunReport {
         sources: source_results,
         acquisitions,
         fingerprints,
         playlists,
     })
+}
+
+fn finish_failed_phase(
+    database: &mut Database,
+    service_run_id: i64,
+    phase: &str,
+    error: &dyn std::fmt::Display,
+) -> Result<(), DatabaseError> {
+    let message = error.to_string();
+    database.finish_service_phase(
+        service_run_id,
+        phase,
+        ServicePhaseStatus::Failed,
+        &serde_json::json!({"error":message}),
+        Some(&message),
+    )
 }
 
 /// Filesystem roots used by one synchronization run.

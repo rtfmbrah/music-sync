@@ -2,8 +2,8 @@
 
 ## CURRENT
 
-The CLI initializes `tracing` and maps default, `-v`, `-vv`, and `-vvv` to warning,
-info, debug, and trace. `doctor` emits stable named checks in English and optionally
+The CLI initializes `tracing` and maps default/`-v`, `-vv`, and `-vvv` to info,
+debug, and trace. `doctor` emits stable named checks in English and optionally
 pretty JSON. Database tables reserve persistent runs, jobs, and contextual events.
 Deferred acquisition attempts now persist a warning event and retain their attempt
 count; abandoned running acquisitions can be made explicitly retryable on restart.
@@ -27,16 +27,50 @@ counts and the latest persisted warning/error. Deferred jobs require audited
 `acquisition recover-running` converts confirmed abandoned claims to deferred while
 retaining staging evidence.
 
+Schema version 16 adds mutually exclusive service-cycle history. `sync run` reserves
+one durable cycle before contacting providers and records ordered source,
+acquisition, fingerprint, and playlist phases with exact JSON summaries. A second
+cycle is rejected while one remains running. Successful and partial cycles finish
+truthfully; fatal errors finish the active phase and cycle as failed. `runs history`
+is immutable, bounded, newest-first, and supports exact state filtering. `runs show`
+returns ordered phase evidence. `runs recover-interrupted` is the only transition for
+an operator-confirmed abandoned cycle and never retries work implicitly.
+
+`service run` is the complete headless cycle. It uses the same exclusive durable run
+for core source synchronization, discovery/taste import and verified acquisition,
+artifact health, post-acquisition fingerprinting, conservative repair
+assessment/execution, canonical metadata, artwork, lyrics, source-preserving tags,
+and final playlists. Verified repair attempts are rehashed and committed
+automatically; rejected, unresolved, deferred, and commit failures remain isolated
+and auditable. A repeat retries previously verified but uncommitted safe repair work.
+
+`events` performs immutable newest-first queries with exact severity, component,
+run, and job filters plus a hard result bound. It never creates SQLite sidecars or
+contacts a provider.
+
+Human-oriented commands show durable service run/phase transitions on stderr at the
+default information level. `--no-progress` suppresses them, while `--json`
+automatically keeps stdout machine-readable and stderr quiet unless verbosity is
+explicitly raised. The same structured `tracing` events are captured by journald for
+the systemd oneshot.
+
+`maintenance backup` uses SQLite `VACUUM INTO` to create a consistent, uniquely
+named snapshot in an existing operator-provisioned directory. It never overwrites a
+snapshot and does not delete old backups; retention remains an explicit operator
+policy.
+
+`just test-performance` runs the complete deterministic offline service cycle twice,
+checks idempotency and exclusivity, and fails if execution exceeds a deliberately
+generous ten-second regression ceiling. Build time is excluded. Target-LXC acceptance
+also records real total timing before production activation.
+
 ## PLANNED
 
-Interactive output shows real phase counts for source enumeration, reconciliation,
-metadata, downloads, artwork, lyrics, verification, and discovery. `--no-progress`
-and JSON event output support systemd/non-terminal use. Persistent events include
+Richer per-item interactive counters remain planned. Persistent events include
 timestamp, level, run/component, recording/source/job identifiers, event name,
 message, and structured decision evidence.
 
-Expanded run-level history and failure filtering remain planned. Candidate and
-discovery logs explain both scores
+Candidate and discovery logs explain both scores
 and final decisions, for example metadata compatibility followed by fingerprint
 mismatch and rejection. This is one local application, not a distributed queue.
 

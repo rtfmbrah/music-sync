@@ -1,6 +1,9 @@
 //! Read-only local environment diagnostics.
 
 use std::env;
+use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
@@ -72,10 +75,145 @@ pub fn run_doctor(config: &AppConfig) -> DoctorReport {
         true,
     ));
     checks.push(check_database(&config.database_path()));
-    for tool in ["yt-dlp", "ffmpeg", "ffprobe", "fpcalc"] {
-        checks.push(check_tool(tool));
+    if config.service.enabled {
+        checks.push(check_tool_path("yt-dlp", &config.service.yt_dlp, true));
+        checks.push(check_tool_path("ffmpeg", &config.service.ffmpeg, true));
+        checks.push(check_tool_path("ffprobe", &config.service.ffprobe, true));
+        checks.push(check_tool_path("fpcalc", &config.service.fpcalc, true));
+        checks.push(check_same_filesystem(
+            &config.state_directory,
+            &config.library_directory,
+        ));
+        checks.push(check_endpoint_security(config));
+        checks.push(check_secret_contract(config));
+    } else {
+        for tool in ["yt-dlp", "ffmpeg", "ffprobe", "fpcalc"] {
+            checks.push(check_tool(tool));
+        }
     }
     DoctorReport { checks }
+}
+
+fn check_tool_path(name: &str, path: &Path, required: bool) -> DiagnosticCheck {
+    let executable = path.is_file() && is_executable(path);
+    if executable {
+        DiagnosticCheck {
+            name: format!("tool_{name}"),
+            status: CheckStatus::Pass,
+            message: format!("Configured {name} is executable: {}", path.display()),
+        }
+    } else {
+        DiagnosticCheck {
+            name: format!("tool_{name}"),
+            status: if required {
+                CheckStatus::Failure
+            } else {
+                CheckStatus::Warning
+            },
+            message: format!(
+                "Configured {name} is not an executable file: {}",
+                path.display()
+            ),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn is_executable(path: &Path) -> bool {
+    fs::metadata(path).is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
+}
+#[cfg(not(unix))]
+fn is_executable(path: &Path) -> bool {
+    path.is_file()
+}
+
+fn check_same_filesystem(state: &Path, library: &Path) -> DiagnosticCheck {
+    let state_anchor = if state.exists() {
+        Some(state.to_path_buf())
+    } else {
+        existing_parent(state)
+    };
+    let library_anchor = if library.exists() {
+        Some(library.to_path_buf())
+    } else {
+        existing_parent(library)
+    };
+    #[cfg(unix)]
+    if let (Some(state), Some(library)) = (state_anchor, library_anchor)
+        && let (Ok(state), Ok(library)) = (fs::metadata(&state), fs::metadata(&library))
+    {
+        let same = state.dev() == library.dev();
+        return DiagnosticCheck {
+            name: "staging_library_filesystem".into(),
+            status: if same {
+                CheckStatus::Pass
+            } else {
+                CheckStatus::Failure
+            },
+            message: if same {
+                "State staging and library are on the same filesystem".into()
+            } else {
+                "State staging and library are on different filesystems; atomic hard-link commit cannot work".into()
+            },
+        };
+    }
+    DiagnosticCheck {
+        name: "staging_library_filesystem".into(),
+        status: CheckStatus::Warning,
+        message: "Could not determine whether state staging and library share a filesystem".into(),
+    }
+}
+
+fn check_endpoint_security(config: &AppConfig) -> DiagnosticCheck {
+    let endpoints = [
+        &config.service.musicbrainz_endpoint,
+        &config.service.cover_art_endpoint,
+        &config.service.lyrics_endpoint,
+        &config.service.listenbrainz_endpoint,
+    ];
+    let secure = endpoints.iter().all(|endpoint| {
+        endpoint.starts_with("https://")
+            || endpoint.starts_with("http://127.0.0.1:")
+            || endpoint.starts_with("http://[::1]:")
+    });
+    DiagnosticCheck {
+        name: "service_endpoints".into(),
+        status: if secure {
+            CheckStatus::Pass
+        } else {
+            CheckStatus::Failure
+        },
+        message: if secure {
+            "Service endpoints use HTTPS (or explicit loopback fixtures)".into()
+        } else {
+            "Every service endpoint must use HTTPS outside loopback fixtures".into()
+        },
+    }
+}
+
+fn check_secret_contract(config: &AppConfig) -> DiagnosticCheck {
+    if config.discovery.navidrome_url.is_none() {
+        return DiagnosticCheck {
+            name: "navidrome_secrets".into(),
+            status: CheckStatus::Pass,
+            message: "Navidrome taste import is not configured".into(),
+        };
+    }
+    let present =
+        env::var_os("NAVIDROME_TOKEN").is_some() && env::var_os("NAVIDROME_SALT").is_some();
+    DiagnosticCheck {
+        name: "navidrome_secrets".into(),
+        status: if present {
+            CheckStatus::Pass
+        } else {
+            CheckStatus::Failure
+        },
+        message: if present {
+            "Required Navidrome secret variables are present".into()
+        } else {
+            "NAVIDROME_TOKEN and NAVIDROME_SALT are required without exposing their values".into()
+        },
+    }
 }
 
 fn check_directory(name: &str, path: &Path, may_be_created: bool) -> DiagnosticCheck {
@@ -179,6 +317,7 @@ mod tests {
             playlist_directory: playlists.clone(),
             concurrency: ConcurrencyConfig::default(),
             discovery: DiscoveryConfig::default(),
+            service: Default::default(),
         };
 
         let report = run_doctor(&config);
@@ -186,6 +325,43 @@ mod tests {
         assert!(!report.is_healthy());
         assert!(!state.exists());
         assert!(!playlists.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn enabled_service_requires_explicit_executable_tools() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let root = tempfile::tempdir()?;
+        let library = root.path().join("library");
+        let playlists = root.path().join("playlists");
+        fs::create_dir(&library)?;
+        fs::create_dir(&playlists)?;
+        let mut config = AppConfig {
+            state_directory: root.path().join("state"),
+            library_directory: library,
+            playlist_directory: playlists,
+            concurrency: Default::default(),
+            discovery: Default::default(),
+            service: Default::default(),
+        };
+        config.service.enabled = true;
+        config.service.user_agent = Some("fixture@example.invalid".into());
+        config.service.yt_dlp = "/missing/yt-dlp".into();
+        config.service.ffmpeg = "/missing/ffmpeg".into();
+        config.service.ffprobe = "/missing/ffprobe".into();
+        config.service.fpcalc = "/missing/fpcalc".into();
+        let report = run_doctor(&config);
+        assert!(!report.is_healthy());
+        assert_eq!(
+            report
+                .checks
+                .iter()
+                .filter(
+                    |check| check.name.starts_with("tool_") && check.status == CheckStatus::Failure
+                )
+                .count(),
+            4
+        );
         Ok(())
     }
 }

@@ -22,6 +22,76 @@ pub struct AppConfig {
     /// Autonomous discovery policy.
     #[serde(default)]
     pub discovery: DiscoveryConfig,
+    /// Complete headless service-cycle policy and external adapter locations.
+    #[serde(default)]
+    pub service: ServiceConfig,
+}
+
+/// Headless autonomous service configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ServiceConfig {
+    /// Enables the complete enrichment/discovery service cycle.
+    pub enabled: bool,
+    /// Identifying HTTP User-Agent with operator contact information.
+    pub user_agent: Option<String>,
+    /// Explicit yt-dlp adapter executable.
+    pub yt_dlp: PathBuf,
+    /// Explicit ffprobe executable.
+    pub ffprobe: PathBuf,
+    /// Explicit ffmpeg executable.
+    pub ffmpeg: PathBuf,
+    /// Explicit fpcalc executable.
+    pub fpcalc: PathBuf,
+    /// MusicBrainz ws/2 endpoint.
+    pub musicbrainz_endpoint: String,
+    /// Cover Art Archive endpoint.
+    pub cover_art_endpoint: String,
+    /// LRCLIB API endpoint.
+    pub lyrics_endpoint: String,
+    /// ListenBrainz API endpoint.
+    pub listenbrainz_endpoint: String,
+    /// Per-boundary global HTTP deadline in seconds.
+    pub http_timeout_seconds: u64,
+    /// Per-provider yt-dlp enumeration deadline in seconds.
+    pub source_timeout_seconds: u64,
+    /// Per-download yt-dlp deadline in seconds.
+    pub download_timeout_seconds: u64,
+    /// Per-file ffprobe deadline in seconds.
+    pub probe_timeout_seconds: u64,
+    /// Per-file ffmpeg deadline in seconds.
+    pub remux_timeout_seconds: u64,
+    /// Per-file fpcalc deadline in seconds.
+    pub fingerprint_timeout_seconds: u64,
+    /// Maximum items selected by each ordinary bounded phase.
+    pub phase_item_limit: usize,
+    /// Maximum audio seconds consumed by each fingerprint.
+    pub fingerprint_audio_seconds: u32,
+}
+
+impl Default for ServiceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            user_agent: None,
+            yt_dlp: "yt-dlp".into(),
+            ffprobe: "ffprobe".into(),
+            ffmpeg: "ffmpeg".into(),
+            fpcalc: "fpcalc".into(),
+            musicbrainz_endpoint: "https://musicbrainz.org/ws/2".into(),
+            cover_art_endpoint: "https://coverartarchive.org".into(),
+            lyrics_endpoint: "https://lrclib.net/api".into(),
+            listenbrainz_endpoint: "https://api.listenbrainz.org".into(),
+            http_timeout_seconds: 30,
+            source_timeout_seconds: 60,
+            download_timeout_seconds: 600,
+            probe_timeout_seconds: 30,
+            remux_timeout_seconds: 120,
+            fingerprint_timeout_seconds: 60,
+            phase_item_limit: 100,
+            fingerprint_audio_seconds: 120,
+        }
+    }
 }
 
 /// Bounded concurrency limits.
@@ -122,6 +192,47 @@ impl AppConfig {
                 "concurrency limits must be greater than zero".into(),
             ));
         }
+        if self.service.enabled {
+            if self
+                .service
+                .user_agent
+                .as_deref()
+                .is_none_or(|value| value.trim().is_empty())
+            {
+                return Err(ConfigError::Invalid(
+                    "enabled service requires an identifying user agent".into(),
+                ));
+            }
+            if self.service.phase_item_limit == 0
+                || self.service.fingerprint_audio_seconds == 0
+                || [
+                    self.service.http_timeout_seconds,
+                    self.service.source_timeout_seconds,
+                    self.service.download_timeout_seconds,
+                    self.service.probe_timeout_seconds,
+                    self.service.remux_timeout_seconds,
+                    self.service.fingerprint_timeout_seconds,
+                ]
+                .contains(&0)
+            {
+                return Err(ConfigError::Invalid(
+                    "enabled service limits and deadlines must be greater than zero".into(),
+                ));
+            }
+            if [
+                &self.service.yt_dlp,
+                &self.service.ffprobe,
+                &self.service.ffmpeg,
+                &self.service.fpcalc,
+            ]
+            .iter()
+            .any(|path| path.as_os_str().is_empty())
+            {
+                return Err(ConfigError::Invalid(
+                    "enabled service tool paths must not be empty".into(),
+                ));
+            }
+        }
         if self.discovery.target_new_tracks_per_day > self.discovery.max_new_tracks_per_day {
             return Err(ConfigError::Invalid(
                 "discovery target cannot exceed the daily maximum".into(),
@@ -206,6 +317,7 @@ mod tests {
             playlist_directory: PathBuf::from("playlists"),
             concurrency: ConcurrencyConfig::default(),
             discovery: DiscoveryConfig::default(),
+            service: ServiceConfig::default(),
         }
     }
 

@@ -1,0 +1,11 @@
+[Unit]
+Description=Back up music-sync state daily
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=30min
+Persistent=true
+Unit=music-sync-backup.service
+
+[Install]
+WantedBy=timers.target

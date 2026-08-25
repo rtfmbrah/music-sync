@@ -32,8 +32,8 @@ in ad hoc TODO documents.
 
 - Crash-safe acquisition jobs and recovery (complete for initial yt-dlp/ffprobe/hash
   acquisition; interrupted staging is retained).
-- `yt-dlp`, `ffprobe`, `ffmpeg`, hash, and `fpcalc` adapters (yt-dlp, ffprobe, hash,
-  and bounded raw fpcalc complete; ffmpeg planned).
+- `yt-dlp`, `ffprobe`, `ffmpeg`, hash, and `fpcalc` adapters (complete, including
+  bounded source-preserving ffmpeg remuxing).
 - Artifact probing and health reconciliation (complete).
 - Conservative staged candidate pipeline and perceptual identity thresholds
   (complete for retained embedded canonical evidence; external resolution planned).
@@ -65,7 +65,11 @@ in ad hoc TODO documents.
 - Bounded `sync run` orchestration and systemd examples (complete).
 - Read-only durable operational status (complete).
 - Acquisition job history and explicit retry/recovery (complete).
-- Run-level history, expanded failure filtering, and expanded doctor commands.
-- Interactive and JSON progress, persistent logs, systemd examples.
+- Run-level history plus exact run/event/component/job filtering and expanded
+  offline doctor checks (complete).
+- Complete mutually exclusive service-cycle orchestration (complete); interactive
+  progress and persistent log policy remain.
+- JSON phase summaries, hardened systemd examples, consistent state backup, and
+  atomic versioned release/rollback tooling (complete).
 - Least-privilege LXC compatibility/deployment validation in isolated test storage.
 - Production health checks, performance measurement, and repair workflows.

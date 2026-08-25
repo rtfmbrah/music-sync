@@ -5,6 +5,56 @@ use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
 #[test]
+fn maintenance_backup_creates_a_consistent_unique_snapshot()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = tempfile::tempdir()?;
+    let state = root.path().join("state");
+    let library = root.path().join("library");
+    let playlists = root.path().join("playlists");
+    let backups = root.path().join("backups");
+    fs::create_dir(&library)?;
+    fs::create_dir(&playlists)?;
+    fs::create_dir(&backups)?;
+    let config = root.path().join("config.toml");
+    fs::write(
+        &config,
+        format!(
+            "state_directory = {state:?}\nlibrary_directory = {library:?}\nplaylist_directory = {playlists:?}\n"
+        ),
+    )?;
+    let first = Command::new(env!("CARGO_BIN_EXE_music-sync"))
+        .args(["--json", "maintenance", "backup", "--config"])
+        .arg(&config)
+        .arg("--directory")
+        .arg(&backups)
+        .output()?;
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&first.stdout)?;
+    let backup = report["backup"].as_str().ok_or("missing backup path")?;
+    assert_eq!(
+        music_sync::persistence::Database::inspect_read_only(backup.as_ref())?.version,
+        music_sync::persistence::CURRENT_SCHEMA_VERSION
+    );
+    let second = Command::new(env!("CARGO_BIN_EXE_music-sync"))
+        .args(["maintenance", "backup", "--config"])
+        .arg(&config)
+        .arg("--directory")
+        .arg(&backups)
+        .output()?;
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert_eq!(fs::read_dir(&backups)?.count(), 2);
+    Ok(())
+}
+
+#[test]
 fn discovery_run_and_route_require_canonical_relationship_evidence()
 -> Result<(), Box<dyn std::error::Error>> {
     use std::io::{Read, Write};
@@ -108,6 +158,130 @@ fn discovery_run_and_route_require_canonical_relationship_evidence()
             |row| row.get::<_, u64>(0)
         )?,
         1
+    );
+    Ok(())
+}
+
+#[test]
+fn service_run_history_is_read_only_and_recovery_is_explicit()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = tempfile::tempdir()?;
+    let state = root.path().join("state");
+    let library = root.path().join("library");
+    let playlists = root.path().join("playlists");
+    fs::create_dir_all(&library)?;
+    fs::create_dir_all(&playlists)?;
+    let config = root.path().join("config.toml");
+    fs::write(
+        &config,
+        format!(
+            "state_directory = {:?}\nlibrary_directory = {:?}\nplaylist_directory = {:?}\n",
+            state, library, playlists
+        ),
+    )?;
+    let database = state.join("music-sync.sqlite3");
+    let initialize = Command::new(env!("CARGO_BIN_EXE_music-sync"))
+        .args(["source", "add", "https://youtu.be/fixture", "--database"])
+        .arg(&database)
+        .output()?;
+    assert!(initialize.status.success());
+    let connection = rusqlite::Connection::open(&database)?;
+    connection.execute("INSERT INTO service_runs(trigger,status,binary_version) VALUES ('timer','running','fixture')",[])?;
+    connection.execute("INSERT INTO service_run_phases(service_run_id,phase,ordinal,status) VALUES (1,'sources',0,'running')",[])?;
+    drop(connection);
+    let before = fs::read(&database)?;
+    let history = Command::new(env!("CARGO_BIN_EXE_music-sync"))
+        .args(["--json", "runs", "history", "--config"])
+        .arg(&config)
+        .args(["--status", "running"])
+        .output()?;
+    assert!(history.status.success());
+    let rows: serde_json::Value = serde_json::from_slice(&history.stdout)?;
+    assert_eq!(rows[0]["status"], "running");
+    assert_eq!(fs::read(&database)?, before);
+    let recovery = Command::new(env!("CARGO_BIN_EXE_music-sync"))
+        .args(["--json", "runs", "recover-interrupted", "--config"])
+        .arg(&config)
+        .output()?;
+    assert!(recovery.status.success());
+    let recovered: serde_json::Value = serde_json::from_slice(&recovery.stdout)?;
+    assert_eq!(recovered["recovered_run_id"], 1);
+    let show = Command::new(env!("CARGO_BIN_EXE_music-sync"))
+        .args(["--json", "runs", "show", "1", "--config"])
+        .arg(&config)
+        .output()?;
+    assert!(show.status.success());
+    let detail: serde_json::Value = serde_json::from_slice(&show.stdout)?;
+    assert_eq!(detail["run"]["status"], "interrupted");
+    assert_eq!(detail["phases"][0]["phase"], "sources");
+    assert_eq!(detail["phases"][0]["status"], "failed");
+    Ok(())
+}
+
+#[test]
+fn complete_service_runs_every_offline_phase_and_repeats_idempotently()
+-> Result<(), Box<dyn std::error::Error>> {
+    let started = std::time::Instant::now();
+    let root = tempfile::tempdir()?;
+    let state = root.path().join("state");
+    let library = root.path().join("library");
+    let playlists = root.path().join("playlists");
+    fs::create_dir_all(&library)?;
+    fs::create_dir_all(&playlists)?;
+    let config = root.path().join("config.toml");
+    fs::write(
+        &config,
+        format!(
+            "state_directory = {:?}\nlibrary_directory = {:?}\nplaylist_directory = {:?}\n[service]\nenabled = true\nuser_agent = \"fixture@example.invalid\"\nyt_dlp = \"/nonexistent/yt-dlp\"\nffprobe = \"/nonexistent/ffprobe\"\nffmpeg = \"/nonexistent/ffmpeg\"\nfpcalc = \"/nonexistent/fpcalc\"\nphase_item_limit = 5\n",
+            state, library, playlists
+        ),
+    )?;
+    let run = || {
+        Command::new(env!("CARGO_BIN_EXE_music-sync"))
+            .args(["--json", "service", "run", "--config"])
+            .arg(&config)
+            .output()
+    };
+    let first = run()?;
+    let second = run()?;
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let first: serde_json::Value = serde_json::from_slice(&first.stdout)?;
+    let second: serde_json::Value = serde_json::from_slice(&second.stdout)?;
+    assert_eq!(first["core"]["acquisitions"]["selected"], 0);
+    assert_eq!(second["metadata"]["selected"], 0);
+    let history = Command::new(env!("CARGO_BIN_EXE_music-sync"))
+        .args(["--json", "runs", "history", "--config"])
+        .arg(&config)
+        .output()?;
+    let history: serde_json::Value = serde_json::from_slice(&history.stdout)?;
+    assert_eq!(history[0]["status"], "succeeded");
+    assert_eq!(history[0]["phase_count"], 14);
+    assert_eq!(history[1]["status"], "succeeded");
+    let database = state.join("music-sync.sqlite3");
+    let connection = rusqlite::Connection::open(&database)?;
+    connection.execute("INSERT INTO service_runs(trigger,status,binary_version) VALUES ('timer','running','overlap-fixture')",[])?;
+    drop(connection);
+    let overlap = run()?;
+    assert!(!overlap.status.success());
+    assert!(String::from_utf8(overlap.stderr)?.contains("already running"));
+    let connection = rusqlite::Connection::open(&database)?;
+    assert_eq!(
+        connection.query_row("SELECT COUNT(*) FROM service_runs", [], |row| row
+            .get::<_, u64>(0))?,
+        3
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "offline service regression gate exceeded 10 seconds"
     );
     Ok(())
 }
@@ -938,6 +1112,14 @@ fn sync_run_completes_all_phases_and_isolates_one_source_failure()
         fs::read_to_string(playlists.join("collection-2.m3u8"))?,
         "#EXTM3U\nyoutube/two.opus\n"
     );
+    let history = Command::new(env!("CARGO_BIN_EXE_music-sync"))
+        .args(["--json", "runs", "history", "--config"])
+        .arg(&config)
+        .output()?;
+    let history: serde_json::Value = serde_json::from_slice(&history.stdout)?;
+    assert_eq!(history[0]["status"], "partial");
+    assert_eq!(history[1]["status"], "succeeded");
+    assert_eq!(history[0]["phase_count"], 4);
     Ok(())
 }
 
@@ -1034,6 +1216,21 @@ fn status_reports_durable_failures_without_modifying_state()
     assert_eq!(history_report[0]["status"], "deferred");
     assert_eq!(history_report[0]["attempt_count"], 1);
     assert!(history_report[0]["latest_message"].as_str().is_some());
+    let events = Command::new(env!("CARGO_BIN_EXE_music-sync"))
+        .args(["--json", "events", "--config"])
+        .arg(&config)
+        .args([
+            "--level",
+            "warning",
+            "--component",
+            "acquisition",
+            "--job-id",
+            "1",
+        ])
+        .output()?;
+    let events: serde_json::Value = serde_json::from_slice(&events.stdout)?;
+    assert!(events.as_array().is_some_and(|events| events.len() == 1));
+    assert_eq!(events[0]["event"], "acquisition_deferred");
     assert_eq!(fs::read(&database)?, before_database);
     let mut after_entries = fs::read_dir(&state)?
         .map(|entry| entry.map(|entry| entry.file_name()))

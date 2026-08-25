@@ -45,10 +45,11 @@ const MIGRATIONS: &[(u32, &str)] = &[
         include_str!("../migrations/0014_metadata_materialization.sql"),
     ),
     (15, include_str!("../migrations/0015_discovery.sql")),
+    (16, include_str!("../migrations/0016_service_runs.sql")),
 ];
 
 /// Current durable schema version.
-pub const CURRENT_SCHEMA_VERSION: u32 = 15;
+pub const CURRENT_SCHEMA_VERSION: u32 = 16;
 
 /// A connection to music-sync's private application state.
 #[derive(Debug)]
@@ -86,6 +87,31 @@ impl Database {
         database.configure()?;
         database.migrate()?;
         Ok(database)
+    }
+
+    /// Writes a transactionally consistent SQLite snapshot without replacing an
+    /// existing file. The caller owns destination naming and retention.
+    pub fn backup_to(&self, destination: &Path) -> Result<(), DatabaseError> {
+        if destination.exists() {
+            return Err(DatabaseError::BackupAlreadyExists(
+                destination.to_path_buf(),
+            ));
+        }
+        let parent = destination
+            .parent()
+            .ok_or_else(|| DatabaseError::MissingParent {
+                path: destination.to_path_buf(),
+            })?;
+        if !parent.is_dir() {
+            return Err(DatabaseError::BackupParentMissing(parent.to_path_buf()));
+        }
+        let destination_text = destination
+            .to_str()
+            .ok_or_else(|| DatabaseError::BackupPathNotUtf8(destination.to_path_buf()))?;
+        self.connection
+            .execute("VACUUM INTO ?1", [destination_text])
+            .map_err(DatabaseError::Sqlite)?;
+        Ok(())
     }
 
     /// Checks an existing database without creating or migrating it.
@@ -273,6 +299,249 @@ impl Database {
             )?,
             recent_events: events,
         })
+    }
+
+    /// Starts one mutually exclusive durable service cycle.
+    pub fn start_service_run(
+        &mut self,
+        trigger: ServiceRunTrigger,
+        binary_version: &str,
+    ) -> Result<i64, DatabaseError> {
+        if binary_version.trim().is_empty() {
+            return Err(DatabaseError::InvalidServiceRunVersion);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(DatabaseError::Sqlite)?;
+        let running = transaction
+            .query_row(
+                "SELECT id FROM service_runs WHERE status='running'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(DatabaseError::Sqlite)?;
+        if let Some(run_id) = running {
+            return Err(DatabaseError::ServiceRunAlreadyRunning(run_id));
+        }
+        transaction
+            .execute(
+                "INSERT INTO service_runs(trigger,status,binary_version) VALUES (?1,'running',?2)",
+                rusqlite::params![trigger.as_str(), binary_version],
+            )
+            .map_err(DatabaseError::Sqlite)?;
+        let id = transaction.last_insert_rowid();
+        transaction.commit().map_err(DatabaseError::Sqlite)?;
+        tracing::info!(
+            service_run_id = id,
+            trigger = trigger.as_str(),
+            "service cycle started"
+        );
+        Ok(id)
+    }
+
+    /// Starts one uniquely named ordered phase inside a running service cycle.
+    pub fn start_service_phase(
+        &mut self,
+        run_id: i64,
+        phase: &str,
+        ordinal: u32,
+    ) -> Result<(), DatabaseError> {
+        if phase.trim().is_empty() {
+            return Err(DatabaseError::InvalidServicePhase);
+        }
+        let changed=self.connection.execute("INSERT INTO service_run_phases(service_run_id,phase,ordinal,status) SELECT ?1,?2,?3,'running' FROM service_runs WHERE id=?1 AND status='running'",rusqlite::params![run_id,phase,ordinal]).map_err(DatabaseError::Sqlite)?;
+        if changed == 1 {
+            tracing::info!(
+                service_run_id = run_id,
+                phase,
+                ordinal,
+                "service phase started"
+            );
+            Ok(())
+        } else {
+            Err(DatabaseError::ServiceRunNotRunning(run_id))
+        }
+    }
+
+    /// Finishes one running phase with bounded structured summary and message.
+    pub fn finish_service_phase(
+        &mut self,
+        run_id: i64,
+        phase: &str,
+        status: ServicePhaseStatus,
+        summary: &serde_json::Value,
+        message: Option<&str>,
+    ) -> Result<(), DatabaseError> {
+        let summary = serde_json::to_string(summary).map_err(DatabaseError::Json)?;
+        let changed=self.connection.execute("UPDATE service_run_phases SET status=?3,summary_json=?4,message=?5,finished_at=CURRENT_TIMESTAMP WHERE service_run_id=?1 AND phase=?2 AND status='running'",rusqlite::params![run_id,phase,status.as_str(),summary,message]).map_err(DatabaseError::Sqlite)?;
+        if changed == 1 {
+            tracing::info!(
+                service_run_id = run_id,
+                phase,
+                status = status.as_str(),
+                "service phase finished"
+            );
+            Ok(())
+        } else {
+            Err(DatabaseError::ServicePhaseNotRunning {
+                run_id,
+                phase: phase.into(),
+            })
+        }
+    }
+
+    /// Finishes a running service cycle after every phase reached a terminal state.
+    pub fn finish_service_run(
+        &mut self,
+        run_id: i64,
+        status: ServiceRunTerminalStatus,
+        summary: &serde_json::Value,
+    ) -> Result<(), DatabaseError> {
+        let summary = serde_json::to_string(summary).map_err(DatabaseError::Json)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(DatabaseError::Sqlite)?;
+        let running_phases=transaction.query_row("SELECT COUNT(*) FROM service_run_phases WHERE service_run_id=?1 AND status='running'",[run_id],|row|row.get::<_,u64>(0)).map_err(DatabaseError::Sqlite)?;
+        if running_phases != 0 {
+            return Err(DatabaseError::ServiceRunHasRunningPhases(run_id));
+        }
+        let changed=transaction.execute("UPDATE service_runs SET status=?2,summary_json=?3,finished_at=CURRENT_TIMESTAMP WHERE id=?1 AND status='running'",rusqlite::params![run_id,status.as_str(),summary]).map_err(DatabaseError::Sqlite)?;
+        if changed != 1 {
+            return Err(DatabaseError::ServiceRunNotRunning(run_id));
+        }
+        transaction.commit().map_err(DatabaseError::Sqlite)?;
+        tracing::info!(
+            service_run_id = run_id,
+            status = status.as_str(),
+            "service cycle finished"
+        );
+        Ok(())
+    }
+
+    /// Explicitly marks an abandoned service cycle and its active phase interrupted.
+    pub fn recover_interrupted_service_run(&mut self) -> Result<Option<i64>, DatabaseError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(DatabaseError::Sqlite)?;
+        let run_id = transaction
+            .query_row(
+                "SELECT id FROM service_runs WHERE status='running'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(DatabaseError::Sqlite)?;
+        if let Some(run_id) = run_id {
+            transaction.execute("UPDATE service_run_phases SET status='failed',message='operator marked abandoned service run interrupted',summary_json='{}',finished_at=CURRENT_TIMESTAMP WHERE service_run_id=?1 AND status='running'",[run_id]).map_err(DatabaseError::Sqlite)?;
+            transaction.execute("UPDATE service_runs SET status='interrupted',summary_json='{\"reason\":\"operator recovery\"}',finished_at=CURRENT_TIMESTAMP WHERE id=?1",[run_id]).map_err(DatabaseError::Sqlite)?;
+        }
+        transaction.commit().map_err(DatabaseError::Sqlite)?;
+        if let Some(run_id) = run_id {
+            tracing::warn!(
+                service_run_id = run_id,
+                "service cycle marked interrupted by operator"
+            );
+        }
+        Ok(run_id)
+    }
+
+    /// Reads bounded newest-first service-cycle history without mutating state.
+    pub fn service_run_history_read_only(
+        path: &Path,
+        limit: usize,
+        status: Option<ServiceRunHistoryStatus>,
+    ) -> Result<Vec<ServiceRunHistoryEntry>, DatabaseError> {
+        let connection = open_immutable_current_schema(path)?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut statement=connection.prepare("SELECT id,trigger,status,binary_version,started_at,finished_at,summary_json,(SELECT COUNT(*) FROM service_run_phases WHERE service_run_id=service_runs.id),(SELECT COUNT(*) FROM service_run_phases WHERE service_run_id=service_runs.id AND status IN ('failed','partial')) FROM service_runs WHERE (?2 IS NULL OR status=?2) ORDER BY id DESC LIMIT ?1").map_err(DatabaseError::Sqlite)?;
+        statement
+            .query_map(
+                rusqlite::params![limit, status.map(ServiceRunHistoryStatus::as_str)],
+                |row| {
+                    Ok(ServiceRunHistoryEntry {
+                        id: row.get(0)?,
+                        trigger: row.get(1)?,
+                        status: row.get(2)?,
+                        binary_version: row.get(3)?,
+                        started_at: row.get(4)?,
+                        finished_at: row.get(5)?,
+                        summary_json: row.get(6)?,
+                        phase_count: row.get(7)?,
+                        failed_phase_count: row.get(8)?,
+                    })
+                },
+            )
+            .map_err(DatabaseError::Sqlite)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(DatabaseError::Sqlite)
+    }
+
+    /// Reads one service cycle and its ordered phase details without mutation.
+    pub fn service_run_detail_read_only(
+        path: &Path,
+        run_id: i64,
+    ) -> Result<Option<ServiceRunDetail>, DatabaseError> {
+        let connection = open_immutable_current_schema(path)?;
+        let run=connection.query_row("SELECT id,trigger,status,binary_version,started_at,finished_at,summary_json FROM service_runs WHERE id=?1",[run_id],|row|Ok(ServiceRunHistoryEntry{id:row.get(0)?,trigger:row.get(1)?,status:row.get(2)?,binary_version:row.get(3)?,started_at:row.get(4)?,finished_at:row.get(5)?,summary_json:row.get(6)?,phase_count:0,failed_phase_count:0})).optional().map_err(DatabaseError::Sqlite)?;
+        let Some(mut run) = run else { return Ok(None) };
+        let mut statement=connection.prepare("SELECT phase,ordinal,status,started_at,finished_at,summary_json,message FROM service_run_phases WHERE service_run_id=?1 ORDER BY ordinal").map_err(DatabaseError::Sqlite)?;
+        let phases = statement
+            .query_map([run_id], |row| {
+                Ok(ServiceRunPhaseHistoryEntry {
+                    phase: row.get(0)?,
+                    ordinal: row.get(1)?,
+                    status: row.get(2)?,
+                    started_at: row.get(3)?,
+                    finished_at: row.get(4)?,
+                    summary_json: row.get(5)?,
+                    message: row.get(6)?,
+                })
+            })
+            .map_err(DatabaseError::Sqlite)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(DatabaseError::Sqlite)?;
+        run.phase_count = phases.len() as u64;
+        run.failed_phase_count = phases
+            .iter()
+            .filter(|phase| matches!(phase.status.as_str(), "failed" | "partial"))
+            .count() as u64;
+        Ok(Some(ServiceRunDetail { run, phases }))
+    }
+
+    /// Reads bounded newest-first persisted events with exact optional filters.
+    pub fn operational_events_read_only(
+        path: &Path,
+        limit: usize,
+        level: Option<&str>,
+        component: Option<&str>,
+        run_id: Option<i64>,
+        job_id: Option<i64>,
+    ) -> Result<Vec<OperationalEvent>, DatabaseError> {
+        let connection = open_immutable_current_schema(path)?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut statement=connection.prepare("SELECT created_at,level,component,event,message,run_id,job_id FROM events WHERE (?2 IS NULL OR level=?2) AND (?3 IS NULL OR component=?3) AND (?4 IS NULL OR run_id=?4) AND (?5 IS NULL OR job_id=?5) ORDER BY id DESC LIMIT ?1").map_err(DatabaseError::Sqlite)?;
+        statement
+            .query_map(
+                rusqlite::params![limit, level, component, run_id, job_id],
+                |row| {
+                    Ok(OperationalEvent {
+                        created_at: row.get(0)?,
+                        level: row.get(1)?,
+                        component: row.get(2)?,
+                        event: row.get(3)?,
+                        message: row.get(4)?,
+                        run_id: row.get(5)?,
+                        job_id: row.get(6)?,
+                    })
+                },
+            )
+            .map_err(DatabaseError::Sqlite)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(DatabaseError::Sqlite)
     }
 
     /// Reads bounded newest-first acquisition history without mutating SQLite state.
@@ -2143,6 +2412,20 @@ impl Database {
         transaction.commit().map_err(DatabaseError::Sqlite)
     }
 
+    /// Lists verified attempts awaiting safe commit in stable order.
+    pub fn verified_repair_attempt_ids(&self, limit: usize) -> Result<Vec<i64>, DatabaseError> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut statement = self
+            .connection
+            .prepare("SELECT id FROM repair_attempts WHERE state='verified' ORDER BY id LIMIT ?1")
+            .map_err(DatabaseError::Sqlite)?;
+        statement
+            .query_map([limit], |row| row.get::<_, i64>(0))
+            .map_err(DatabaseError::Sqlite)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(DatabaseError::Sqlite)
+    }
+
     /// Loads one verified candidate and its exact staged evidence for commit.
     pub fn verified_repair_attempt(
         &self,
@@ -3957,6 +4240,146 @@ pub struct OperationalEvent {
     pub job_id: Option<i64>,
 }
 
+/// Origin of one service-cycle invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceRunTrigger {
+    /// Interactive/operator invocation.
+    Manual,
+    /// systemd timer invocation.
+    Timer,
+    /// Controlled crash-recovery validation.
+    RecoveryTest,
+}
+impl ServiceRunTrigger {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::Timer => "timer",
+            Self::RecoveryTest => "recovery_test",
+        }
+    }
+}
+
+/// Terminal service-cycle state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceRunTerminalStatus {
+    /// Every phase succeeded.
+    Succeeded,
+    /// Useful work committed but one or more phases failed.
+    Partial,
+    /// Fatal cycle failure.
+    Failed,
+}
+impl ServiceRunTerminalStatus {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Succeeded => "succeeded",
+            Self::Partial => "partial",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// Terminal state of one service phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServicePhaseStatus {
+    /// Phase succeeded.
+    Succeeded,
+    /// Phase committed partial useful work.
+    Partial,
+    /// Phase failed.
+    Failed,
+    /// Dependency or configuration deliberately skipped the phase.
+    Skipped,
+}
+impl ServicePhaseStatus {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Succeeded => "succeeded",
+            Self::Partial => "partial",
+            Self::Failed => "failed",
+            Self::Skipped => "skipped",
+        }
+    }
+}
+
+/// Optional run-history terminal-state filter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceRunHistoryStatus {
+    /// Currently active.
+    Running,
+    /// Successful.
+    Succeeded,
+    /// Partial.
+    Partial,
+    /// Failed.
+    Failed,
+    /// Explicitly recovered interruption.
+    Interrupted,
+}
+impl ServiceRunHistoryStatus {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Succeeded => "succeeded",
+            Self::Partial => "partial",
+            Self::Failed => "failed",
+            Self::Interrupted => "interrupted",
+        }
+    }
+}
+
+/// Read-only durable service-cycle history row.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ServiceRunHistoryEntry {
+    /// Durable ID.
+    pub id: i64,
+    /// Invocation origin.
+    pub trigger: String,
+    /// Durable state.
+    pub status: String,
+    /// Producing binary version.
+    pub binary_version: String,
+    /// Start timestamp.
+    pub started_at: String,
+    /// Terminal timestamp.
+    pub finished_at: Option<String>,
+    /// Exact summary JSON.
+    pub summary_json: String,
+    /// Number of phases.
+    pub phase_count: u64,
+    /// Failed or partial phases.
+    pub failed_phase_count: u64,
+}
+
+/// One ordered phase in read-only service-cycle history.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ServiceRunPhaseHistoryEntry {
+    /// Stable phase name.
+    pub phase: String,
+    /// Execution ordinal.
+    pub ordinal: u32,
+    /// Durable phase state.
+    pub status: String,
+    /// Start timestamp.
+    pub started_at: String,
+    /// Terminal timestamp.
+    pub finished_at: Option<String>,
+    /// Exact summary JSON.
+    pub summary_json: String,
+    /// Optional bounded diagnostic.
+    pub message: Option<String>,
+}
+
+/// One service cycle with ordered phase evidence.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ServiceRunDetail {
+    /// Cycle summary.
+    pub run: ServiceRunHistoryEntry,
+    /// Ordered phase summaries.
+    pub phases: Vec<ServiceRunPhaseHistoryEntry>,
+}
+
 /// One bounded read-only acquisition history entry.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct AcquisitionHistoryEntry {
@@ -4537,6 +4960,15 @@ impl RepairVerificationDecision {
 /// Persistence initialization or migration failure.
 #[derive(Debug, Error)]
 pub enum DatabaseError {
+    /// A backup never replaces an earlier snapshot.
+    #[error("database backup already exists: {0}")]
+    BackupAlreadyExists(PathBuf),
+    /// Backup storage must be provisioned explicitly by the operator.
+    #[error("database backup parent directory does not exist: {0}")]
+    BackupParentMissing(PathBuf),
+    /// SQLite's VACUUM INTO interface requires a Unicode destination.
+    #[error("database backup path is not valid UTF-8: {0}")]
+    BackupPathNotUtf8(PathBuf),
     /// A database path did not have a parent directory.
     #[error("database path has no parent: {path}")]
     MissingParent {
@@ -4685,6 +5117,29 @@ pub enum DatabaseError {
     /// Existing provider identity belongs to another canonical recording.
     #[error("provider item already belongs to another canonical recording")]
     ProviderItemRecordingConflict,
+    /// A service cycle is already active.
+    #[error("service run {0} is already running")]
+    ServiceRunAlreadyRunning(i64),
+    /// Requested service cycle is absent or terminal.
+    #[error("service run {0} is not running")]
+    ServiceRunNotRunning(i64),
+    /// Binary version must be auditable.
+    #[error("service run binary version must not be empty")]
+    InvalidServiceRunVersion,
+    /// Phase name must be stable and nonempty.
+    #[error("service phase name must not be empty")]
+    InvalidServicePhase,
+    /// Requested phase is absent or terminal.
+    #[error("service phase {phase} in run {run_id} is not running")]
+    ServicePhaseNotRunning {
+        /// Owning service cycle.
+        run_id: i64,
+        /// Stable phase name.
+        phase: String,
+    },
+    /// A cycle cannot finish while a phase is active.
+    #[error("service run {0} still has running phases")]
+    ServiceRunHasRunningPhases(i64),
     /// Metadata provider candidate count exceeded durable representation.
     #[error("metadata candidate count exceeds SQLite range")]
     MetadataCandidateCountTooLarge,
@@ -4720,6 +5175,68 @@ pub enum DatabaseError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn database_backup_is_consistent_and_never_clobbers() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let root = tempfile::tempdir()?;
+        let source = root.path().join("state.sqlite3");
+        let backup = root.path().join("backup.sqlite3");
+        let database = Database::open(&source)?;
+        database.backup_to(&backup)?;
+        assert_eq!(
+            Database::inspect_read_only(&backup)?.version,
+            CURRENT_SCHEMA_VERSION
+        );
+        assert!(matches!(
+            database.backup_to(&backup),
+            Err(DatabaseError::BackupAlreadyExists(path)) if path == backup
+        ));
+        assert!(matches!(
+            database.backup_to(&root.path().join("missing/backup.sqlite3")),
+            Err(DatabaseError::BackupParentMissing(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn service_runs_are_exclusive_auditable_and_explicitly_recoverable()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let path = root.path().join("state.sqlite3");
+        let mut database = Database::open(&path)?;
+        let first = database.start_service_run(ServiceRunTrigger::Timer, "0.1.0")?;
+        database.start_service_phase(first, "sources", 0)?;
+        assert!(
+            matches!(database.start_service_run(ServiceRunTrigger::Manual,"0.1.0"),Err(DatabaseError::ServiceRunAlreadyRunning(id)) if id==first)
+        );
+        assert!(
+            matches!(database.finish_service_run(first,ServiceRunTerminalStatus::Succeeded,&serde_json::json!({})),Err(DatabaseError::ServiceRunHasRunningPhases(id)) if id==first)
+        );
+        assert_eq!(database.recover_interrupted_service_run()?, Some(first));
+        let second = database.start_service_run(ServiceRunTrigger::Manual, "0.1.0")?;
+        database.start_service_phase(second, "sources", 0)?;
+        database.finish_service_phase(
+            second,
+            "sources",
+            ServicePhaseStatus::Succeeded,
+            &serde_json::json!({"sources":2}),
+            None,
+        )?;
+        database.finish_service_run(
+            second,
+            ServiceRunTerminalStatus::Succeeded,
+            &serde_json::json!({"phases":1}),
+        )?;
+        drop(database);
+        let history = Database::service_run_history_read_only(&path, 10, None)?;
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].status, "succeeded");
+        assert_eq!(history[0].phase_count, 1);
+        assert_eq!(history[1].status, "interrupted");
+        assert_eq!(history[1].failed_phase_count, 1);
+        Ok(())
+    }
 
     #[test]
     fn discovery_lane_budgets_retain_small_nonzero_lanes() {

@@ -161,17 +161,44 @@ reported `Updated`, omitted that entry, and preserved both acquired audio files.
 
 ## Timer-driven operation
 
-The repository includes example systemd units under `deploy/systemd`. They are not
+The repository includes example service, sync timer, and daily backup timer units
+under `deploy/systemd`. They are not
 installed automatically. Before deployment, create a dedicated service account,
 place configuration outside the repository, install the static binary and pinned
 yt-dlp at the explicit unit paths, and replace the example writable library and
 playlist paths with the configured deployment paths. `ProtectSystem=strict` keeps
 the remaining host filesystem read-only to the service.
 
-The oneshot command returns 0 only when all source, acquisition, and playlist work
+The hardened oneshot invokes `service run --trigger timer`, loads optional secrets
+from `/etc/music-sync/music-sync.env`, and returns 0 only when every enabled phase
 succeeds, 1 after isolated failures, and 2 for fatal configuration or durable-state
-errors. The timer may therefore alert on partial runs without preventing successful
+errors. Schema-backed exclusivity rejects overlap before provider or managed-file
+effects. The timer may therefore alert on partial runs without preventing successful
 unrelated work from being committed.
+
+## Versioned releases, backup, and rollback
+
+`deploy/install-release.sh VERSION MUSIC_SYNC_BINARY YT_DLP_BINARY` installs both
+already-validated executables into a new immutable
+`/opt/music-sync/releases/VERSION` directory. It executes both version commands and
+then atomically switches `/opt/music-sync/current`; it never replaces an existing
+release directory. The service configuration points its yt-dlp adapter at
+`/opt/music-sync/current/yt-dlp`, so application and provider-adapter rollback occur
+together. Run the installer only after isolated acceptance, and retain the previous
+release.
+
+Before activation or schema migration, create a snapshot with `music-sync
+maintenance backup --config /etc/music-sync/music-sync.toml --directory
+/var/backups/music-sync`. The directory must already exist and be writable only by
+the service account. The daily example timer performs the same consistent SQLite
+snapshot and intentionally does not delete old backups. Operators define and test
+retention outside music-sync.
+
+`deploy/rollback-release.sh VERSION` validates a retained release and atomically
+repoints `current`. Stop the timer and service before rollback. Binary rollback is
+safe only when that retained binary supports the current schema; otherwise restore
+the paired pre-upgrade SQLite snapshot first, while the service is stopped. Audio is
+never part of automated rollback and must not be deleted or replaced.
 
 The composed command was validated on 2026-08-24 with the static-musl binary and
 offline two-item fixtures under `/srv/music-sync-v2-test/sync-20260824`. Its first
@@ -179,7 +206,7 @@ run reconciled one source, committed two acquisitions, and created one ordered
 playlist. The repeat reported two unchanged memberships, zero selected acquisition
 jobs, and an unchanged playlist. Both audio files remained present and `/srv/music`
 remained non-writable. Local `systemd-analyze verify` parsed the example units and
-then reported the expected missing `/opt/music-sync/bin/music-sync`, because the
+then reported the expected missing `/opt/music-sync/current/music-sync`, because the
 examples are deliberately not installed on the development host. A complete unit
 verification remains a deployment-time check after adapting and installing paths.
 
@@ -257,3 +284,19 @@ had a new container hash while immutable artifact history exactly matched the or
 SHA-256. The immediate repeat selected zero work and succeeded with deliberately
 nonexistent ffmpeg/ffprobe paths. Status reported one committed materialization and two
 healthy artifact identities. `/srv/music` remained non-writable.
+
+The schema-v16 complete production-operations cycle was accepted on Debian 12 under
+`/srv/music-sync-v2-test/service-p5-20260825` on 2026-08-25. The exact static binary
+SHA-256 was `a485112722cdd4c32c509a2841032abec3a9bf782559c512c3eea5947b0504d2`.
+Offline doctor passed configuration, directories, executable-path, same-filesystem,
+endpoint, and secret-contract checks; its initial missing-database warning was
+expected. Because the target has no fpcalc package yet, `/bin/true` occupied only the
+explicit fpcalc fixture path for this empty-library orchestration test; final service
+readiness still requires real `fpcalc`.
+
+Two complete 14-phase cycles succeeded in 41 ms total, repeated with no selected
+work, and produced two durable successful run records with no failed phases. A
+consistent schema-v16 backup was created in isolated backup storage, and immutable
+status reported no pending work or failures. The static binary, configuration,
+state, generated playlists, and backup all remained inside isolated test storage.
+The production library was verified readable and non-writable before and after.

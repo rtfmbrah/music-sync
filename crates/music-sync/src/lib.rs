@@ -27,6 +27,7 @@ pub mod playlist;
 pub mod preservation;
 pub mod provider;
 pub mod repair;
+pub mod service;
 pub mod sync;
 pub mod tag_materialization;
 pub mod yt_dlp;

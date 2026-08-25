@@ -16,6 +16,12 @@ pub struct NavidromeFavorites {
     salt: String,
 }
 
+/// Read-only boundary for canonical taste-signal recording IDs.
+pub trait TasteSignalProvider {
+    /// Returns exact recording MBIDs without mutating the playback service.
+    fn recording_mbids(&self) -> Result<Vec<String>, NavidromeError>;
+}
+
 impl NavidromeFavorites {
     /// Creates a production HTTPS adapter using a precomputed Subsonic token and salt.
     pub fn new(
@@ -96,6 +102,12 @@ impl NavidromeFavorites {
         values.sort();
         values.dedup();
         Ok(values)
+    }
+}
+
+impl TasteSignalProvider for NavidromeFavorites {
+    fn recording_mbids(&self) -> Result<Vec<String>, NavidromeError> {
+        NavidromeFavorites::recording_mbids(self)
     }
 }
 

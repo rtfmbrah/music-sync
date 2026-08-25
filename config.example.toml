@@ -18,3 +18,23 @@ minimum_free_disk_gb = 20
 # listenbrainz_user = "your-public-listenbrainz-user"
 # navidrome_url = "https://music.example.invalid"
 # navidrome_user = "music-sync-readonly"
+
+[service]
+enabled = false
+# user_agent = "music-sync/0.1 (operator@example.invalid)"
+yt_dlp = "/opt/music-sync/current/yt-dlp"
+ffprobe = "/usr/bin/ffprobe"
+ffmpeg = "/usr/bin/ffmpeg"
+fpcalc = "/usr/bin/fpcalc"
+musicbrainz_endpoint = "https://musicbrainz.org/ws/2"
+cover_art_endpoint = "https://coverartarchive.org"
+lyrics_endpoint = "https://lrclib.net/api"
+listenbrainz_endpoint = "https://api.listenbrainz.org"
+http_timeout_seconds = 30
+source_timeout_seconds = 60
+download_timeout_seconds = 600
+probe_timeout_seconds = 30
+remux_timeout_seconds = 120
+fingerprint_timeout_seconds = 60
+phase_item_limit = 100
+fingerprint_audio_seconds = 120

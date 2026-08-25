@@ -6,9 +6,9 @@ use std::error::Error;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use clap::{ArgAction, Parser, Subcommand};
+use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use music_sync::acquisition::{
     AcquisitionRunOutcome, run_one_acquisition, run_pending_acquisitions,
 };
@@ -30,12 +30,17 @@ use music_sync::media_probe::Ffprobe;
 use music_sync::metadata::resolve_canonical_metadata;
 use music_sync::musicbrainz::MusicBrainz;
 use music_sync::navidrome::NavidromeFavorites;
-use music_sync::persistence::Database;
+use music_sync::persistence::{
+    Database, ServiceRunHistoryStatus, ServiceRunTerminalStatus, ServiceRunTrigger,
+};
 use music_sync::playlist::{PlaylistMaterializationReport, materialize_playlists};
 use music_sync::provider::{SourceId, SourceSnapshot, is_supported_youtube_url};
 use music_sync::repair::{
     assess_repair_eligibility, commit_verified_repair, generate_repair_candidates,
     run_one_repair_verification,
+};
+use music_sync::service::{
+    ServiceBoundaries, ServiceDirectories, ServiceLimits, run_complete_service,
 };
 use music_sync::sync::{
     SourceSyncResult, SyncBoundaries, SyncDirectories, SyncLimits, SyncRunReport, run_sync,
@@ -60,6 +65,10 @@ struct Cli {
     /// Emit machine-readable JSON where supported.
     #[arg(long, global = true)]
     json: bool,
+
+    /// Disable real-time phase progress on stderr.
+    #[arg(long, global = true)]
+    no_progress: bool,
 
     #[command(subcommand)]
     command: Command,
@@ -123,6 +132,11 @@ enum Command {
         #[command(subcommand)]
         command: SyncCommand,
     },
+    /// Run the complete bounded autonomous service cycle.
+    Service {
+        #[command(subcommand)]
+        command: ServiceCommand,
+    },
     /// Show read-only durable operational state without contacting providers.
     Status {
         /// TOML configuration identifying the application database.
@@ -132,6 +146,130 @@ enum Command {
         #[arg(long, default_value = "20")]
         recent_events: NonZeroUsize,
     },
+    /// Inspect or explicitly recover durable service-cycle history.
+    Runs {
+        #[command(subcommand)]
+        command: RunsCommand,
+    },
+    /// Query bounded persisted operational events without mutation.
+    Events {
+        /// TOML configuration identifying application state.
+        #[arg(short, long, default_value = "music-sync.toml")]
+        config: PathBuf,
+        /// Maximum newest events (1 through 1000).
+        #[arg(long, default_value = "100")]
+        limit: NonZeroUsize,
+        /// Exact severity filter.
+        #[arg(long, value_enum)]
+        level: Option<EventLevelFilter>,
+        /// Exact component filter.
+        #[arg(long)]
+        component: Option<String>,
+        /// Exact durable run filter.
+        #[arg(long)]
+        run_id: Option<i64>,
+        /// Exact durable job filter.
+        #[arg(long)]
+        job_id: Option<i64>,
+    },
+    /// Perform explicit offline-safe operational maintenance.
+    Maintenance {
+        #[command(subcommand)]
+        command: MaintenanceCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum MaintenanceCommand {
+    /// Create a consistent, no-clobber SQLite snapshot in a provisioned directory.
+    Backup {
+        /// TOML configuration identifying application state.
+        #[arg(short, long, default_value = "music-sync.toml")]
+        config: PathBuf,
+        /// Existing directory that receives a uniquely named snapshot.
+        #[arg(long)]
+        directory: PathBuf,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum EventLevelFilter {
+    Info,
+    Warning,
+    Error,
+}
+impl EventLevelFilter {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Info => "info",
+            Self::Warning => "warning",
+            Self::Error => "error",
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum ServiceCommand {
+    /// Run every enabled autonomous phase once.
+    Run {
+        /// TOML configuration containing service policy and directories.
+        #[arg(short, long, default_value = "music-sync.toml")]
+        config: PathBuf,
+        /// Durable invocation origin.
+        #[arg(long, value_enum, default_value = "manual")]
+        trigger: SyncTrigger,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum RunsCommand {
+    /// Show bounded newest-first service-cycle history without mutation.
+    History {
+        /// TOML configuration identifying application state.
+        #[arg(short, long, default_value = "music-sync.toml")]
+        config: PathBuf,
+        /// Maximum history rows (1 through 1000).
+        #[arg(long, default_value = "100")]
+        limit: NonZeroUsize,
+        /// Optional exact durable status filter.
+        #[arg(long)]
+        status: Option<RunStatusFilter>,
+    },
+    /// Mark one confirmed abandoned service cycle interrupted.
+    RecoverInterrupted {
+        /// TOML configuration identifying application state.
+        #[arg(short, long, default_value = "music-sync.toml")]
+        config: PathBuf,
+    },
+    /// Show one service cycle with ordered phase summaries.
+    Show {
+        /// Durable service run ID.
+        run_id: i64,
+        /// TOML configuration identifying application state.
+        #[arg(short, long, default_value = "music-sync.toml")]
+        config: PathBuf,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum RunStatusFilter {
+    Running,
+    Succeeded,
+    Partial,
+    Failed,
+    Interrupted,
+}
+
+impl From<RunStatusFilter> for ServiceRunHistoryStatus {
+    fn from(value: RunStatusFilter) -> Self {
+        match value {
+            RunStatusFilter::Running => Self::Running,
+            RunStatusFilter::Succeeded => Self::Succeeded,
+            RunStatusFilter::Partial => Self::Partial,
+            RunStatusFilter::Failed => Self::Failed,
+            RunStatusFilter::Interrupted => Self::Interrupted,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -395,7 +533,24 @@ enum SyncCommand {
         /// Per-artifact fpcalc deadline in seconds.
         #[arg(long, default_value = "60")]
         fingerprint_timeout_seconds: NonZeroU64,
+        /// Durable invocation origin for service history.
+        #[arg(long, value_enum, default_value = "manual")]
+        trigger: SyncTrigger,
     },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum SyncTrigger {
+    Manual,
+    Timer,
+}
+impl From<SyncTrigger> for ServiceRunTrigger {
+    fn from(value: SyncTrigger) -> Self {
+        match value {
+            SyncTrigger::Manual => Self::Manual,
+            SyncTrigger::Timer => Self::Timer,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -596,7 +751,7 @@ enum LibraryCommand {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    initialize_logging(cli.verbose);
+    initialize_logging(cli.verbose, cli.no_progress || cli.json);
     match run(cli) {
         Ok(code) => code,
         Err(error) => {
@@ -609,6 +764,307 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> Result<ExitCode, Box<dyn Error>> {
     match cli.command {
+        Command::Maintenance {
+            command: MaintenanceCommand::Backup { config, directory },
+        } => {
+            let config = AppConfig::from_file(&config)?;
+            let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+            let destination = directory.join(format!("music-sync-{timestamp}.sqlite3"));
+            let database = Database::open(&config.database_path())?;
+            database.backup_to(&destination)?;
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::json!({"backup": destination, "created": true})
+                );
+            } else {
+                println!("Database backup created: {}", destination.display());
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Events {
+            config,
+            limit,
+            level,
+            component,
+            run_id,
+            job_id,
+        } => {
+            if limit.get() > 1000 {
+                return Err("event limit must not exceed 1000".into());
+            }
+            if component
+                .as_deref()
+                .is_some_and(|value| value.is_empty() || value.len() > 64)
+            {
+                return Err("event component filter must contain 1 through 64 bytes".into());
+            }
+            let config = AppConfig::from_file(&config)?;
+            let events = Database::operational_events_read_only(
+                &config.database_path(),
+                limit.get(),
+                level.map(EventLevelFilter::as_str),
+                component.as_deref(),
+                run_id,
+                job_id,
+            )?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&events)?)
+            } else {
+                for event in events {
+                    println!(
+                        "{} {} {} {}: {}",
+                        event.created_at, event.level, event.component, event.event, event.message
+                    )
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Service {
+            command: ServiceCommand::Run { config, trigger },
+        } => {
+            let config = AppConfig::from_file(&config)?;
+            if !config.service.enabled {
+                return Err("complete service requires service.enabled=true".into());
+            }
+            let user_agent = config
+                .service
+                .user_agent
+                .as_deref()
+                .ok_or("complete service requires a user agent")?;
+            let timeout = Duration::from_secs(config.service.http_timeout_seconds);
+            let loopback = |endpoint: &str| {
+                endpoint.starts_with("http://127.0.0.1:") || endpoint.starts_with("http://[::1]:")
+            };
+            let source = YtDlp::new(
+                config.service.yt_dlp.clone(),
+                Duration::from_secs(config.service.source_timeout_seconds),
+            );
+            let acquisition = YtDlp::new(
+                config.service.yt_dlp.clone(),
+                Duration::from_secs(config.service.download_timeout_seconds),
+            );
+            let probe = Ffprobe::new(
+                config.service.ffprobe.clone(),
+                Duration::from_secs(config.service.probe_timeout_seconds),
+            );
+            let fingerprinter = Fpcalc::new(
+                config.service.fpcalc.clone(),
+                Duration::from_secs(config.service.fingerprint_timeout_seconds),
+                config.service.fingerprint_audio_seconds,
+            );
+            let musicbrainz = MusicBrainz::with_endpoint(
+                &config.service.musicbrainz_endpoint,
+                user_agent,
+                timeout,
+                if loopback(&config.service.musicbrainz_endpoint) {
+                    Duration::ZERO
+                } else {
+                    Duration::from_secs(1)
+                },
+                !loopback(&config.service.musicbrainz_endpoint),
+            )?;
+            let artwork = CoverArtArchive::with_endpoint(
+                &config.service.cover_art_endpoint,
+                user_agent,
+                timeout,
+                !loopback(&config.service.cover_art_endpoint),
+            )?;
+            let lyrics = Lrclib::with_endpoint(
+                &config.service.lyrics_endpoint,
+                user_agent,
+                timeout,
+                if loopback(&config.service.lyrics_endpoint) {
+                    Duration::ZERO
+                } else {
+                    Duration::from_millis(300)
+                },
+                !loopback(&config.service.lyrics_endpoint),
+            )?;
+            let remuxer = FfmpegMetadataRemuxer::new(
+                config.service.ffmpeg.clone(),
+                Duration::from_secs(config.service.remux_timeout_seconds),
+            );
+            let recommendations = if config.discovery.enabled {
+                Some(ListenBrainz::with_endpoint(
+                    &config.service.listenbrainz_endpoint,
+                    config
+                        .discovery
+                        .listenbrainz_user
+                        .as_deref()
+                        .ok_or("enabled discovery requires ListenBrainz user")?,
+                    user_agent,
+                    timeout,
+                    config.discovery.exploration_ratio,
+                    config.discovery.wildcard_ratio,
+                    !loopback(&config.service.listenbrainz_endpoint),
+                )?)
+            } else {
+                None
+            };
+            let taste_signals = if let (Some(url), Some(user)) = (
+                config.discovery.navidrome_url.as_deref(),
+                config.discovery.navidrome_user.as_deref(),
+            ) {
+                Some(NavidromeFavorites::new(
+                    url,
+                    user,
+                    &std::env::var("NAVIDROME_TOKEN")?,
+                    &std::env::var("NAVIDROME_SALT")?,
+                    timeout,
+                )?)
+            } else {
+                None
+            };
+            let mut database = Database::open(&config.database_path())?;
+            let run_id = database.start_service_run(trigger.into(), env!("CARGO_PKG_VERSION"))?;
+            let result = run_complete_service(
+                &mut database,
+                run_id,
+                ServiceDirectories {
+                    state: &config.state_directory,
+                    library: &config.library_directory,
+                    playlists: &config.playlist_directory,
+                },
+                ServiceBoundaries {
+                    source_adapter: &source,
+                    acquisition_adapter: &acquisition,
+                    probe: &probe,
+                    hasher: &Sha256FileHasher,
+                    fingerprinter: &fingerprinter,
+                    canonical_metadata: &musicbrainz,
+                    artwork: &artwork,
+                    lyrics: &lyrics,
+                    remuxer: &remuxer,
+                    recommendations: recommendations
+                        .as_ref()
+                        .map(|value| value as &dyn music_sync::discovery::RecommendationProvider),
+                    taste_signals: taste_signals
+                        .as_ref()
+                        .map(|value| value as &dyn music_sync::navidrome::TasteSignalProvider),
+                    free_space: &DfFreeSpace::new("df".into()),
+                },
+                ServiceLimits {
+                    items: config.service.phase_item_limit,
+                    fingerprint_audio_seconds: config.service.fingerprint_audio_seconds,
+                },
+                &config.discovery,
+            );
+            let report = match result {
+                Ok(report) => report,
+                Err(error) => {
+                    database.finish_service_run(
+                        run_id,
+                        ServiceRunTerminalStatus::Failed,
+                        &serde_json::json!({"error":error.to_string()}),
+                    )?;
+                    return Err(Box::new(error));
+                }
+            };
+            let successful = report.is_successful();
+            database.finish_service_run(
+                run_id,
+                if successful {
+                    ServiceRunTerminalStatus::Succeeded
+                } else {
+                    ServiceRunTerminalStatus::Partial
+                },
+                &serde_json::to_value(&report)?,
+            )?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&report)?)
+            } else {
+                println!(
+                    "Service run {run_id}: {}",
+                    if successful { "succeeded" } else { "partial" }
+                );
+            }
+            Ok(if successful {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(1)
+            })
+        }
+        Command::Runs {
+            command:
+                RunsCommand::History {
+                    config,
+                    limit,
+                    status,
+                },
+        } => {
+            if limit.get() > 1000 {
+                return Err("service run history limit must not exceed 1000".into());
+            }
+            let config = AppConfig::from_file(&config)?;
+            let history = Database::service_run_history_read_only(
+                &config.database_path(),
+                limit.get(),
+                status.map(Into::into),
+            )?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&history)?);
+            } else {
+                for entry in history {
+                    println!(
+                        "{} {} {} {} phases={} failed={} started={} finished={}",
+                        entry.id,
+                        entry.status,
+                        entry.trigger,
+                        entry.binary_version,
+                        entry.phase_count,
+                        entry.failed_phase_count,
+                        entry.started_at,
+                        entry.finished_at.as_deref().unwrap_or("-")
+                    );
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Runs {
+            command: RunsCommand::Show { run_id, config },
+        } => {
+            let config = AppConfig::from_file(&config)?;
+            let detail = Database::service_run_detail_read_only(&config.database_path(), run_id)?;
+            let Some(detail) = detail else {
+                return Err(format!("service run {run_id} does not exist").into());
+            };
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&detail)?);
+            } else {
+                println!(
+                    "Run {}: {} ({})",
+                    detail.run.id, detail.run.status, detail.run.trigger
+                );
+                for phase in detail.phases {
+                    println!("  {} {}: {}", phase.ordinal, phase.phase, phase.status);
+                    if let Some(message) = phase.message {
+                        println!("    {message}");
+                    }
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Runs {
+            command: RunsCommand::RecoverInterrupted { config },
+        } => {
+            let config = AppConfig::from_file(&config)?;
+            let mut database = Database::open(&config.database_path())?;
+            let recovered = database.recover_interrupted_service_run()?;
+            if cli.json {
+                println!("{}", serde_json::json!({"recovered_run_id":recovered}));
+            } else {
+                println!(
+                    "Recovered interrupted service run: {}",
+                    recovered.map_or_else(|| "none".into(), |id| id.to_string())
+                );
+            }
+            Ok(if recovered.is_some() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(1)
+            })
+        }
         Command::Discovery {
             command:
                 DiscoveryCommand::Route {
@@ -1674,6 +2130,7 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn Error>> {
                     fingerprint_audio_seconds,
                     fpcalc,
                     fingerprint_timeout_seconds,
+                    trigger,
                 },
         } => {
             let config = AppConfig::from_file(&config)?;
@@ -1692,8 +2149,11 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn Error>> {
                 Duration::from_secs(fingerprint_timeout_seconds.get()),
                 fingerprint_audio_seconds,
             );
-            let report = run_sync(
+            let service_run_id =
+                database.start_service_run(trigger.into(), env!("CARGO_PKG_VERSION"))?;
+            let report = match run_sync(
                 &mut database,
+                service_run_id,
                 SyncDirectories {
                     state: &config.state_directory,
                     library: &config.library_directory,
@@ -1711,9 +2171,30 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn Error>> {
                     maximum_fingerprints: max_fingerprints.get(),
                     fingerprint_audio_seconds,
                 },
+            ) {
+                Ok(report) => report,
+                Err(error) => {
+                    database.finish_service_run(
+                        service_run_id,
+                        ServiceRunTerminalStatus::Failed,
+                        &serde_json::json!({"error":error.to_string()}),
+                    )?;
+                    return Err(Box::new(error));
+                }
+            };
+            let successful = report.is_successful();
+            let report_json = serde_json::to_value(&report)?;
+            database.finish_service_run(
+                service_run_id,
+                if successful {
+                    ServiceRunTerminalStatus::Succeeded
+                } else {
+                    ServiceRunTerminalStatus::Partial
+                },
+                &serde_json::json!({"core_sync":report_json}),
             )?;
             render_sync_run(&report, cli.json)?;
-            Ok(if report.is_successful() {
+            Ok(if successful {
                 ExitCode::SUCCESS
             } else {
                 ExitCode::from(1)
@@ -1953,9 +2434,10 @@ fn render_adoption_apply(
     Ok(())
 }
 
-fn initialize_logging(verbosity: u8) {
+fn initialize_logging(verbosity: u8, progress_disabled: bool) {
     let default_level = match verbosity {
-        0 => "warn",
+        0 if progress_disabled => "warn",
+        0 => "info",
         1 => "info",
         2 => "debug",
         _ => "trace",
