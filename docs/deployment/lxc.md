@@ -189,7 +189,7 @@ release.
 
 Before activation or schema migration, create a snapshot with `music-sync
 maintenance backup --config /etc/music-sync/music-sync.toml --directory
-/var/backups/music-sync`. The directory must already exist and be writable only by
+/srv/music-sync-backups`. The directory must already exist and be writable only by
 the service account. The daily example timer performs the same consistent SQLite
 snapshot and intentionally does not delete old backups. Operators define and test
 retention outside music-sync.
@@ -199,6 +199,12 @@ repoints `current`. Stop the timer and service before rollback. Binary rollback 
 safe only when that retained binary supports the current schema; otherwise restore
 the paired pre-upgrade SQLite snapshot first, while the service is stopped. Audio is
 never part of automated rollback and must not be deleted or replaced.
+
+On the confirmed LXC, `/var/lib` is on the 30 GiB root filesystem while `/srv/music`
+is on the 469 GiB data filesystem. Production state therefore belongs at
+`/srv/music-sync-state`, and backups at `/srv/music-sync-backups`. This both avoids
+the constrained root volume and keeps acquisition staging on the same filesystem as
+the library, which is required for atomic hard-link commits.
 
 The composed command was validated on 2026-08-24 with the static-musl binary and
 offline two-item fixtures under `/srv/music-sync-v2-test/sync-20260824`. Its first

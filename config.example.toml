@@ -1,6 +1,6 @@
-state_directory = "/var/lib/music-sync"
+state_directory = "/srv/music-sync-state"
 library_directory = "/srv/music"
-playlist_directory = "/srv/playlists"
+playlist_directory = "/srv/music/_playlists"
 
 [concurrency]
 provider_requests = 2

@@ -1,18 +1,18 @@
 [Unit]
 Description=Create a consistent music-sync state backup
-ConditionPathIsDirectory=/var/backups/music-sync
+ConditionPathIsDirectory=/srv/music-sync-backups
 
 [Service]
 Type=oneshot
 User=music-sync
 Group=music-sync
-ExecStart=/opt/music-sync/current/music-sync maintenance backup --config /etc/music-sync/music-sync.toml --directory /var/backups/music-sync
+ExecStart=/opt/music-sync/current/music-sync maintenance backup --config /etc/music-sync/music-sync.toml --directory /srv/music-sync-backups
 UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
 ProtectSystem=strict
-ReadWritePaths=/var/lib/music-sync /var/backups/music-sync
+ReadWritePaths=/srv/music-sync-state /srv/music-sync-backups
 RestrictSUIDSGID=true
 LockPersonality=true
 MemoryDenyWriteExecute=true
