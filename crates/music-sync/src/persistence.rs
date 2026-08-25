@@ -46,10 +46,14 @@ const MIGRATIONS: &[(u32, &str)] = &[
     ),
     (15, include_str!("../migrations/0015_discovery.sql")),
     (16, include_str!("../migrations/0016_service_runs.sql")),
+    (
+        17,
+        include_str!("../migrations/0017_adoption_provider_verification.sql"),
+    ),
 ];
 
 /// Current durable schema version.
-pub const CURRENT_SCHEMA_VERSION: u32 = 16;
+pub const CURRENT_SCHEMA_VERSION: u32 = 17;
 
 /// A connection to music-sync's private application state.
 #[derive(Debug)]
@@ -2843,6 +2847,115 @@ impl Database {
         Ok(summary)
     }
 
+    /// Selects bounded filename-generated candidates that still require independent
+    /// audio verification before an adopted artifact may satisfy a provider item.
+    pub fn adoption_provider_candidates(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<AdoptionProviderCandidate>, DatabaseError> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT provider_items.id,provider_items.provider_item_id,
+                    provider_items.original_url,jobs.id,artifacts.id,
+                    artifacts.recording_id,artifacts.path,artifacts.duration_ms,
+                    artifact_fingerprints.max_seconds,
+                    artifact_fingerprints.duration_ms,
+                    artifact_fingerprints.fingerprint_json
+             FROM provider_items
+             JOIN acquisition_jobs ON acquisition_jobs.provider_item_id=provider_items.id
+             JOIN jobs ON jobs.id=acquisition_jobs.job_id
+             JOIN artifacts ON instr(artifacts.path,provider_items.provider_item_id)>0
+             JOIN artifact_fingerprints ON artifact_fingerprints.artifact_id=artifacts.id
+             LEFT JOIN adoption_provider_verifications ON
+                  adoption_provider_verifications.provider_item_id=provider_items.id
+             WHERE provider_items.provider='youtube'
+               AND provider_items.recording_id IS NULL
+               AND jobs.status IN ('pending','deferred')
+               AND artifacts.health='healthy'
+               AND (adoption_provider_verifications.status IS NULL OR
+                    adoption_provider_verifications.status IN ('running','deferred'))
+             ORDER BY provider_items.id,artifacts.id LIMIT ?1",
+            )
+            .map_err(DatabaseError::Sqlite)?;
+        statement
+            .query_map([limit], |row| {
+                Ok(AdoptionProviderCandidate {
+                    provider_item_database_id: row.get(0)?,
+                    provider_item_id: row.get(1)?,
+                    original_url: row.get(2)?,
+                    acquisition_job_id: row.get(3)?,
+                    artifact_id: row.get(4)?,
+                    recording_id: row.get(5)?,
+                    artifact_path: PathBuf::from(row.get::<_, String>(6)?),
+                    artifact_duration_ms: row.get(7)?,
+                    fingerprint_max_seconds: row.get(8)?,
+                    fingerprint_duration_ms: row.get(9)?,
+                    fingerprint_json: row.get(10)?,
+                })
+            })
+            .map_err(DatabaseError::Sqlite)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(DatabaseError::Sqlite)
+    }
+
+    /// Starts or resumes one non-destructive adopted/provider verification.
+    pub fn start_adoption_provider_verification(
+        &mut self,
+        candidate: &AdoptionProviderCandidate,
+    ) -> Result<(), DatabaseError> {
+        self.connection
+            .execute(
+                "INSERT INTO adoption_provider_verifications(provider_item_id,acquisition_job_id,
+             artifact_id,status,attempt_count) VALUES (?1,?2,?3,'running',1)
+             ON CONFLICT(provider_item_id) DO UPDATE SET status='running',
+             attempt_count=attempt_count+1,message=NULL,updated_at=CURRENT_TIMESTAMP
+             WHERE status IN ('running','deferred') AND artifact_id=excluded.artifact_id",
+                rusqlite::params![
+                    candidate.provider_item_database_id,
+                    candidate.acquisition_job_id,
+                    candidate.artifact_id
+                ],
+            )
+            .map_err(DatabaseError::Sqlite)?;
+        Ok(())
+    }
+
+    /// Records retained staged comparison evidence and, only for a verified match,
+    /// atomically associates the provider item and satisfies its acquisition job.
+    pub fn finish_adoption_provider_verification(
+        &mut self,
+        candidate: &AdoptionProviderCandidate,
+        status: AdoptionProviderVerificationStatus,
+        validated: Option<&ValidatedStagedMedia>,
+        fingerprint_json: Option<&str>,
+        fingerprint_decision: Option<&str>,
+        message: Option<&str>,
+    ) -> Result<(), DatabaseError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(DatabaseError::Sqlite)?;
+        let changed=transaction.execute("UPDATE adoption_provider_verifications SET status=?2,staged_path=?3,staged_sha256=?4,staged_duration_ms=?5,staged_fingerprint_json=?6,fingerprint_decision=?7,message=?8,updated_at=CURRENT_TIMESTAMP WHERE provider_item_id=?1 AND artifact_id=?9 AND status='running'",rusqlite::params![candidate.provider_item_database_id,status.as_str(),validated.map(|value|value.path.to_string_lossy().into_owned()),validated.map(|value|value.sha256.as_str()),validated.and_then(|value|value.duration_ms).and_then(|value|i64::try_from(value).ok()),fingerprint_json,fingerprint_decision,message,candidate.artifact_id]).map_err(DatabaseError::Sqlite)?;
+        if changed != 1 {
+            return Err(DatabaseError::AdoptionProviderVerificationNotRunning(
+                candidate.provider_item_database_id,
+            ));
+        }
+        if status == AdoptionProviderVerificationStatus::Verified {
+            let associated=transaction.execute("UPDATE provider_items SET recording_id=?2 WHERE id=?1 AND recording_id IS NULL",rusqlite::params![candidate.provider_item_database_id,candidate.recording_id]).map_err(DatabaseError::Sqlite)?;
+            let preferred=transaction.execute("UPDATE recordings SET preferred_artifact_id=?2 WHERE id=?1 AND (preferred_artifact_id IS NULL OR preferred_artifact_id=?2)",rusqlite::params![candidate.recording_id,candidate.artifact_id]).map_err(DatabaseError::Sqlite)?;
+            let satisfied=transaction.execute("UPDATE jobs SET status='succeeded',updated_at=CURRENT_TIMESTAMP WHERE id=?1 AND status IN ('pending','deferred')",[candidate.acquisition_job_id]).map_err(DatabaseError::Sqlite)?;
+            if associated != 1 || preferred != 1 || satisfied != 1 {
+                return Err(DatabaseError::AdoptionProviderAssociationConflict(
+                    candidate.provider_item_database_id,
+                ));
+            }
+        }
+        transaction.commit().map_err(DatabaseError::Sqlite)
+    }
+
     /// Adds a YouTube source idempotently or reactivates an existing source.
     pub fn add_source(
         &mut self,
@@ -4380,6 +4493,54 @@ pub struct ServiceRunDetail {
     pub phases: Vec<ServiceRunPhaseHistoryEntry>,
 }
 
+/// One filename-generated provider/adopted-artifact candidate awaiting audio proof.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdoptionProviderCandidate {
+    /// Durable provider-item row.
+    pub provider_item_database_id: i64,
+    /// Provider-owned YouTube object ID.
+    pub provider_item_id: String,
+    /// Exact enumerated provider URL.
+    pub original_url: String,
+    /// Pending acquisition job satisfied only after verification.
+    pub acquisition_job_id: i64,
+    /// Candidate adopted artifact.
+    pub artifact_id: i64,
+    /// Local unresolved recording owning the artifact.
+    pub recording_id: i64,
+    /// Absolute registered artifact path.
+    pub artifact_path: PathBuf,
+    /// Structurally probed artifact duration.
+    pub artifact_duration_ms: Option<i64>,
+    /// Fingerprint extraction bound.
+    pub fingerprint_max_seconds: i64,
+    /// Reference fingerprint duration.
+    pub fingerprint_duration_ms: i64,
+    /// Serialized raw reference fingerprint.
+    pub fingerprint_json: String,
+}
+
+/// Terminal outcome of independent adopted/provider audio verification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdoptionProviderVerificationStatus {
+    /// A transient boundary failure retained evidence for explicit repetition.
+    Deferred,
+    /// Independent audio evidence contradicted the filename-generated candidate.
+    Rejected,
+    /// Duration and raw audio fingerprint independently matched.
+    Verified,
+}
+
+impl AdoptionProviderVerificationStatus {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Deferred => "deferred",
+            Self::Rejected => "rejected",
+            Self::Verified => "verified",
+        }
+    }
+}
+
 /// One bounded read-only acquisition history entry.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct AcquisitionHistoryEntry {
@@ -4960,6 +5121,12 @@ impl RepairVerificationDecision {
 /// Persistence initialization or migration failure.
 #[derive(Debug, Error)]
 pub enum DatabaseError {
+    /// Adoption/provider verification was not in its resumable running state.
+    #[error("adoption provider verification is not running for provider item {0}")]
+    AdoptionProviderVerificationNotRunning(i64),
+    /// Provider association or acquisition state changed during verification.
+    #[error("adoption provider association changed for provider item {0}")]
+    AdoptionProviderAssociationConflict(i64),
     /// A backup never replaces an earlier snapshot.
     #[error("database backup already exists: {0}")]
     BackupAlreadyExists(PathBuf),

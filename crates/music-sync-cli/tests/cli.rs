@@ -5,6 +5,137 @@ use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
 #[test]
+fn adopted_provider_links_require_duration_and_fingerprint_proof()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = tempfile::tempdir()?;
+    let state = root.path().join("state");
+    let library = root.path().join("library");
+    let playlists = root.path().join("playlists");
+    fs::create_dir(&library)?;
+    fs::create_dir(&playlists)?;
+    let provider_id = "Ka4RGy8H2rs";
+    let adopted = library.join(format!("Existing Track [{provider_id}].m4a"));
+    fs::write(&adopted, b"preserved adopted audio")?;
+    let yt_dlp = root.path().join("yt-dlp");
+    let ffprobe = root.path().join("ffprobe");
+    let fpcalc = root.path().join("fpcalc");
+    fs::write(
+        &yt_dlp,
+        format!(
+            "#!/bin/sh\ncase \" $* \" in *' --dump-single-json '*) printf '%s' '{{\"id\":\"{provider_id}\",\"webpage_url\":\"https://youtu.be/{provider_id}\",\"title\":\"Existing Track\",\"duration\":180}}' ;; *) previous=; for argument in \"$@\"; do if [ \"$previous\" = paths ]; then directory=$argument; break; fi; previous=${{argument#--}}; done; printf staged >\"$directory/media.opus\"; printf '%s\\n' \"$directory/media.opus\" ;; esac\n"
+        ),
+    )?;
+    fs::write(
+        &ffprobe,
+        "#!/bin/sh\nprintf '%s' '{\"streams\":[{\"codec_type\":\"audio\",\"codec_name\":\"aac\",\"sample_rate\":\"48000\",\"channels\":2}],\"format\":{\"duration\":\"180.0\"}}'\n",
+    )?;
+    let values = (0..130_u32).collect::<Vec<_>>();
+    fs::write(
+        &fpcalc,
+        format!(
+            "#!/bin/sh\nprintf '%s' '{{\"duration\":180.0,\"fingerprint\":{}}}'\n",
+            serde_json::to_string(&values)?
+        ),
+    )?;
+    for executable in [&yt_dlp, &ffprobe, &fpcalc] {
+        let mut permissions = fs::metadata(executable)?.permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(executable, permissions)?;
+    }
+    let config = root.path().join("config.toml");
+    fs::write(
+        &config,
+        format!(
+            "state_directory = {state:?}\nlibrary_directory = {library:?}\nplaylist_directory = {playlists:?}\n[service]\nenabled = true\nuser_agent = \"fixture@example.invalid\"\nyt_dlp = {yt_dlp:?}\nffprobe = {ffprobe:?}\nffmpeg = \"/bin/true\"\nfpcalc = {fpcalc:?}\n"
+        ),
+    )?;
+    let database = state.join("music-sync.sqlite3");
+    let success = |mut command: Command| -> Result<(), Box<dyn std::error::Error>> {
+        let output = command.output()?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).into_owned().into());
+        }
+        Ok(())
+    };
+    let mut adopt = Command::new(env!("CARGO_BIN_EXE_music-sync"));
+    adopt
+        .args(["library", "adopt"])
+        .arg(&library)
+        .args(["--apply", "--database"])
+        .arg(&database);
+    success(adopt)?;
+    let mut health = Command::new(env!("CARGO_BIN_EXE_music-sync"));
+    health
+        .args(["library", "health", "--config"])
+        .arg(&config)
+        .arg("--ffprobe")
+        .arg(&ffprobe);
+    success(health)?;
+    let mut fingerprint = Command::new(env!("CARGO_BIN_EXE_music-sync"));
+    fingerprint
+        .args(["library", "fingerprint", "--config"])
+        .arg(&config)
+        .arg("--fpcalc")
+        .arg(&fpcalc);
+    success(fingerprint)?;
+    let mut add = Command::new(env!("CARGO_BIN_EXE_music-sync"));
+    add.args([
+        "source",
+        "add",
+        &format!("https://youtu.be/{provider_id}"),
+        "--database",
+    ])
+    .arg(&database);
+    success(add)?;
+    let mut reconcile = Command::new(env!("CARGO_BIN_EXE_music-sync"));
+    reconcile
+        .args(["source", "reconcile", "1", "--database"])
+        .arg(&database)
+        .arg("--yt-dlp")
+        .arg(&yt_dlp);
+    success(reconcile)?;
+    let output = Command::new(env!("CARGO_BIN_EXE_music-sync"))
+        .args(["--json", "library", "verify-provider-links", "--config"])
+        .arg(&config)
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(report["verified"], 1);
+    assert_eq!(fs::read(&adopted)?, b"preserved adopted audio");
+    assert!(!library.join(format!("youtube/{provider_id}.opus")).exists());
+    let connection = rusqlite::Connection::open(&database)?;
+    assert_eq!(
+        connection.query_row(
+            "SELECT COUNT(*) FROM provider_items WHERE recording_id IS NOT NULL",
+            [],
+            |row| row.get::<_, u64>(0)
+        )?,
+        1
+    );
+    assert_eq!(
+        connection.query_row(
+            "SELECT COUNT(*) FROM recordings WHERE preferred_artifact_id IS NOT NULL",
+            [],
+            |row| row.get::<_, u64>(0)
+        )?,
+        1
+    );
+    assert_eq!(
+        connection.query_row(
+            "SELECT COUNT(*) FROM jobs WHERE status='succeeded'",
+            [],
+            |row| row.get::<_, u64>(0)
+        )?,
+        1
+    );
+    Ok(())
+}
+
+#[test]
 fn maintenance_backup_creates_a_consistent_unique_snapshot()
 -> Result<(), Box<dyn std::error::Error>> {
     let root = tempfile::tempdir()?;

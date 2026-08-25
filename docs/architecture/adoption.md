@@ -60,11 +60,21 @@ paths cannot be represented losslessly in SQLite text and roll back the entire b
 A successful probe establishes container/audio structure, not canonical recording
 identity or a full decode of every frame.
 
+Schema version 17 adds an explicit migration-only bridge for adopted libraries.
+After source enumeration, health probing, and raw artifact fingerprinting,
+`library verify-provider-links` may use an exact YouTube ID token in a filename to
+generate a candidate only. It downloads that exact provider object into retained
+application staging, independently validates and fingerprints it, and associates the
+provider item with the adopted recording only when container duration is within
+three seconds and the bounded raw Chromaprint comparison matches. Existing audio is
+never modified or copied into a new managed path. Mismatches are rejected;
+insufficient evidence and boundary failures are deferred. Every attempt, staged hash,
+duration, fingerprint decision, and message is durable and repeatable.
+
 ## PLANNED
 
-Add deeper decode validation, provider-ID observation, external corroboration,
-perceptual fingerprints, and canonical identification states. Expensive operations
-must be observable and safely resumable.
+Add deeper decode validation and canonical identification states. Expensive
+operations must be observable and safely resumable.
 
 Extend apply with persisted probe/hash evidence, root-scoped reconciliation, and
 explicit canonical identification states. Missing paths must be reconciled

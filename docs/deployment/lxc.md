@@ -306,3 +306,14 @@ consistent schema-v16 backup was created in isolated backup storage, and immutab
 status reported no pending work or failures. The static binary, configuration,
 state, generated playlists, and backup all remained inside isolated test storage.
 The production library was verified readable and non-writable before and after.
+
+Schema-v17 adopted/provider verification was accepted under isolated LXC storage on
+2026-08-25 using a read-only copy of one sufficiently long production M4A. The exact
+YouTube ID token generated one candidate. Real Debian ffprobe and fpcalc derived
+independent duration and raw Chromaprint evidence; an offline yt-dlp fixture staged
+the same provider bytes. Verification linked one provider object, satisfied its
+pending acquisition job, selected the healthy adopted artifact as preferred, and
+reduced unresolved active memberships to zero. No `library/youtube` duplicate was
+created, the adopted and production SHA-256 both remained
+`3f41c49eff9ba6e682e490fe2d42beacdab8d7d811383db916d1d7ea0fd5c3cf`, and
+production remained non-writable.

@@ -85,6 +85,13 @@ materialization, immutable original-byte history, explicit deferral, and the der
 preferred artifact. The former artifact row moves to its retained history path; it is
 not deleted or collapsed into the derived container.
 
+Schema version 17 stores migration-only adopted/provider verification attempts.
+Filename tokens generate candidates but never establish identity. Retained provider
+staging, exact hash, duration, raw fingerprint comparison, attempt count, and terminal
+decision are auditable. Only a verified duration and perceptual match atomically
+associates the provider item with the existing unresolved recording and satisfies its
+pending acquisition job; no artifact row or audio path is replaced.
+
 ## PLANNED
 
 Add discovery seeds/candidates and expanded job attempts when a real workflow

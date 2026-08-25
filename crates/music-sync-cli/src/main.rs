@@ -16,6 +16,7 @@ use music_sync::adoption::{
     AdoptionApplyReport, AdoptionReport, HashLimit, ProbeLimit, apply_library, scan_library,
     scan_library_with_hash, scan_library_with_probe, scan_library_with_probe_and_hash,
 };
+use music_sync::adoption_link::verify_adopted_provider_links;
 use music_sync::artwork::{CoverArtArchive, resolve_release_artwork};
 use music_sync::config::AppConfig;
 use music_sync::content_hash::Sha256FileHasher;
@@ -688,6 +689,15 @@ enum SourceCommand {
 
 #[derive(Debug, Subcommand)]
 enum LibraryCommand {
+    /// Verify adopted artifacts against queued YouTube objects without replacing audio.
+    VerifyProviderLinks {
+        /// TOML configuration containing state, tools, and deadlines.
+        #[arg(short, long, default_value = "music-sync.toml")]
+        config: PathBuf,
+        /// Maximum unique provider objects attempted once.
+        #[arg(long, default_value = "100")]
+        max_items: NonZeroUsize,
+    },
     /// Derive bounded raw Chromaprint evidence for healthy registered artifacts.
     Fingerprint {
         /// TOML configuration containing state and library directories.
@@ -1681,6 +1691,52 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn Error>> {
             let report = run_doctor(&config);
             render_doctor(&report, cli.json)?;
             Ok(if report.is_healthy() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(1)
+            })
+        }
+        Command::Library {
+            command: LibraryCommand::VerifyProviderLinks { config, max_items },
+        } => {
+            let config = AppConfig::from_file(&config)?;
+            if !config.service.enabled {
+                return Err("provider-link verification requires service.enabled=true".into());
+            }
+            let mut database = Database::open(&config.database_path())?;
+            let downloader = YtDlp::new(
+                config.service.yt_dlp.clone(),
+                Duration::from_secs(config.service.download_timeout_seconds),
+            );
+            let probe = Ffprobe::new(
+                config.service.ffprobe.clone(),
+                Duration::from_secs(config.service.probe_timeout_seconds),
+            );
+            let fingerprinter = Fpcalc::new(
+                config.service.fpcalc.clone(),
+                Duration::from_secs(config.service.fingerprint_timeout_seconds),
+                config.service.fingerprint_audio_seconds,
+            );
+            let report = verify_adopted_provider_links(
+                &mut database,
+                &config.state_directory,
+                &downloader,
+                &probe,
+                &Sha256FileHasher,
+                &fingerprinter,
+                max_items.get(),
+            )?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("Provider objects selected: {}", report.selected);
+                println!("Verified links:           {}", report.verified);
+                println!("Rejected candidates:      {}", report.rejected);
+                println!("Deferred candidates:      {}", report.deferred);
+                println!("Ambiguous filenames:      {}", report.ambiguous);
+                println!("Boundary failures:        {}", report.failures.len());
+            }
+            Ok(if report.failures.is_empty() {
                 ExitCode::SUCCESS
             } else {
                 ExitCode::from(1)

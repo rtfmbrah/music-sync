@@ -20,6 +20,8 @@ in ad hoc TODO documents.
 - Bounded artifact hashes and exact-byte duplicate evidence (complete).
 - Embedded canonical-tag validation (complete).
 - Initial transactional, idempotent adoption apply (complete).
+- Fingerprint-verified adopted-artifact/provider migration without duplicate library
+  output (complete locally; production migration acceptance active).
 - Persisted raw perceptual identity evidence and bounded adoption reconciliation
   (complete); external canonical resolution remains planned.
 - Source/provider model and stored `yt-dlp` fixtures (complete).
