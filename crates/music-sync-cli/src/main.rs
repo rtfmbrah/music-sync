@@ -870,6 +870,7 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn Error>> {
                 Duration::from_secs(config.service.source_timeout_seconds),
             )
             .with_cookie_file(config.service.yt_dlp_cookie_file.clone())
+            .with_cache_directory(config.state_directory.join("yt-dlp-cache"))
             .with_pacing(
                 config.service.yt_dlp_sleep_requests_seconds,
                 config.service.yt_dlp_min_sleep_seconds,
@@ -880,6 +881,7 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn Error>> {
                 Duration::from_secs(config.service.download_timeout_seconds),
             )
             .with_cookie_file(config.service.yt_dlp_cookie_file.clone())
+            .with_cache_directory(config.state_directory.join("yt-dlp-cache"))
             .with_pacing(
                 config.service.yt_dlp_sleep_requests_seconds,
                 config.service.yt_dlp_min_sleep_seconds,
@@ -1741,6 +1743,7 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn Error>> {
                 Duration::from_secs(config.service.download_timeout_seconds),
             )
             .with_cookie_file(config.service.yt_dlp_cookie_file.clone())
+            .with_cache_directory(config.state_directory.join("yt-dlp-cache"))
             .with_pacing(
                 config.service.yt_dlp_sleep_requests_seconds,
                 config.service.yt_dlp_min_sleep_seconds,

@@ -17,6 +17,7 @@ fn passes_explicit_cookie_file_without_reading_it() -> Result<(), Box<dyn std::e
     let executable = directory.path().join("yt-dlp");
     let marker = directory.path().join("args");
     let cookies = directory.path().join("cookies.txt");
+    let cache = directory.path().join("cache");
     fs::write(&cookies, "secret fixture")?;
     fs::write(
         &executable,
@@ -30,6 +31,7 @@ fn passes_explicit_cookie_file_without_reading_it() -> Result<(), Box<dyn std::e
     fs::set_permissions(&executable, permissions)?;
     YtDlp::new(executable, Duration::from_secs(1))
         .with_cookie_file(Some(cookies.clone()))
+        .with_cache_directory(cache.clone())
         .with_pacing(1, 5, 15)
         .enumerate("https://youtu.be/one")?;
     let arguments = fs::read_to_string(marker)?;
@@ -37,6 +39,8 @@ fn passes_explicit_cookie_file_without_reading_it() -> Result<(), Box<dyn std::e
     assert!(arguments.contains(&format!("{}\n", cookies.display())));
     assert!(!arguments.contains("secret fixture"));
     assert!(arguments.contains("--sleep-requests\n1\n"));
+    assert!(arguments.contains("--extractor-args\nyoutube:player_client=default,web_embedded\n"));
+    assert!(arguments.contains(&format!("--cache-dir\n{}\n", cache.display())));
     assert!(!arguments.contains("--sleep-interval"));
     Ok(())
 }

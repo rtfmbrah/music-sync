@@ -197,6 +197,25 @@ configuration and are validated at startup. Serial job execution alone is not a
 provider-throttling policy; keep the pacing enabled even when acquisition concurrency
 is one.
 
+The production adapter also selects YouTube's `default,web_embedded` client set for
+cookie-authenticated access and places yt-dlp's cache below the configured state
+directory. This avoids the demonstrated logged-in `tv_downgraded` reload failure and
+does not require a home directory for the dedicated service account.
+
+Do not enable `MemoryDenyWriteExecute` on the service unit. yt-dlp delegates current
+YouTube JavaScript challenges to Deno, whose V8 runtime requires executable memory;
+the restriction reproducibly makes Deno panic and leaves no playable formats. The
+unit retains `NoNewPrivileges`, strict filesystem protection, private temporary
+storage, namespace restrictions, and kernel/control-group hardening.
+
+Expose `/srv` through one `ReadWritePaths` entry rather than separate state and
+library entries. Separate systemd bind mounts create a mount boundary inside the
+sandbox and make the crash-safe hard-link commit fail with `EXDEV`, even when both
+paths report the same backing filesystem outside the unit. The dedicated service
+account's ordinary ownership and ACLs still restrict actual writes to application
+state, the managed library subtree, playlists, and the explicitly writable cookie
+file; preserved production audio remains non-writable.
+
 For an adopted library, do not enable the timer immediately after provider-link
 verification. First run `music-sync library quarantine-unverified-provider-links
 --config /etc/music-sync/music-sync.toml --max-items 10000` while the service is
@@ -243,6 +262,14 @@ uses the dedicated account, pinned yt-dlp, request/download pacing, `/srv` state
 backup paths, a half-hour sync timer, and a daily backup timer. A partial service run
 remains a failed oneshot result for alerting while the timer continues scheduling
 later runs.
+
+The first new production playlist item completed end to end on 2026-08-25. After the
+authenticated-client, Deno-compatible sandbox, and single-`/srv` mount corrections,
+job 1450 downloaded YouTube item `5li1Cu-AJpo`, validated it, atomically committed a
+new healthy WebM artifact, updated playlist output, and repeated with a fully
+successful service cycle. Production then reported 1,561 healthy artifacts, 1,128
+succeeded acquisition jobs, no pending/running work, and no missing or corrupt
+audio.
 
 The composed command was validated on 2026-08-24 with the static-musl binary and
 offline two-item fixtures under `/srv/music-sync-v2-test/sync-20260824`. Its first

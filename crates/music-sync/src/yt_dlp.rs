@@ -18,6 +18,7 @@ pub struct YtDlp {
     executable: PathBuf,
     timeout: Duration,
     cookie_file: Option<PathBuf>,
+    cache_directory: Option<PathBuf>,
     sleep_requests_seconds: Option<u64>,
     download_sleep_seconds: Option<(u64, u64)>,
 }
@@ -30,6 +31,7 @@ impl YtDlp {
             executable,
             timeout,
             cookie_file: None,
+            cache_directory: None,
             sleep_requests_seconds: None,
             download_sleep_seconds: None,
         }
@@ -39,6 +41,13 @@ impl YtDlp {
     #[must_use]
     pub fn with_cookie_file(mut self, cookie_file: Option<PathBuf>) -> Self {
         self.cookie_file = cookie_file;
+        self
+    }
+
+    /// Configures a writable yt-dlp cache outside the service account's absent home.
+    #[must_use]
+    pub fn with_cache_directory(mut self, cache_directory: PathBuf) -> Self {
+        self.cache_directory = Some(cache_directory);
         self
     }
 
@@ -61,6 +70,7 @@ impl YtDlp {
     /// Enumerates a single video or playlist without downloading media.
     pub fn enumerate(&self, url: &str) -> Result<SourceSnapshot, YtDlpError> {
         let mut command = Command::new(&self.executable);
+        self.apply_youtube_runtime(&mut command);
         self.apply_authentication(&mut command);
         self.apply_request_pacing(&mut command);
         command.args([
@@ -89,6 +99,7 @@ impl YtDlp {
             return Err(YtDlpError::StagingNotDirectory(staging));
         }
         let mut command = Command::new(&self.executable);
+        self.apply_youtube_runtime(&mut command);
         self.apply_authentication(&mut command);
         self.apply_request_pacing(&mut command);
         if let Some((minimum, maximum)) = self.download_sleep_seconds {
@@ -123,6 +134,16 @@ impl YtDlp {
     fn apply_authentication(&self, command: &mut Command) {
         if let Some(cookie_file) = &self.cookie_file {
             command.arg("--cookies").arg(cookie_file);
+        }
+    }
+
+    fn apply_youtube_runtime(&self, command: &mut Command) {
+        command.args([
+            "--extractor-args",
+            "youtube:player_client=default,web_embedded",
+        ]);
+        if let Some(cache_directory) = &self.cache_directory {
+            command.arg("--cache-dir").arg(cache_directory);
         }
     }
 

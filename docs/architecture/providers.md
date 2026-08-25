@@ -32,6 +32,12 @@ downloads receive bounded randomized sleep. The service defaults to one second
 between requests and five to fifteen seconds before downloads. Explicit operator
 commands remain immediate; pacing policy belongs to autonomous operation.
 
+Authenticated YouTube access explicitly selects the `default,web_embedded` client
+set to avoid the demonstrated logged-in `tv_downgraded` reload failure. yt-dlp's
+cache is rooted below application state because the dedicated service account has no
+home directory. Both choices remain adapter details and are fixture-tested as exact
+subprocess arguments.
+
 ## PLANNED
 
 Expand classification with demonstrated geo/cookie/PO-token fixtures.

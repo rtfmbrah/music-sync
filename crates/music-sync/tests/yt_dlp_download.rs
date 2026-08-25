@@ -51,14 +51,18 @@ fn passes_request_and_randomized_download_pacing() -> Result<(), Box<dyn std::er
     permissions.set_mode(0o700);
     fs::set_permissions(&executable, permissions)?;
     let staging = tempfile::tempdir()?;
+    let cache = tools.path().join("cache");
 
     YtDlp::new(executable, Duration::from_secs(1))
+        .with_cache_directory(cache.clone())
         .with_pacing(1, 5, 15)
         .download("https://youtu.be/fixture", staging.path())?;
     let arguments = fs::read_to_string(marker)?;
     assert!(arguments.contains("--sleep-requests\n1\n"));
     assert!(arguments.contains("--sleep-interval\n5\n"));
     assert!(arguments.contains("--max-sleep-interval\n15\n"));
+    assert!(arguments.contains("--extractor-args\nyoutube:player_client=default,web_embedded\n"));
+    assert!(arguments.contains(&format!("--cache-dir\n{}\n", cache.display())));
     Ok(())
 }
 
