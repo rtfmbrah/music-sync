@@ -173,7 +173,12 @@ fn filename_contains_exact_id(path: &Path, provider_id: &str) -> bool {
     let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
         return false;
     };
-    stem.match_indices(provider_id).any(|(start, value)| {
+    token_occurs_with_boundaries(stem, provider_id)
+        || token_occurs_with_boundaries(stem, &format!("youtube-{provider_id}"))
+}
+
+fn token_occurs_with_boundaries(stem: &str, token: &str) -> bool {
+    stem.match_indices(token).any(|(start, value)| {
         let end = start + value.len();
         let before = stem[..start].chars().next_back();
         let after = stem[end..].chars().next();
@@ -262,6 +267,10 @@ mod tests {
         assert!(filename_contains_exact_id(
             Path::new("Ka4RGy8H2rs.opus"),
             "Ka4RGy8H2rs"
+        ));
+        assert!(filename_contains_exact_id(
+            Path::new("044 - K. [youtube-26Uo_l5Iipo].m4a"),
+            "26Uo_l5Iipo"
         ));
         assert!(!filename_contains_exact_id(
             Path::new("xKa4RGy8H2rsy.m4a"),
