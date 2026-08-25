@@ -21,6 +21,11 @@ accepted only when it reports exactly one absolute, non-empty regular file whose
 canonical parent is the staging directory. The file remains uncommitted staging
 evidence until acquisition orchestration validates and commits it.
 
+Autonomous service construction supplies validated request and randomized download
+sleep bounds to the adapter. The delay occurs inside yt-dlp and remains covered by
+the bounded subprocess deadline. This pacing complements serial job processing and
+reduces provider bursts without changing acquisition state transitions.
+
 Staged-media validation composes the ffprobe and streaming SHA-256 boundaries. It
 requires a non-empty regular file with a structural audio stream and rejects any
 size mismatch across the pre-probe observation, hashed byte count, and post-hash
@@ -59,6 +64,13 @@ unsafe. A deferred job can appear again only after explicit retry release.
 `acquisition recover-running` is a separate operator action for a confirmed
 abandoned process; it marks running jobs deferred, audits the transition, and retains
 staging evidence.
+
+The one-time adopted-library migration can also defer a pending job when an exact
+provider ID filename candidate exists but cannot be audio-verified. This quarantine
+is audited and uses the ordinary deferred state, so timer runs skip it and only an
+explicit operator retry can release it. A verified fingerprint contradiction does
+not quarantine the job: the provider object is then genuinely absent from the
+existing artifact set and remains eligible for acquisition.
 
 Verified repair uses the same structural validation, exact hashing, safe destination,
 same-filesystem hard-link, directory-sync, and no-clobber recovery boundaries. Repair

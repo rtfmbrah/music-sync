@@ -92,6 +92,11 @@ decision are auditable. Only a verified duration and perceptual match atomically
 associates the provider item with the existing unresolved recording and satisfies its
 pending acquisition job; no artifact row or audio path is replaced.
 
+Schema version 18 stores bounded artifact-fingerprint deferrals with their extraction
+bound, attempt count, diagnostic, and update time. Timer runs skip a matching
+deferral until explicit operator retry, while a different extraction bound remains
+independently eligible.
+
 ## PLANNED
 
 Add discovery seeds/candidates and expanded job attempts when a real workflow

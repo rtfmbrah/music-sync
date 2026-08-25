@@ -12,6 +12,36 @@ use music_sync::yt_dlp::YtDlp;
 static FIXTURE_EXECUTION: Mutex<()> = Mutex::new(());
 
 #[test]
+fn passes_explicit_cookie_file_without_reading_it() -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let executable = directory.path().join("yt-dlp");
+    let marker = directory.path().join("args");
+    let cookies = directory.path().join("cookies.txt");
+    fs::write(&cookies, "secret fixture")?;
+    fs::write(
+        &executable,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" >{}\nprintf '%s' '{{\"id\":\"one\",\"webpage_url\":\"https://youtu.be/one\"}}'\n",
+            marker.display()
+        ),
+    )?;
+    let mut permissions = fs::metadata(&executable)?.permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&executable, permissions)?;
+    YtDlp::new(executable, Duration::from_secs(1))
+        .with_cookie_file(Some(cookies.clone()))
+        .with_pacing(1, 5, 15)
+        .enumerate("https://youtu.be/one")?;
+    let arguments = fs::read_to_string(marker)?;
+    assert!(arguments.contains("--cookies\n"));
+    assert!(arguments.contains(&format!("{}\n", cookies.display())));
+    assert!(!arguments.contains("secret fixture"));
+    assert!(arguments.contains("--sleep-requests\n1\n"));
+    assert!(!arguments.contains("--sleep-interval"));
+    Ok(())
+}
+
+#[test]
 fn enumerates_stored_playlist_fixture_through_subprocess() -> Result<(), Box<dyn std::error::Error>>
 {
     let _execution = FIXTURE_EXECUTION

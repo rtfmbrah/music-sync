@@ -13,7 +13,8 @@ use crate::fingerprint::{Fingerprinter, RawFingerprint};
 use crate::identity::{FingerprintComparison, compare_raw_fingerprints};
 use crate::media_probe::MediaProbe;
 use crate::persistence::{
-    AdoptionProviderCandidate, AdoptionProviderVerificationStatus, Database, DatabaseError,
+    AdoptionProviderCandidate, AdoptionProviderQuarantineCandidate,
+    AdoptionProviderVerificationState, AdoptionProviderVerificationStatus, Database, DatabaseError,
 };
 use crate::yt_dlp::YtDlp;
 
@@ -121,6 +122,51 @@ pub fn verify_adopted_provider_links(
     Ok(report)
 }
 
+/// Defers downloads that could duplicate an unresolved adopted filename candidate.
+pub fn quarantine_unverified_adopted_provider_links(
+    database: &mut Database,
+    maximum_items: usize,
+) -> Result<AdoptionLinkQuarantineReport, AdoptionLinkError> {
+    if maximum_items == 0 {
+        return Err(AdoptionLinkError::InvalidLimit);
+    }
+    let candidates =
+        database.adoption_provider_quarantine_candidates(maximum_items.saturating_mul(16))?;
+    let mut grouped: BTreeMap<i64, Vec<AdoptionProviderQuarantineCandidate>> = BTreeMap::new();
+    for candidate in candidates {
+        if filename_contains_exact_id(&candidate.artifact_path, &candidate.provider_item_id) {
+            grouped
+                .entry(candidate.provider_item_database_id)
+                .or_default()
+                .push(candidate);
+        }
+    }
+
+    let mut report = AdoptionLinkQuarantineReport::default();
+    for candidates in grouped.into_values().take(maximum_items) {
+        report.selected += 1;
+        let candidate = &candidates[0];
+        match candidate.verification_status {
+            Some(AdoptionProviderVerificationState::Running) => report.running += 1,
+            Some(AdoptionProviderVerificationState::Rejected) => report.rejected += 1,
+            Some(AdoptionProviderVerificationState::Verified) => report.verified += 1,
+            None | Some(AdoptionProviderVerificationState::Deferred) => {
+                if candidate.acquisition_deferred {
+                    report.already_quarantined += 1;
+                } else if database.quarantine_unverified_adoption_acquisition(
+                    candidate.provider_item_database_id,
+                    candidate.acquisition_job_id,
+                )? {
+                    report.quarantined += 1;
+                } else {
+                    report.changed_during_run += 1;
+                }
+            }
+        }
+    }
+    Ok(report)
+}
+
 fn verify_one(
     candidate: &AdoptionProviderCandidate,
     state_directory: &Path,
@@ -212,6 +258,25 @@ pub struct AdoptionLinkReport {
     pub ambiguous: u64,
     /// Isolated boundary failures.
     pub failures: Vec<AdoptionLinkFailure>,
+}
+
+/// Aggregate duplicate-prevention decisions for unresolved adopted candidates.
+#[derive(Debug, Default, Serialize)]
+pub struct AdoptionLinkQuarantineReport {
+    /// Unique unresolved provider objects with exact filename candidates.
+    pub selected: u64,
+    /// Pending acquisition jobs newly deferred for explicit operator review.
+    pub quarantined: u64,
+    /// Jobs already deferred by an earlier identical pass.
+    pub already_quarantined: u64,
+    /// Active verifications left untouched.
+    pub running: u64,
+    /// Fingerprint contradictions intentionally left eligible for acquisition.
+    pub rejected: u64,
+    /// Verified rows observed during a concurrent state transition.
+    pub verified: u64,
+    /// Rows whose guarded state changed before the transaction committed.
+    pub changed_during_run: u64,
 }
 
 /// One isolated provider-boundary failure.

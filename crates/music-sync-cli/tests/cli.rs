@@ -136,6 +136,154 @@ fn adopted_provider_links_require_duration_and_fingerprint_proof()
 }
 
 #[test]
+fn unresolved_adopted_provider_candidate_is_quarantined_before_service_activation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = tempfile::tempdir()?;
+    let state = root.path().join("state");
+    let library = root.path().join("library");
+    let playlists = root.path().join("playlists");
+    fs::create_dir(&library)?;
+    fs::create_dir(&playlists)?;
+    let provider_id = "Ka4RGy8H2rs";
+    let adopted = library.join(format!("Existing [youtube-{provider_id}].m4a"));
+    fs::write(&adopted, b"preserved without usable fingerprint")?;
+    let config = root.path().join("config.toml");
+    fs::write(
+        &config,
+        format!(
+            "state_directory = {state:?}\nlibrary_directory = {library:?}\nplaylist_directory = {playlists:?}\n[service]\nenabled = true\nuser_agent = \"fixture@example.invalid\"\n"
+        ),
+    )?;
+    let database_path = state.join("music-sync.sqlite3");
+    drop(music_sync::persistence::Database::open(&database_path)?);
+    let connection = rusqlite::Connection::open(&database_path)?;
+    connection.execute(
+        "INSERT INTO sync_runs(status,finished_at) VALUES ('succeeded',CURRENT_TIMESTAMP)",
+        [],
+    )?;
+    connection.execute("INSERT INTO jobs(run_id,kind,status,idempotency_key) VALUES (1,'acquire','pending','acquire:youtube:Ka4RGy8H2rs')", [])?;
+    connection.execute("INSERT INTO provider_items(provider,provider_item_id,original_url) VALUES ('youtube',?1,?2)", [provider_id, &format!("https://youtu.be/{provider_id}")])?;
+    connection.execute(
+        "INSERT INTO acquisition_jobs(job_id,provider_item_id) VALUES (1,1)",
+        [],
+    )?;
+    connection.execute("INSERT INTO recordings DEFAULT VALUES", [])?;
+    connection.execute(
+        "INSERT INTO artifacts(recording_id,path,health) VALUES (1,?1,'healthy')",
+        [adopted.to_str().ok_or("non-Unicode fixture path")?],
+    )?;
+    drop(connection);
+
+    let run = || {
+        Command::new(env!("CARGO_BIN_EXE_music-sync"))
+            .args([
+                "--json",
+                "library",
+                "quarantine-unverified-provider-links",
+                "--config",
+            ])
+            .arg(&config)
+            .output()
+    };
+    let first = run()?;
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&first.stdout)?;
+    assert_eq!(report["quarantined"], 1);
+    assert_eq!(fs::read(&adopted)?, b"preserved without usable fingerprint");
+
+    let repeat = run()?;
+    assert!(repeat.status.success());
+    let repeat_report: serde_json::Value = serde_json::from_slice(&repeat.stdout)?;
+    assert_eq!(repeat_report["already_quarantined"], 1);
+    let connection = rusqlite::Connection::open(database_path)?;
+    assert_eq!(
+        connection.query_row("SELECT status FROM jobs WHERE id=1", [], |row| row
+            .get::<_, String>(0))?,
+        "deferred"
+    );
+    Ok(())
+}
+
+#[test]
+fn failed_artifact_fingerprint_is_deferred_until_explicit_retry()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = tempfile::tempdir()?;
+    let state = root.path().join("state");
+    let library = root.path().join("library");
+    let playlists = root.path().join("playlists");
+    fs::create_dir(&library)?;
+    fs::create_dir(&playlists)?;
+    let media = library.join("undecodable.m4a");
+    fs::write(&media, b"preserved media")?;
+    let config = root.path().join("config.toml");
+    fs::write(
+        &config,
+        format!(
+            "state_directory = {state:?}\nlibrary_directory = {library:?}\nplaylist_directory = {playlists:?}\n"
+        ),
+    )?;
+    let database_path = state.join("music-sync.sqlite3");
+    let mut database = music_sync::persistence::Database::open(&database_path)?;
+    database.register_adopted_artifacts(std::slice::from_ref(&media))?;
+    drop(database);
+    let connection = rusqlite::Connection::open(&database_path)?;
+    connection.execute("UPDATE artifacts SET health='healthy'", [])?;
+    drop(connection);
+    let fpcalc = root.path().join("fpcalc");
+    fs::write(&fpcalc, "#!/bin/sh\necho decode failed >&2\nexit 3\n")?;
+    let mut permissions = fs::metadata(&fpcalc)?.permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&fpcalc, permissions)?;
+    let fingerprint = || {
+        Command::new(env!("CARGO_BIN_EXE_music-sync"))
+            .args(["--json", "library", "fingerprint", "--config"])
+            .arg(&config)
+            .args(["--max-artifacts", "10", "--fpcalc"])
+            .arg(&fpcalc)
+            .output()
+    };
+
+    let failed = fingerprint()?;
+    assert_eq!(failed.status.code(), Some(1));
+    let failed_report: serde_json::Value = serde_json::from_slice(&failed.stdout)?;
+    assert_eq!(failed_report["selected"], 1);
+    assert_eq!(failed_report["failures"].as_array().map(Vec::len), Some(1));
+
+    let skipped = fingerprint()?;
+    assert!(skipped.status.success());
+    let skipped_report: serde_json::Value = serde_json::from_slice(&skipped.stdout)?;
+    assert_eq!(skipped_report["selected"], 0);
+
+    let retry = Command::new(env!("CARGO_BIN_EXE_music-sync"))
+        .args(["--json", "library", "retry-fingerprint", "1", "--config"])
+        .arg(&config)
+        .output()?;
+    assert!(retry.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&retry.stdout)?["released"],
+        true
+    );
+
+    let retried = fingerprint()?;
+    assert_eq!(retried.status.code(), Some(1));
+    let connection = rusqlite::Connection::open(database_path)?;
+    assert_eq!(
+        connection.query_row(
+            "SELECT status,attempt_count FROM artifact_fingerprint_deferrals",
+            [],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?)),
+        )?,
+        ("deferred".into(), 2)
+    );
+    assert_eq!(fs::read(media)?, b"preserved media");
+    Ok(())
+}
+
+#[test]
 fn maintenance_backup_creates_a_consistent_unique_snapshot()
 -> Result<(), Box<dyn std::error::Error>> {
     let root = tempfile::tempdir()?;

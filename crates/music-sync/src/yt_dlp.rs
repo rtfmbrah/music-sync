@@ -17,6 +17,9 @@ const MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 pub struct YtDlp {
     executable: PathBuf,
     timeout: Duration,
+    cookie_file: Option<PathBuf>,
+    sleep_requests_seconds: Option<u64>,
+    download_sleep_seconds: Option<(u64, u64)>,
 }
 
 impl YtDlp {
@@ -26,12 +29,40 @@ impl YtDlp {
         Self {
             executable,
             timeout,
+            cookie_file: None,
+            sleep_requests_seconds: None,
+            download_sleep_seconds: None,
         }
+    }
+
+    /// Configures an optional Netscape-format cookie file for authenticated provider access.
+    #[must_use]
+    pub fn with_cookie_file(mut self, cookie_file: Option<PathBuf>) -> Self {
+        self.cookie_file = cookie_file;
+        self
+    }
+
+    /// Configures yt-dlp's own extraction and randomized pre-download pacing.
+    #[must_use]
+    pub fn with_pacing(
+        mut self,
+        sleep_requests_seconds: u64,
+        minimum_download_sleep_seconds: u64,
+        maximum_download_sleep_seconds: u64,
+    ) -> Self {
+        self.sleep_requests_seconds = Some(sleep_requests_seconds);
+        self.download_sleep_seconds = Some((
+            minimum_download_sleep_seconds,
+            maximum_download_sleep_seconds,
+        ));
+        self
     }
 
     /// Enumerates a single video or playlist without downloading media.
     pub fn enumerate(&self, url: &str) -> Result<SourceSnapshot, YtDlpError> {
         let mut command = Command::new(&self.executable);
+        self.apply_authentication(&mut command);
+        self.apply_request_pacing(&mut command);
         command.args([
             "--flat-playlist",
             "--dump-single-json",
@@ -58,6 +89,15 @@ impl YtDlp {
             return Err(YtDlpError::StagingNotDirectory(staging));
         }
         let mut command = Command::new(&self.executable);
+        self.apply_authentication(&mut command);
+        self.apply_request_pacing(&mut command);
+        if let Some((minimum, maximum)) = self.download_sleep_seconds {
+            command
+                .arg("--sleep-interval")
+                .arg(minimum.to_string())
+                .arg("--max-sleep-interval")
+                .arg(maximum.to_string());
+        }
         command
             .args([
                 "--no-playlist",
@@ -78,6 +118,18 @@ impl YtDlp {
             ]);
         let stdout = self.execute(&mut command)?;
         validate_download_output(&stdout, &staging)
+    }
+
+    fn apply_authentication(&self, command: &mut Command) {
+        if let Some(cookie_file) = &self.cookie_file {
+            command.arg("--cookies").arg(cookie_file);
+        }
+    }
+
+    fn apply_request_pacing(&self, command: &mut Command) {
+        if let Some(seconds) = self.sleep_requests_seconds {
+            command.arg("--sleep-requests").arg(seconds.to_string());
+        }
     }
 
     fn execute(&self, command: &mut Command) -> Result<Vec<u8>, YtDlpError> {

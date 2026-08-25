@@ -16,7 +16,9 @@ use music_sync::adoption::{
     AdoptionApplyReport, AdoptionReport, HashLimit, ProbeLimit, apply_library, scan_library,
     scan_library_with_hash, scan_library_with_probe, scan_library_with_probe_and_hash,
 };
-use music_sync::adoption_link::verify_adopted_provider_links;
+use music_sync::adoption_link::{
+    quarantine_unverified_adopted_provider_links, verify_adopted_provider_links,
+};
 use music_sync::artwork::{CoverArtArchive, resolve_release_artwork};
 use music_sync::config::AppConfig;
 use music_sync::content_hash::Sha256FileHasher;
@@ -698,6 +700,15 @@ enum LibraryCommand {
         #[arg(long, default_value = "100")]
         max_items: NonZeroUsize,
     },
+    /// Defer downloads that could duplicate unresolved adopted filename candidates.
+    QuarantineUnverifiedProviderLinks {
+        /// TOML configuration identifying migration state.
+        #[arg(short, long, default_value = "music-sync.toml")]
+        config: PathBuf,
+        /// Maximum unique provider objects inspected once.
+        #[arg(long, default_value = "100")]
+        max_items: NonZeroUsize,
+    },
     /// Derive bounded raw Chromaprint evidence for healthy registered artifacts.
     Fingerprint {
         /// TOML configuration containing state and library directories.
@@ -715,6 +726,14 @@ enum LibraryCommand {
         /// Per-artifact fpcalc deadline in seconds.
         #[arg(long, default_value = "60")]
         timeout_seconds: NonZeroU64,
+    },
+    /// Explicitly release one deferred artifact fingerprint for retry.
+    RetryFingerprint {
+        /// Durable artifact ID shown in the fingerprint failure report.
+        artifact_id: i64,
+        /// TOML configuration identifying application state.
+        #[arg(short, long, default_value = "music-sync.toml")]
+        config: PathBuf,
     },
     /// Reconcile registered artifact health without modifying media files.
     Health {
@@ -849,10 +868,22 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn Error>> {
             let source = YtDlp::new(
                 config.service.yt_dlp.clone(),
                 Duration::from_secs(config.service.source_timeout_seconds),
+            )
+            .with_cookie_file(config.service.yt_dlp_cookie_file.clone())
+            .with_pacing(
+                config.service.yt_dlp_sleep_requests_seconds,
+                config.service.yt_dlp_min_sleep_seconds,
+                config.service.yt_dlp_max_sleep_seconds,
             );
             let acquisition = YtDlp::new(
                 config.service.yt_dlp.clone(),
                 Duration::from_secs(config.service.download_timeout_seconds),
+            )
+            .with_cookie_file(config.service.yt_dlp_cookie_file.clone())
+            .with_pacing(
+                config.service.yt_dlp_sleep_requests_seconds,
+                config.service.yt_dlp_min_sleep_seconds,
+                config.service.yt_dlp_max_sleep_seconds,
             );
             let probe = Ffprobe::new(
                 config.service.ffprobe.clone(),
@@ -1619,6 +1650,7 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn Error>> {
                 println!("Artifacts unknown:       {}", report.artifacts.unknown);
                 println!("Artifacts missing:       {}", report.artifacts.missing);
                 println!("Artifacts corrupt:       {}", report.artifacts.corrupt);
+                println!("Fingerprints deferred:   {}", report.fingerprints_deferred);
                 println!("Repairs eligible:        {}", report.repairs.eligible);
                 println!("Repairs unresolved:      {}", report.repairs.unresolved);
                 println!("Repairs verified:        {}", report.repairs.verified);
@@ -1707,6 +1739,12 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn Error>> {
             let downloader = YtDlp::new(
                 config.service.yt_dlp.clone(),
                 Duration::from_secs(config.service.download_timeout_seconds),
+            )
+            .with_cookie_file(config.service.yt_dlp_cookie_file.clone())
+            .with_pacing(
+                config.service.yt_dlp_sleep_requests_seconds,
+                config.service.yt_dlp_min_sleep_seconds,
+                config.service.yt_dlp_max_sleep_seconds,
             );
             let probe = Ffprobe::new(
                 config.service.ffprobe.clone(),
@@ -1737,6 +1775,32 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn Error>> {
                 println!("Boundary failures:        {}", report.failures.len());
             }
             Ok(if report.failures.is_empty() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(1)
+            })
+        }
+        Command::Library {
+            command: LibraryCommand::QuarantineUnverifiedProviderLinks { config, max_items },
+        } => {
+            let config = AppConfig::from_file(&config)?;
+            if !config.service.enabled {
+                return Err("provider-link quarantine requires service.enabled=true".into());
+            }
+            let mut database = Database::open(&config.database_path())?;
+            let report =
+                quarantine_unverified_adopted_provider_links(&mut database, max_items.get())?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("Provider objects selected: {}", report.selected);
+                println!("Newly quarantined:        {}", report.quarantined);
+                println!("Already quarantined:      {}", report.already_quarantined);
+                println!("Verifications running:    {}", report.running);
+                println!("Rejected candidates:      {}", report.rejected);
+                println!("Changed during run:       {}", report.changed_during_run);
+            }
+            Ok(if report.running == 0 && report.changed_during_run == 0 {
                 ExitCode::SUCCESS
             } else {
                 ExitCode::from(1)
@@ -1780,6 +1844,32 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn Error>> {
                 }
             }
             Ok(if report.failures.is_empty() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(1)
+            })
+        }
+        Command::Library {
+            command:
+                LibraryCommand::RetryFingerprint {
+                    artifact_id,
+                    config,
+                },
+        } => {
+            let config = AppConfig::from_file(&config)?;
+            let mut database = Database::open(&config.database_path())?;
+            let released = database.retry_deferred_artifact_fingerprint(artifact_id)?;
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::json!({"artifact_id": artifact_id, "released": released})
+                );
+            } else if released {
+                println!("Released artifact fingerprint {artifact_id} for retry");
+            } else {
+                println!("Artifact fingerprint {artifact_id} was not deferred");
+            }
+            Ok(if released {
                 ExitCode::SUCCESS
             } else {
                 ExitCode::from(1)

@@ -35,6 +35,34 @@ fn downloads_one_nonempty_file_directly_inside_staging() -> Result<(), Box<dyn s
 }
 
 #[test]
+fn passes_request_and_randomized_download_pacing() -> Result<(), Box<dyn std::error::Error>> {
+    let _execution = fixture_lock()?;
+    let tools = tempfile::tempdir()?;
+    let executable = tools.path().join("yt-dlp");
+    let marker = tools.path().join("args");
+    fs::write(
+        &executable,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" >{}\nwhile test \"$1\" != '--paths'; do shift; done\nstaging=$2\nprintf audio >\"$staging/media.opus\"\nprintf '%s\\n' \"$staging/media.opus\"\n",
+            marker.display()
+        ),
+    )?;
+    let mut permissions = fs::metadata(&executable)?.permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&executable, permissions)?;
+    let staging = tempfile::tempdir()?;
+
+    YtDlp::new(executable, Duration::from_secs(1))
+        .with_pacing(1, 5, 15)
+        .download("https://youtu.be/fixture", staging.path())?;
+    let arguments = fs::read_to_string(marker)?;
+    assert!(arguments.contains("--sleep-requests\n1\n"));
+    assert!(arguments.contains("--sleep-interval\n5\n"));
+    assert!(arguments.contains("--max-sleep-interval\n15\n"));
+    Ok(())
+}
+
+#[test]
 fn classifies_provider_failure_without_accepting_media() -> Result<(), Box<dyn std::error::Error>> {
     let _execution = fixture_lock()?;
     let (_tools, executable) =

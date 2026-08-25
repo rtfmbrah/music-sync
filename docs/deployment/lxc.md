@@ -169,12 +169,40 @@ yt-dlp at the explicit unit paths, and replace the example writable library and
 playlist paths with the configured deployment paths. `ProtectSystem=strict` keeps
 the remaining host filesystem read-only to the service.
 
+The sync timer uses a half-hour wall-clock schedule with a randomized delay of up to
+two minutes. A calendar schedule retains a real next activation after installation
+or restart; it does not inherit an already-expired monotonic trigger from an older
+unit definition. `Persistent=true` catches up one missed activation after downtime.
+
 The hardened oneshot invokes `service run --trigger timer`, loads optional secrets
 from `/etc/music-sync/music-sync.env`, and returns 0 only when every enabled phase
 succeeds, 1 after isolated failures, and 2 for fatal configuration or durable-state
 errors. Schema-backed exclusivity rejects overlap before provider or managed-file
 effects. The timer may therefore alert on partial runs without preventing successful
 unrelated work from being committed.
+
+When YouTube requires authenticated anti-bot access, configure
+`service.yt_dlp_cookie_file` with an absolute Netscape-format cookie file outside the
+repository. The adapter passes only its path to yt-dlp and never reads, serializes, or
+logs cookie contents. `doctor` requires the file to be regular and inaccessible to
+group and other users. Cookie rotation does not require an application rebuild.
+yt-dlp persists cookie-jar updates back to the configured file, so the hardened
+service unit grants write access to that single secret path while `/etc` otherwise
+remains protected read-only.
+
+Timer-driven provider access is deliberately paced. The default service policy asks
+yt-dlp to wait one second between extraction requests and to wait a randomized five
+to fifteen seconds before each media download. These positive bounds are explicit
+configuration and are validated at startup. Serial job execution alone is not a
+provider-throttling policy; keep the pacing enabled even when acquisition concurrency
+is one.
+
+For an adopted library, do not enable the timer immediately after provider-link
+verification. First run `music-sync library quarantine-unverified-provider-links
+--config /etc/music-sync/music-sync.toml --max-items 10000` while the service is
+stopped, review its JSON report, and confirm that no verification remains `running`.
+The command defers only unresolved exact filename candidates; it does not touch
+audio. This prevents the first ordinary service cycle from downloading duplicates.
 
 ## Versioned releases, backup, and rollback
 
@@ -205,6 +233,16 @@ is on the 469 GiB data filesystem. Production state therefore belongs at
 `/srv/music-sync-state`, and backups at `/srv/music-sync-backups`. This both avoids
 the constrained root volume and keeps acquisition staging on the same filesystem as
 the library, which is required for atomic hard-link commits.
+
+Production activation completed on 2026-08-25 with schema 18 and release
+`0.1.0-20260825.3`. The migration registered 1,560 healthy artifacts without
+rewriting audio, proved 1,127 adopted/provider associations, quarantined 205
+unresolved filename candidates, deferred 117 unavailable provider objects, and
+persisted 88 isolated fingerprint failures for explicit retry. The hardened service
+uses the dedicated account, pinned yt-dlp, request/download pacing, `/srv` state and
+backup paths, a half-hour sync timer, and a daily backup timer. A partial service run
+remains a failed oneshot result for alerting while the timer continues scheduling
+later runs.
 
 The composed command was validated on 2026-08-24 with the static-musl binary and
 offline two-item fixtures under `/srv/music-sync-v2-test/sync-20260824`. Its first

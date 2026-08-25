@@ -61,6 +61,9 @@
 - Raw fingerprint tests cover bounded fpcalc arguments/output/deadlines, schema-v7
   persistence, repeat idempotency, automatic sync extraction, isolated failures, and
   strict aligned/duration-aware comparison without live services.
+- Fingerprint deferral tests prove failed artifacts do not starve later work, ordinary
+  repeats skip the same bound, and explicit operator retry releases only the selected
+  artifact.
 - Repair persistence tests prove transient failures cannot create cases, every
   permanent-loss/health/membership/fingerprint prerequisite is required, generated
   candidates remain unverified and idempotent, recovered health cancels a case, and

@@ -21,9 +21,11 @@ in ad hoc TODO documents.
 - Embedded canonical-tag validation (complete).
 - Initial transactional, idempotent adoption apply (complete).
 - Fingerprint-verified adopted-artifact/provider migration without duplicate library
-  output (complete locally; production migration acceptance active).
+  output, including first-activation quarantine of unresolved filename candidates
+  (complete, including production migration acceptance).
 - Persisted raw perceptual identity evidence and bounded adoption reconciliation
-  (complete); external canonical resolution remains planned.
+  with durable isolated-failure deferral (complete); external canonical resolution
+  remains planned.
 - Source/provider model and stored `yt-dlp` fixtures (complete).
 - Inspect-only YouTube video/playlist enumeration with typed errors (complete).
 - Persistent source add/list/deactivate/reactivate lifecycle (complete).
@@ -73,5 +75,7 @@ in ad hoc TODO documents.
   progress and persistent log policy remain.
 - JSON phase summaries, hardened systemd examples, consistent state backup, and
   atomic versioned release/rollback tooling (complete).
-- Least-privilege LXC compatibility/deployment validation in isolated test storage.
+- Least-privilege LXC compatibility/deployment validation (complete for isolated
+  acceptance and production activation with paced provider access, versioned
+  releases, schema 18 state, half-hour sync, and daily backup timers).
 - Production health checks, performance measurement, and repair workflows.

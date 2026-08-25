@@ -71,6 +71,14 @@ never modified or copied into a new managed path. Mismatches are rejected;
 insufficient evidence and boundary failures are deferred. Every attempt, staged hash,
 duration, fingerprint decision, and message is durable and repeatable.
 
+Before first service activation, `library quarantine-unverified-provider-links`
+finds exact filename candidates that remain unverified, including healthy artifacts
+without usable fingerprint evidence, and defers their pending acquisition jobs. This
+prevents an ordinary service cycle from downloading a possible duplicate. Active
+verifications are untouched, and a fingerprint-rejected candidate remains eligible
+for normal acquisition because its existing audio was independently contradicted.
+Releasing a quarantined job requires the existing explicit operator retry command.
+
 ## PLANNED
 
 Add deeper decode validation and canonical identification states. Expensive

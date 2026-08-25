@@ -50,10 +50,14 @@ const MIGRATIONS: &[(u32, &str)] = &[
         17,
         include_str!("../migrations/0017_adoption_provider_verification.sql"),
     ),
+    (
+        18,
+        include_str!("../migrations/0018_artifact_fingerprint_deferrals.sql"),
+    ),
 ];
 
 /// Current durable schema version.
-pub const CURRENT_SCHEMA_VERSION: u32 = 17;
+pub const CURRENT_SCHEMA_VERSION: u32 = 18;
 
 /// A connection to music-sync's private application state.
 #[derive(Debug)]
@@ -211,6 +215,9 @@ impl Database {
                 missing: count("SELECT COUNT(*) FROM artifacts WHERE health = 'missing'")?,
                 corrupt: count("SELECT COUNT(*) FROM artifacts WHERE health = 'corrupt'")?,
             },
+            fingerprints_deferred: count(
+                "SELECT COUNT(*) FROM artifact_fingerprint_deferrals WHERE status='deferred'",
+            )?,
             repairs: RepairCaseCounts {
                 eligible: count("SELECT COUNT(*) FROM repair_cases WHERE state = 'eligible'")?,
                 unresolved: count("SELECT COUNT(*) FROM repair_cases WHERE state = 'unresolved'")?,
@@ -628,6 +635,7 @@ impl Database {
     pub fn artifact_fingerprint_candidates(
         &self,
         limit: usize,
+        maximum_audio_seconds: u32,
     ) -> Result<Vec<ArtifactFingerprintCandidate>, DatabaseError> {
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let mut statement = self
@@ -639,12 +647,21 @@ impl Database {
                  FROM artifacts
                  LEFT JOIN artifact_fingerprints ON
                            artifact_fingerprints.artifact_id = artifacts.id
+                LEFT JOIN artifact_fingerprint_deferrals ON
+                           artifact_fingerprint_deferrals.artifact_id = artifacts.id
+                       AND artifact_fingerprint_deferrals.max_seconds = ?1
+                       AND artifact_fingerprint_deferrals.status = 'deferred'
                  WHERE artifacts.health = 'healthy'
-                 ORDER BY artifacts.id LIMIT ?1",
+                   AND artifact_fingerprint_deferrals.artifact_id IS NULL
+                 ORDER BY CASE
+                     WHEN artifact_fingerprints.artifact_id IS NULL
+                       OR artifact_fingerprints.max_seconds != ?1 THEN 0
+                     ELSE 1
+                 END, artifacts.id LIMIT ?2",
             )
             .map_err(DatabaseError::Sqlite)?;
         statement
-            .query_map([limit], |row| {
+            .query_map(rusqlite::params![maximum_audio_seconds, limit], |row| {
                 Ok(ArtifactFingerprintCandidate {
                     artifact_id: row.get(0)?,
                     path: PathBuf::from(row.get::<_, String>(1)?),
@@ -655,6 +672,61 @@ impl Database {
             .map_err(DatabaseError::Sqlite)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(DatabaseError::Sqlite)
+    }
+
+    /// Durably defers one isolated fingerprint boundary failure at an extraction bound.
+    pub fn defer_artifact_fingerprint(
+        &mut self,
+        artifact_id: i64,
+        maximum_audio_seconds: u32,
+        message: &str,
+    ) -> Result<(), DatabaseError> {
+        self.connection
+            .execute(
+                "INSERT INTO artifact_fingerprint_deferrals(
+                     artifact_id,max_seconds,attempt_count,message)
+                 SELECT id,?2,1,?3 FROM artifacts WHERE id=?1
+                 ON CONFLICT(artifact_id) DO UPDATE SET
+                     max_seconds=excluded.max_seconds,
+                     status='deferred',
+                     attempt_count=artifact_fingerprint_deferrals.attempt_count+1,
+                     message=excluded.message,
+                     updated_at=CURRENT_TIMESTAMP",
+                rusqlite::params![artifact_id, maximum_audio_seconds, message],
+            )
+            .map_err(DatabaseError::Sqlite)?;
+        Ok(())
+    }
+
+    /// Explicitly releases one deferred artifact fingerprint for a future pass.
+    pub fn retry_deferred_artifact_fingerprint(
+        &mut self,
+        artifact_id: i64,
+    ) -> Result<bool, DatabaseError> {
+        Ok(self
+            .connection
+            .execute(
+                "UPDATE artifact_fingerprint_deferrals
+                 SET status='pending',updated_at=CURRENT_TIMESTAMP
+                 WHERE artifact_id=?1 AND status='deferred'",
+                [artifact_id],
+            )
+            .map_err(DatabaseError::Sqlite)?
+            == 1)
+    }
+
+    /// Clears stale deferral evidence after successful extraction.
+    pub fn clear_artifact_fingerprint_deferral(
+        &mut self,
+        artifact_id: i64,
+    ) -> Result<(), DatabaseError> {
+        self.connection
+            .execute(
+                "DELETE FROM artifact_fingerprint_deferrals WHERE artifact_id=?1",
+                [artifact_id],
+            )
+            .map_err(DatabaseError::Sqlite)?;
+        Ok(())
     }
 
     /// Upserts exact raw fingerprint evidence and reports whether bytes changed.
@@ -2900,6 +2972,98 @@ impl Database {
             .map_err(DatabaseError::Sqlite)
     }
 
+    /// Selects unresolved provider jobs that have a possible adopted artifact path.
+    ///
+    /// The caller must still apply exact filename-token matching. SQL substring
+    /// matching is deliberately only a bounded candidate generator.
+    pub fn adoption_provider_quarantine_candidates(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<AdoptionProviderQuarantineCandidate>, DatabaseError> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT provider_items.id,provider_items.provider_item_id,jobs.id,jobs.status,
+                    artifacts.path,adoption_provider_verifications.status
+             FROM provider_items
+             JOIN acquisition_jobs ON acquisition_jobs.provider_item_id=provider_items.id
+             JOIN jobs ON jobs.id=acquisition_jobs.job_id
+             JOIN artifacts ON instr(artifacts.path,provider_items.provider_item_id)>0
+             LEFT JOIN adoption_provider_verifications ON
+                  adoption_provider_verifications.provider_item_id=provider_items.id
+             WHERE provider_items.provider='youtube'
+               AND provider_items.recording_id IS NULL
+               AND jobs.status IN ('pending','deferred')
+               AND artifacts.health='healthy'
+             ORDER BY provider_items.id,artifacts.id LIMIT ?1",
+            )
+            .map_err(DatabaseError::Sqlite)?;
+        statement
+            .query_map([limit], |row| {
+                Ok(AdoptionProviderQuarantineCandidate {
+                    provider_item_database_id: row.get(0)?,
+                    provider_item_id: row.get(1)?,
+                    acquisition_job_id: row.get(2)?,
+                    acquisition_deferred: row.get::<_, String>(3)? == "deferred",
+                    artifact_path: PathBuf::from(row.get::<_, String>(4)?),
+                    verification_status: row
+                        .get::<_, Option<String>>(5)?
+                        .as_deref()
+                        .and_then(AdoptionProviderVerificationState::from_str),
+                })
+            })
+            .map_err(DatabaseError::Sqlite)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(DatabaseError::Sqlite)
+    }
+
+    /// Defers a pending acquisition whose adopted filename candidate remains
+    /// unresolved, preventing an ordinary service run from creating a duplicate.
+    pub fn quarantine_unverified_adoption_acquisition(
+        &mut self,
+        provider_item_id: i64,
+        job_id: i64,
+    ) -> Result<bool, DatabaseError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(DatabaseError::Sqlite)?;
+        let changed = transaction
+            .execute(
+                "UPDATE jobs SET status='deferred',updated_at=CURRENT_TIMESTAMP
+                 WHERE id=?2 AND kind='acquire' AND status='pending'
+                   AND EXISTS (
+                       SELECT 1 FROM acquisition_jobs
+                       JOIN provider_items ON provider_items.id=acquisition_jobs.provider_item_id
+                       LEFT JOIN adoption_provider_verifications ON
+                            adoption_provider_verifications.provider_item_id=provider_items.id
+                       WHERE acquisition_jobs.job_id=jobs.id
+                         AND provider_items.id=?1
+                         AND provider_items.recording_id IS NULL
+                         AND (adoption_provider_verifications.status IS NULL OR
+                              adoption_provider_verifications.status='deferred')
+                   )",
+                rusqlite::params![provider_item_id, job_id],
+            )
+            .map_err(DatabaseError::Sqlite)?
+            == 1;
+        if changed {
+            transaction
+                .execute(
+                    "INSERT INTO events(run_id,job_id,level,component,event,message)
+                     SELECT run_id,id,'warning','adoption',
+                            'adoption_provider_acquisition_quarantined',
+                            'Existing adopted filename candidate lacks conclusive audio identity; operator review is required before acquisition retry'
+                     FROM jobs WHERE id=?1",
+                    [job_id],
+                )
+                .map_err(DatabaseError::Sqlite)?;
+        }
+        transaction.commit().map_err(DatabaseError::Sqlite)?;
+        Ok(changed)
+    }
+
     /// Starts or resumes one non-destructive adopted/provider verification.
     pub fn start_adoption_provider_verification(
         &mut self,
@@ -4139,6 +4303,8 @@ pub struct OperationalStatus {
     pub jobs: JobStatusCounts,
     /// Physical artifact counts by constrained health.
     pub artifacts: ArtifactHealthCounts,
+    /// Artifact fingerprint failures awaiting explicit operator retry.
+    pub fingerprints_deferred: u64,
     /// Repair cases grouped by their conservative durable state.
     pub repairs: RepairCaseCounts,
     /// Repair candidate attempts grouped by their constrained state.
@@ -4518,6 +4684,48 @@ pub struct AdoptionProviderCandidate {
     pub fingerprint_duration_ms: i64,
     /// Serialized raw reference fingerprint.
     pub fingerprint_json: String,
+}
+
+/// One unresolved provider job with a possible adopted filename candidate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdoptionProviderQuarantineCandidate {
+    /// Durable provider-item row.
+    pub provider_item_database_id: i64,
+    /// Provider-owned YouTube object ID.
+    pub provider_item_id: String,
+    /// Acquisition job that must not create an unreviewed duplicate.
+    pub acquisition_job_id: i64,
+    /// Whether an earlier migration pass already deferred the job.
+    pub acquisition_deferred: bool,
+    /// Healthy adopted artifact path that generated the candidate.
+    pub artifact_path: PathBuf,
+    /// Durable verification state, when verification was possible.
+    pub verification_status: Option<AdoptionProviderVerificationState>,
+}
+
+/// Durable state of an adopted/provider verification attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdoptionProviderVerificationState {
+    /// Verification is currently active and must not be disturbed.
+    Running,
+    /// Evidence or a provider boundary was insufficient.
+    Deferred,
+    /// Audio evidence contradicted the filename-generated candidate.
+    Rejected,
+    /// Independent audio evidence established the association.
+    Verified,
+}
+
+impl AdoptionProviderVerificationState {
+    fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "running" => Some(Self::Running),
+            "deferred" => Some(Self::Deferred),
+            "rejected" => Some(Self::Rejected),
+            "verified" => Some(Self::Verified),
+            _ => None,
+        }
+    }
 }
 
 /// Terminal outcome of independent adopted/provider audio verification.
@@ -5984,6 +6192,146 @@ mod tests {
         assert!(database.artwork_resolution_candidates(10)?.is_empty());
         assert_eq!(database.table_count("artwork_blobs")?, 1);
         assert_eq!(database.table_count("release_artwork")?, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn adopted_candidate_quarantine_includes_missing_fingerprint_and_is_guarded()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut database = Database::open_in_memory()?;
+        database
+            .connection
+            .execute("INSERT INTO sync_runs(status) VALUES ('succeeded')", [])?;
+        database.connection.execute(
+            "INSERT INTO jobs(run_id,kind,status,idempotency_key)
+             VALUES (1,'acquire','pending','acquire:youtube:fixture-id')",
+            [],
+        )?;
+        database.connection.execute(
+            "INSERT INTO provider_items(provider,provider_item_id,original_url)
+             VALUES ('youtube','fixture-id','https://youtu.be/fixture-id')",
+            [],
+        )?;
+        database.connection.execute(
+            "INSERT INTO acquisition_jobs(job_id,provider_item_id) VALUES (1,1)",
+            [],
+        )?;
+        database
+            .connection
+            .execute("INSERT INTO recordings DEFAULT VALUES", [])?;
+        database.connection.execute(
+            "INSERT INTO artifacts(recording_id,path,health,duration_ms)
+             VALUES (1,'/music/Track [fixture-id].opus','healthy',180000)",
+            [],
+        )?;
+
+        let candidates = database.adoption_provider_quarantine_candidates(10)?;
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].verification_status, None);
+        assert!(!candidates[0].acquisition_deferred);
+        assert!(database.quarantine_unverified_adoption_acquisition(1, 1)?);
+        assert!(!database.quarantine_unverified_adoption_acquisition(1, 1)?);
+        assert_eq!(
+            database
+                .connection
+                .query_row("SELECT status FROM jobs WHERE id=1", [], |row| row
+                    .get::<_, String>(0),)?,
+            "deferred"
+        );
+        assert_eq!(
+            database.connection.query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE event='adoption_provider_acquisition_quarantined'",
+                [],
+                |row| row.get::<_, u64>(0),
+            )?,
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn fingerprint_deferral_does_not_starve_later_missing_evidence()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut database = Database::open_in_memory()?;
+        for path in [
+            "/music/current.m4a",
+            "/music/deferred.m4a",
+            "/music/later.m4a",
+        ] {
+            database
+                .connection
+                .execute("INSERT INTO recordings DEFAULT VALUES", [])?;
+            let recording_id = database.connection.last_insert_rowid();
+            database.connection.execute(
+                "INSERT INTO artifacts(recording_id,path,health) VALUES (?1,?2,'healthy')",
+                rusqlite::params![recording_id, path],
+            )?;
+        }
+        database.record_artifact_fingerprint(&ArtifactFingerprintEvidence {
+            artifact_id: 1,
+            max_seconds: 120,
+            duration_ms: 1_000,
+            fingerprint_json: "[1]".into(),
+            value_count: 1,
+        })?;
+        database.defer_artifact_fingerprint(2, 120, "decode failed")?;
+
+        let candidates = database.artifact_fingerprint_candidates(1, 120)?;
+        assert_eq!(candidates[0].artifact_id, 3);
+        assert!(database.retry_deferred_artifact_fingerprint(2)?);
+        assert!(!database.retry_deferred_artifact_fingerprint(2)?);
+        let candidates = database.artifact_fingerprint_candidates(1, 120)?;
+        assert_eq!(candidates[0].artifact_id, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn rejected_or_running_adoption_verification_cannot_be_quarantined()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for status in ["rejected", "running"] {
+            let mut database = Database::open_in_memory()?;
+            database
+                .connection
+                .execute("INSERT INTO sync_runs(status) VALUES ('succeeded')", [])?;
+            database.connection.execute(
+                "INSERT INTO jobs(run_id,kind,status,idempotency_key)
+                 VALUES (1,'acquire','pending','acquire:youtube:fixture-id')",
+                [],
+            )?;
+            database.connection.execute(
+                "INSERT INTO provider_items(provider,provider_item_id,original_url)
+                 VALUES ('youtube','fixture-id','https://youtu.be/fixture-id')",
+                [],
+            )?;
+            database.connection.execute(
+                "INSERT INTO acquisition_jobs(job_id,provider_item_id) VALUES (1,1)",
+                [],
+            )?;
+            database
+                .connection
+                .execute("INSERT INTO recordings DEFAULT VALUES", [])?;
+            database.connection.execute(
+                "INSERT INTO artifacts(recording_id,path,health)
+                 VALUES (1,'/music/Track [fixture-id].opus','healthy')",
+                [],
+            )?;
+            database.connection.execute(
+                "INSERT INTO adoption_provider_verifications(
+                     provider_item_id,acquisition_job_id,artifact_id,status,attempt_count)
+                 VALUES (1,1,1,?1,1)",
+                [status],
+            )?;
+
+            assert!(!database.quarantine_unverified_adoption_acquisition(1, 1)?);
+            assert_eq!(
+                database
+                    .connection
+                    .query_row("SELECT status FROM jobs WHERE id=1", [], |row| row
+                        .get::<_, String>(0),)?,
+                "pending"
+            );
+        }
         Ok(())
     }
 }

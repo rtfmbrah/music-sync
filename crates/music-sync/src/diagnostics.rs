@@ -80,6 +80,9 @@ pub fn run_doctor(config: &AppConfig) -> DoctorReport {
         checks.push(check_tool_path("ffmpeg", &config.service.ffmpeg, true));
         checks.push(check_tool_path("ffprobe", &config.service.ffprobe, true));
         checks.push(check_tool_path("fpcalc", &config.service.fpcalc, true));
+        if let Some(cookie_file) = &config.service.yt_dlp_cookie_file {
+            checks.push(check_secret_file("yt-dlp_cookies", cookie_file));
+        }
         checks.push(check_same_filesystem(
             &config.state_directory,
             &config.library_directory,
@@ -92,6 +95,37 @@ pub fn run_doctor(config: &AppConfig) -> DoctorReport {
         }
     }
     DoctorReport { checks }
+}
+
+fn check_secret_file(name: &str, path: &Path) -> DiagnosticCheck {
+    let secure = fs::metadata(path).is_ok_and(|metadata| {
+        if !metadata.is_file() {
+            return false;
+        }
+        #[cfg(unix)]
+        return metadata.permissions().mode() & 0o077 == 0;
+        #[cfg(not(unix))]
+        true
+    });
+    DiagnosticCheck {
+        name: format!("secret_{name}"),
+        status: if secure {
+            CheckStatus::Pass
+        } else {
+            CheckStatus::Failure
+        },
+        message: if secure {
+            format!(
+                "Secret file exists with restricted permissions: {}",
+                path.display()
+            )
+        } else {
+            format!(
+                "Secret file must be regular and inaccessible to group/others: {}",
+                path.display()
+            )
+        },
+    }
 }
 
 fn check_tool_path(name: &str, path: &Path, required: bool) -> DiagnosticCheck {

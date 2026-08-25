@@ -37,6 +37,14 @@ configured library and symbolic links, invoke `fpcalc` with explicit output, tim
 and audio-length bounds, and retain prior evidence when one extraction fails.
 Repeating the same extraction bound is idempotent.
 
+Schema version 18 durably defers an isolated artifact fingerprint failure at its
+requested extraction bound. Ordinary service cycles exclude that artifact instead
+of repeatedly invoking fpcalc and blocking later unfingerprinted artifacts. Missing
+or outdated evidence is prioritized ahead of already-current evidence. An operator
+may explicitly release one artifact with `library retry-fingerprint`; changing the
+configured extraction bound also makes it eligible without discarding the retained
+diagnostic. Successful extraction clears stale deferral evidence.
+
 Raw comparison requires at least 120 overlapping values, searches at most 120 values
 of alignment, permits at most two average differing bits per value, and requires
 durations within three seconds. These deliberately strict near-identity thresholds

@@ -37,6 +37,14 @@ pub struct ServiceConfig {
     pub user_agent: Option<String>,
     /// Explicit yt-dlp adapter executable.
     pub yt_dlp: PathBuf,
+    /// Optional Netscape-format YouTube cookie file kept outside tracked config.
+    pub yt_dlp_cookie_file: Option<PathBuf>,
+    /// Delay between provider extraction requests delegated to yt-dlp.
+    pub yt_dlp_sleep_requests_seconds: u64,
+    /// Minimum randomized delay before each media download.
+    pub yt_dlp_min_sleep_seconds: u64,
+    /// Maximum randomized delay before each media download.
+    pub yt_dlp_max_sleep_seconds: u64,
     /// Explicit ffprobe executable.
     pub ffprobe: PathBuf,
     /// Explicit ffmpeg executable.
@@ -75,6 +83,10 @@ impl Default for ServiceConfig {
             enabled: false,
             user_agent: None,
             yt_dlp: "yt-dlp".into(),
+            yt_dlp_cookie_file: None,
+            yt_dlp_sleep_requests_seconds: 1,
+            yt_dlp_min_sleep_seconds: 5,
+            yt_dlp_max_sleep_seconds: 15,
             ffprobe: "ffprobe".into(),
             ffmpeg: "ffmpeg".into(),
             fpcalc: "fpcalc".into(),
@@ -232,6 +244,24 @@ impl AppConfig {
                     "enabled service tool paths must not be empty".into(),
                 ));
             }
+            if self
+                .service
+                .yt_dlp_cookie_file
+                .as_ref()
+                .is_some_and(|path| path.as_os_str().is_empty())
+            {
+                return Err(ConfigError::Invalid(
+                    "configured yt-dlp cookie path must not be empty".into(),
+                ));
+            }
+            if self.service.yt_dlp_sleep_requests_seconds == 0
+                || self.service.yt_dlp_min_sleep_seconds == 0
+                || self.service.yt_dlp_max_sleep_seconds < self.service.yt_dlp_min_sleep_seconds
+            {
+                return Err(ConfigError::Invalid(
+                    "enabled service yt-dlp pacing must be positive with maximum sleep at least minimum sleep".into(),
+                ));
+            }
         }
         if self.discovery.target_new_tracks_per_day > self.discovery.max_new_tracks_per_day {
             return Err(ConfigError::Invalid(
@@ -333,6 +363,16 @@ mod tests {
         let mut config = valid_config();
         config.discovery.exploration_ratio = 0.8;
         config.discovery.wildcard_ratio = 0.3;
+        assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));
+    }
+
+    #[test]
+    fn rejects_invalid_service_provider_pacing() {
+        let mut config = valid_config();
+        config.service.enabled = true;
+        config.service.user_agent = Some("fixture@example.invalid".into());
+        config.service.yt_dlp_min_sleep_seconds = 20;
+        config.service.yt_dlp_max_sleep_seconds = 10;
         assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));
     }
 }

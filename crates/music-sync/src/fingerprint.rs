@@ -144,7 +144,8 @@ pub fn reconcile_artifact_fingerprints(
             source,
         }
     })?;
-    let candidates = database.artifact_fingerprint_candidates(maximum_artifacts)?;
+    let candidates =
+        database.artifact_fingerprint_candidates(maximum_artifacts, maximum_audio_seconds)?;
     let mut report = FingerprintReport {
         selected: candidates.len() as u64,
         ..FingerprintReport::default()
@@ -159,6 +160,11 @@ pub fn reconcile_artifact_fingerprints(
         let path = match safe_regular_path(&candidate.path, &library) {
             Ok(path) => path,
             Err(message) => {
+                database.defer_artifact_fingerprint(
+                    candidate.artifact_id,
+                    maximum_audio_seconds,
+                    &message,
+                )?;
                 report.failures.push(FingerprintFailure {
                     artifact_id: candidate.artifact_id,
                     path: candidate.path,
@@ -170,10 +176,16 @@ pub fn reconcile_artifact_fingerprints(
         let fingerprint = match fingerprinter.fingerprint(&path) {
             Ok(fingerprint) => fingerprint,
             Err(error) => {
+                let message = error.to_string();
+                database.defer_artifact_fingerprint(
+                    candidate.artifact_id,
+                    maximum_audio_seconds,
+                    &message,
+                )?;
                 report.failures.push(FingerprintFailure {
                     artifact_id: candidate.artifact_id,
                     path: candidate.path,
-                    message: error.to_string(),
+                    message,
                 });
                 continue;
             }
@@ -193,6 +205,7 @@ pub fn reconcile_artifact_fingerprints(
         } else {
             report.unchanged += 1;
         }
+        database.clear_artifact_fingerprint_deferral(candidate.artifact_id)?;
     }
     Ok(report)
 }

@@ -26,6 +26,12 @@ job staging directory. Download output paths are treated as untrusted adapter ou
 relative, multiple, missing, empty, non-regular, and staging-escaping results are
 rejected before any artifact can be committed.
 
+Timer-driven enumeration and acquisition apply configured yt-dlp pacing inside the
+adapter. Extraction requests receive a fixed inter-request delay, while media
+downloads receive bounded randomized sleep. The service defaults to one second
+between requests and five to fifteen seconds before downloads. Explicit operator
+commands remain immediate; pacing policy belongs to autonomous operation.
+
 ## PLANNED
 
 Expand classification with demonstrated geo/cookie/PO-token fixtures.
