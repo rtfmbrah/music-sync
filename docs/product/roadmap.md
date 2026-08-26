@@ -77,5 +77,6 @@ in ad hoc TODO documents.
   atomic versioned release/rollback tooling (complete).
 - Least-privilege LXC compatibility/deployment validation (complete for isolated
   acceptance and production activation with paced provider access, versioned
-  releases, schema 18 state, half-hour sync, and daily backup timers).
+  releases, schema 19 state, named existing-playlist adoption, half-hour sync, and
+  daily backup timers).
 - Production health checks, performance measurement, and repair workflows.

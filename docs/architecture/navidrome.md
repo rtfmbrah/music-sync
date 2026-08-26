@@ -13,6 +13,18 @@ files and directory metadata make normal repeats unchanged and permit exact-byte
 recovery after interruption. Playlist removal changes only membership output;
 acquired audio remains preserved.
 
+Output filenames derive from safe current collection names. Entries are rendered
+relative to the configured playlist directory, not the library root, so a playlist
+below the library resolves sibling media correctly. If the named M3U8 already
+exists, music-sync adopts it: valid known managed entries are deduplicated and all
+other non-comment entries are durably preserved. A prior `collection-<id>.m3u8` is
+retired only when its bytes match music-sync's recorded ownership hash.
+
+Only sources that enumerate a real provider collection produce playlist output.
+Single-video sources retain their provider membership and acquired audio but never
+materialize a one-track M3U. Any legacy output for such a source is retired only
+under the same exact recorded-hash ownership check.
+
 ## PLANNED
 
 Navidrome scans the managed filesystem and remains responsible for playback,

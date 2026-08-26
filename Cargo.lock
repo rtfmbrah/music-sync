@@ -614,6 +614,7 @@ dependencies = [
  "music-sync",
  "rusqlite",
  "serde_json",
+ "sha2",
  "tempfile",
  "tracing",
  "tracing-subscriber",

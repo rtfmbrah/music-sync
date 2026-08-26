@@ -97,6 +97,12 @@ bound, attempt count, diagnostic, and update time. Timer runs skip a matching
 deferral until explicit operator retry, while a different extraction bound remains
 independently eligible.
 
+Schema version 19 stores ordered entries preserved from an adopted named playlist.
+Known managed artifacts are deduplicated against active collection membership;
+unknown existing entries remain byte-path-preserved across later materialization.
+Playlist output ownership may move from the legacy internal-ID filename only after
+the old file matches its recorded SHA-256.
+
 ## PLANNED
 
 Add discovery seeds/candidates and expanded job attempts when a real workflow

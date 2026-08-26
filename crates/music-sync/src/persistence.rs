@@ -54,10 +54,11 @@ const MIGRATIONS: &[(u32, &str)] = &[
         18,
         include_str!("../migrations/0018_artifact_fingerprint_deferrals.sql"),
     ),
+    (19, include_str!("../migrations/0019_playlist_adoption.sql")),
 ];
 
 /// Current durable schema version.
-pub const CURRENT_SCHEMA_VERSION: u32 = 18;
+pub const CURRENT_SCHEMA_VERSION: u32 = 19;
 
 /// A connection to music-sync's private application state.
 #[derive(Debug)]
@@ -3265,12 +3266,13 @@ impl Database {
             });
         }
 
-        let collection_id = source_collection_id(
-            &transaction,
-            source_id,
-            snapshot,
-            source.2.as_deref().unwrap_or(&source.1),
-        )?;
+        let collection_name = source
+            .2
+            .as_deref()
+            .or(snapshot.title.as_deref())
+            .unwrap_or(&source.1);
+        let collection_id =
+            source_collection_id(&transaction, source_id, snapshot, collection_name)?;
         let previously_active = active_membership_ids(&transaction, collection_id)?;
         transaction
             .execute(
@@ -3856,7 +3858,11 @@ impl Database {
     pub fn playlist_snapshots(&self) -> Result<Vec<PlaylistSnapshot>, DatabaseError> {
         let mut statement = self
             .connection
-            .prepare("SELECT id, name FROM collections ORDER BY id")
+            .prepare(
+                "SELECT id, name FROM collections
+                 WHERE provider_collection_id NOT LIKE 'source:%'
+                 ORDER BY id",
+            )
             .map_err(DatabaseError::Sqlite)?;
         let rows = statement
             .query_map([], |row| {
@@ -3900,14 +3906,140 @@ impl Database {
                 .map(|row| row.map(PathBuf::from))
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(DatabaseError::Sqlite)?;
+            let mut preserved = self
+                .connection
+                .prepare(
+                    "SELECT path FROM playlist_preserved_entries
+                     WHERE collection_id = ?1 ORDER BY position",
+                )
+                .map_err(DatabaseError::Sqlite)?;
+            let rows = preserved
+                .query_map([collection_id], |row| row.get::<_, String>(0))
+                .map_err(DatabaseError::Sqlite)?;
+            let preserved_entries = rows
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(DatabaseError::Sqlite)?;
             snapshots.push(PlaylistSnapshot {
                 collection_id,
                 name,
                 unresolved: active.saturating_sub(paths.len() as u64),
                 entries: paths,
+                preserved_entries,
             });
         }
         Ok(snapshots)
+    }
+
+    pub(crate) fn non_playlist_outputs(
+        &self,
+    ) -> Result<Vec<(i64, PlaylistOutputState)>, DatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT collections.id, playlist_outputs.path, playlist_outputs.sha256
+                 FROM collections
+                 JOIN playlist_outputs ON playlist_outputs.collection_id = collections.id
+                 WHERE collections.provider_collection_id LIKE 'source:%'
+                 ORDER BY collections.id",
+            )
+            .map_err(DatabaseError::Sqlite)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    PlaylistOutputState {
+                        path: PathBuf::from(row.get::<_, String>(1)?),
+                        sha256: row.get(2)?,
+                    },
+                ))
+            })
+            .map_err(DatabaseError::Sqlite)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(DatabaseError::Sqlite)
+    }
+
+    pub(crate) fn forget_playlist_output(
+        &mut self,
+        collection_id: i64,
+    ) -> Result<(), DatabaseError> {
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(DatabaseError::Sqlite)?;
+        transaction
+            .execute(
+                "DELETE FROM playlist_preserved_entries WHERE collection_id = ?1",
+                [collection_id],
+            )
+            .map_err(DatabaseError::Sqlite)?;
+        transaction
+            .execute(
+                "DELETE FROM playlist_outputs WHERE collection_id = ?1",
+                [collection_id],
+            )
+            .map_err(DatabaseError::Sqlite)?;
+        transaction.commit().map_err(DatabaseError::Sqlite)
+    }
+
+    pub(crate) fn playlist_output(
+        &self,
+        collection_id: i64,
+    ) -> Result<Option<PlaylistOutputState>, DatabaseError> {
+        self.connection
+            .query_row(
+                "SELECT path, sha256 FROM playlist_outputs WHERE collection_id = ?1",
+                [collection_id],
+                |row| {
+                    Ok(PlaylistOutputState {
+                        path: PathBuf::from(row.get::<_, String>(0)?),
+                        sha256: row.get(1)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(DatabaseError::Sqlite)
+    }
+
+    pub(crate) fn adopt_playlist_output(
+        &mut self,
+        collection_id: i64,
+        path: &Path,
+        sha256: &str,
+        preserved_entries: &[String],
+    ) -> Result<(), DatabaseError> {
+        let path = path
+            .to_str()
+            .ok_or_else(|| DatabaseError::NonUnicodePath(path.to_path_buf()))?;
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(DatabaseError::Sqlite)?;
+        transaction
+            .execute(
+                "INSERT INTO playlist_outputs(collection_id, path, sha256, updated_at)
+                 VALUES (?1, ?2, ?3, CURRENT_TIMESTAMP)
+                 ON CONFLICT(collection_id) DO UPDATE SET
+                   path = excluded.path, sha256 = excluded.sha256,
+                   updated_at = CURRENT_TIMESTAMP",
+                rusqlite::params![collection_id, path, sha256],
+            )
+            .map_err(DatabaseError::Sqlite)?;
+        transaction
+            .execute(
+                "DELETE FROM playlist_preserved_entries WHERE collection_id = ?1",
+                [collection_id],
+            )
+            .map_err(DatabaseError::Sqlite)?;
+        for (position, entry) in preserved_entries.iter().enumerate() {
+            transaction
+                .execute(
+                    "INSERT INTO playlist_preserved_entries(collection_id, position, path)
+                     VALUES (?1, ?2, ?3)",
+                    rusqlite::params![collection_id, position as i64, entry],
+                )
+                .map_err(DatabaseError::Sqlite)?;
+        }
+        transaction.commit().map_err(DatabaseError::Sqlite)
     }
 
     pub(crate) fn prepare_playlist_output(
@@ -4113,7 +4245,7 @@ fn source_collection_id(
     transaction: &Transaction<'_>,
     source_id: SourceId,
     snapshot: &SourceSnapshot,
-    fallback_name: &str,
+    collection_name: &str,
 ) -> Result<i64, DatabaseError> {
     if let Some(id) = transaction
         .query_row(
@@ -4124,18 +4256,23 @@ fn source_collection_id(
         .optional()
         .map_err(DatabaseError::Sqlite)?
     {
+        transaction
+            .execute(
+                "UPDATE collections SET name = ?2 WHERE id = ?1",
+                rusqlite::params![id, collection_name],
+            )
+            .map_err(DatabaseError::Sqlite)?;
         return Ok(id);
     }
     let provider_collection_id = snapshot
         .provider_collection_id
         .clone()
         .unwrap_or_else(|| format!("source:{}", source_id.0));
-    let name = snapshot.title.as_deref().unwrap_or(fallback_name);
     transaction
         .execute(
             "INSERT INTO collections(provider, provider_collection_id, name) VALUES (?1, ?2, ?3)
              ON CONFLICT(provider, provider_collection_id) DO UPDATE SET name = excluded.name",
-            rusqlite::params![snapshot.provider, provider_collection_id, name],
+            rusqlite::params![snapshot.provider, provider_collection_id, collection_name],
         )
         .map_err(DatabaseError::Sqlite)?;
     let collection_id = transaction
@@ -4225,8 +4362,16 @@ pub struct PlaylistSnapshot {
     pub name: String,
     /// Preferred healthy artifacts in membership order.
     pub entries: Vec<PathBuf>,
+    /// Valid existing playlist entries preserved when the named output was adopted.
+    pub preserved_entries: Vec<String>,
     /// Active memberships not yet backed by a preferred healthy artifact.
     pub unresolved: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PlaylistOutputState {
+    pub(crate) path: PathBuf,
+    pub(crate) sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

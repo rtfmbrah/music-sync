@@ -43,8 +43,12 @@
   the failure is attempted only once per batch, and only that deferred job is selected
   by the following batch.
 - Playlist workflow coverage proves ordered creation, unchanged repetition, atomic
-  update after membership removal, preservation of removed audio, and rejection of
-  an unknown existing output without changing its bytes.
+  update after membership removal, preservation of removed audio, and safe adoption
+  of an existing named output without dropping unknown entries.
+- Named-playlist migration coverage proves correct paths relative to a sibling
+  playlist directory, adoption of existing unknown entries, deduplication of known
+  managed entries, exact-hash retirement of a legacy internal-ID output, unchanged
+  repetition, and preservation across later membership removal.
 - Full sync CLI coverage proves all phases complete in one invocation, repeats avoid
   downloads, and one transient source failure preserves its prior membership while
   unrelated reconciliation and playlist work continue.

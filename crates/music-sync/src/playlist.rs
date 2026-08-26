@@ -33,8 +33,18 @@ pub fn materialize_playlists(
             path: playlist_directory.to_path_buf(),
             source,
         })?;
-    let snapshots = database.playlist_snapshots()?;
     let mut report = PlaylistMaterializationReport::default();
+    for (collection_id, output_state) in database.non_playlist_outputs()? {
+        match retire_non_playlist_output(database, collection_id, &output_state) {
+            Ok(()) => {}
+            Err(error) if error.is_database_failure() => return Err(error),
+            Err(error) => report.failures.push(PlaylistFailure {
+                collection_id,
+                message: error.to_string(),
+            }),
+        }
+    }
+    let snapshots = database.playlist_snapshots()?;
     for snapshot in snapshots {
         match materialize_one(database, &snapshot, &library, &output) {
             Ok(result) => report.playlists.push(result),
@@ -48,6 +58,30 @@ pub fn materialize_playlists(
     Ok(report)
 }
 
+fn retire_non_playlist_output(
+    database: &mut Database,
+    collection_id: i64,
+    output: &crate::persistence::PlaylistOutputState,
+) -> Result<(), PlaylistError> {
+    if output.path.exists() {
+        let observed = hex_sha256(
+            Sha256FileHasher
+                .hash(&output.path)
+                .map_err(PlaylistError::Hash)?
+                .sha256,
+        );
+        if output.sha256.as_deref() != Some(observed.as_str()) {
+            return Err(PlaylistError::ExistingMismatch(output.path.clone()));
+        }
+        fs::remove_file(&output.path).map_err(|source| PlaylistError::Write {
+            path: output.path.clone(),
+            source,
+        })?;
+    }
+    database.forget_playlist_output(collection_id)?;
+    Ok(())
+}
+
 fn materialize_one(
     database: &mut Database,
     snapshot: &PlaylistSnapshot,
@@ -56,6 +90,20 @@ fn materialize_one(
 ) -> Result<PlaylistMaterialized, PlaylistError> {
     let mut contents = String::from("#EXTM3U\n");
     let mut omitted = snapshot.unresolved;
+    let final_path = named_playlist_path(database, output, &snapshot.name, snapshot.collection_id)?;
+    migrate_or_adopt_output(database, snapshot, library, &final_path)?;
+    let snapshot = database
+        .playlist_snapshots()?
+        .into_iter()
+        .find(|candidate| candidate.collection_id == snapshot.collection_id)
+        .ok_or(PlaylistError::MissingCollection(snapshot.collection_id))?;
+    let mut rendered = std::collections::BTreeSet::new();
+    for entry in &snapshot.preserved_entries {
+        if !entry.contains(['\n', '\r']) && rendered.insert(entry.clone()) {
+            contents.push_str(entry);
+            contents.push('\n');
+        }
+    }
     for artifact in &snapshot.entries {
         let artifact = match artifact.canonicalize() {
             Ok(path) if path.is_file() => path,
@@ -64,17 +112,20 @@ fn materialize_one(
                 continue;
             }
         };
-        let relative = artifact
+        artifact
             .strip_prefix(library)
             .map_err(|_| PlaylistError::ArtifactOutsideLibrary(artifact.clone()))?;
+        let relative = relative_path(output, &artifact);
         let relative = relative
             .to_str()
             .filter(|path| !path.contains(['\n', '\r']))
             .ok_or_else(|| PlaylistError::UnsafeArtifactPath(relative.to_path_buf()))?;
-        contents.push_str(&relative.replace(std::path::MAIN_SEPARATOR, "/"));
-        contents.push('\n');
+        let relative = relative.replace(std::path::MAIN_SEPARATOR, "/");
+        if rendered.insert(relative.clone()) {
+            contents.push_str(&relative);
+            contents.push('\n');
+        }
     }
-    let final_path = output.join(format!("collection-{}.m3u8", snapshot.collection_id));
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(PlaylistError::Clock)?
@@ -138,10 +189,192 @@ fn materialize_one(
         collection_id: snapshot.collection_id,
         name: snapshot.name.clone(),
         path: final_path,
-        entries: (snapshot.entries.len() as u64).saturating_sub(omitted - snapshot.unresolved),
+        entries: rendered.len() as u64,
         omitted,
         effect,
     })
+}
+
+fn migrate_or_adopt_output(
+    database: &mut Database,
+    snapshot: &PlaylistSnapshot,
+    library: &Path,
+    desired: &Path,
+) -> Result<(), PlaylistError> {
+    let ownership = database.playlist_output(snapshot.collection_id)?;
+    if ownership
+        .as_ref()
+        .is_some_and(|state| state.path == desired)
+    {
+        return Ok(());
+    }
+    if desired.exists() {
+        let desired_hash = hex_sha256(
+            Sha256FileHasher
+                .hash(desired)
+                .map_err(PlaylistError::Hash)?
+                .sha256,
+        );
+        let moved_recovery = ownership
+            .as_ref()
+            .and_then(|state| state.sha256.as_deref())
+            .is_some_and(|sha256| sha256 == desired_hash);
+        let preserved = if moved_recovery {
+            Vec::new()
+        } else {
+            existing_playlist_entries(desired, library, &snapshot.entries)?
+        };
+        if let Some(old) = &ownership {
+            retire_owned_output(&old.path, old.sha256.as_deref(), desired)?;
+        }
+        database.adopt_playlist_output(
+            snapshot.collection_id,
+            desired,
+            &desired_hash,
+            &preserved,
+        )?;
+        return Ok(());
+    }
+    if let Some(old) = ownership
+        && old.path.exists()
+    {
+        let observed = hex_sha256(
+            Sha256FileHasher
+                .hash(&old.path)
+                .map_err(PlaylistError::Hash)?
+                .sha256,
+        );
+        if old.sha256.as_deref() != Some(observed.as_str()) {
+            return Err(PlaylistError::ExistingMismatch(old.path));
+        }
+        fs::rename(&old.path, desired).map_err(|source| PlaylistError::Write {
+            path: desired.to_path_buf(),
+            source,
+        })?;
+        database.adopt_playlist_output(snapshot.collection_id, desired, &observed, &[])?;
+        return Ok(());
+    }
+    Ok(())
+}
+
+fn existing_playlist_entries(
+    path: &Path,
+    library: &Path,
+    managed: &[PathBuf],
+) -> Result<Vec<String>, PlaylistError> {
+    let bytes = fs::read(path).map_err(|source| PlaylistError::Write {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| PlaylistError::UnsafeExistingPlaylist(path.to_path_buf()))?;
+    let managed = managed
+        .iter()
+        .filter_map(|entry| entry.canonicalize().ok())
+        .collect::<std::collections::BTreeSet<_>>();
+    let parent = path
+        .parent()
+        .ok_or_else(|| PlaylistError::UnsafeExistingPlaylist(path.into()))?;
+    let mut preserved = Vec::new();
+    for line in text.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let candidate = if Path::new(line).is_absolute() {
+            PathBuf::from(line)
+        } else {
+            parent.join(line)
+        };
+        let managed_entry = candidate.canonicalize().ok().is_some_and(|candidate| {
+            candidate.starts_with(library) && managed.contains(&candidate)
+        });
+        if !managed_entry && !preserved.iter().any(|entry| entry == line) {
+            preserved.push(line.to_owned());
+        }
+    }
+    Ok(preserved)
+}
+
+fn retire_owned_output(
+    old: &Path,
+    expected_sha256: Option<&str>,
+    desired: &Path,
+) -> Result<(), PlaylistError> {
+    if old == desired || !old.exists() {
+        return Ok(());
+    }
+    let observed = hex_sha256(
+        Sha256FileHasher
+            .hash(old)
+            .map_err(PlaylistError::Hash)?
+            .sha256,
+    );
+    if expected_sha256 != Some(observed.as_str()) {
+        return Err(PlaylistError::ExistingMismatch(old.to_path_buf()));
+    }
+    fs::remove_file(old).map_err(|source| PlaylistError::Write {
+        path: old.to_path_buf(),
+        source,
+    })
+}
+
+fn playlist_stem(name: &str, collection_id: i64) -> String {
+    let stem = name
+        .trim()
+        .chars()
+        .map(|character| match character {
+            '/' | '\\' | '\0' | '\n' | '\r' => '_',
+            character => character,
+        })
+        .collect::<String>();
+    let stem = stem.trim_matches(['.', ' ']);
+    if stem.is_empty() {
+        format!("collection-{collection_id}")
+    } else {
+        stem.to_owned()
+    }
+}
+
+fn named_playlist_path(
+    database: &Database,
+    output: &Path,
+    name: &str,
+    collection_id: i64,
+) -> Result<PathBuf, PlaylistError> {
+    let stem = playlist_stem(name, collection_id);
+    let m3u8 = output.join(format!("{stem}.m3u8"));
+    let m3u = output.join(format!("{stem}.m3u"));
+    let ownership = database.playlist_output(collection_id)?;
+    if ownership.as_ref().is_some_and(|state| state.path == m3u8) {
+        return Ok(m3u8);
+    }
+    if ownership.as_ref().is_some_and(|state| state.path == m3u) {
+        return Ok(m3u);
+    }
+    match (m3u8.exists(), m3u.exists()) {
+        (true, true) => Err(PlaylistError::AmbiguousNamedOutputs { m3u8, m3u }),
+        (true, false) => Ok(m3u8),
+        (false, true) => Ok(m3u),
+        (false, false) => Ok(m3u8),
+    }
+}
+
+fn relative_path(from: &Path, to: &Path) -> PathBuf {
+    let from = from.components().collect::<Vec<_>>();
+    let to = to.components().collect::<Vec<_>>();
+    let common = from
+        .iter()
+        .zip(&to)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let mut relative = PathBuf::new();
+    for _ in common..from.len() {
+        relative.push("..");
+    }
+    for component in &to[common..] {
+        relative.push(component.as_os_str());
+    }
+    relative
 }
 
 fn link_initial(
@@ -248,6 +481,20 @@ pub enum PlaylistError {
     /// SQLite query or ownership state failed.
     #[error(transparent)]
     Database(#[from] DatabaseError),
+    /// A durable collection disappeared during one materialization operation.
+    #[error("playlist collection disappeared during materialization: {0}")]
+    MissingCollection(i64),
+    /// An existing named playlist could not be safely parsed for adoption.
+    #[error("existing playlist is not safe UTF-8 M3U8: {0}")]
+    UnsafeExistingPlaylist(PathBuf),
+    /// Both supported filename extensions already exist without owned disambiguation.
+    #[error("both named playlist outputs exist and ownership cannot disambiguate: {m3u8}, {m3u}")]
+    AmbiguousNamedOutputs {
+        /// Existing UTF-8-extension candidate.
+        m3u8: PathBuf,
+        /// Existing legacy-extension candidate.
+        m3u: PathBuf,
+    },
     /// A configured directory could not be created or resolved.
     #[error("failed to access playlist directory {path}: {source}")]
     Directory {

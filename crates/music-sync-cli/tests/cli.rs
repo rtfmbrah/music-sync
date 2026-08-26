@@ -4,6 +4,8 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
+use sha2::{Digest, Sha256};
+
 #[test]
 fn adopted_provider_links_require_duration_and_fingerprint_proof()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -1177,6 +1179,7 @@ fn playlist_materialization_is_atomic_idempotent_and_tracks_active_membership()
                 "--database",
             ])
             .arg(&database)
+            .args(["--name", "Fixture-Local"])
             .output()?
             .status
             .success()
@@ -1198,17 +1201,36 @@ fn playlist_materialization_is_atomic_idempotent_and_tracks_active_membership()
         .output()?;
     assert!(acquired.status.success());
 
+    let legacy = playlists.join("collection-1.m3u8");
+    let legacy_contents = b"#EXTM3U\nyoutube/one.opus\nyoutube/two.opus\n";
+    fs::write(&legacy, legacy_contents)?;
+    let legacy_sha256 = format!("{:x}", Sha256::digest(legacy_contents));
+    let existing = library.join("existing.opus");
+    fs::write(&existing, b"existing audio")?;
+    let named = playlists.join("Fixture-Local.m3u");
+    fs::write(
+        &named,
+        b"#EXTM3U\n../library/existing.opus\n../library/youtube/one.opus\n",
+    )?;
+    let connection = rusqlite::Connection::open(&database)?;
+    connection.execute(
+        "INSERT INTO playlist_outputs(collection_id, path, sha256) VALUES (1, ?1, ?2)",
+        rusqlite::params![legacy.to_string_lossy(), legacy_sha256],
+    )?;
+    drop(connection);
+
     let config_string = config.to_str().ok_or("non-UTF-8 config path")?;
     let first = run(&["playlist", "materialize", "--config", config_string])?;
     let first_json: serde_json::Value = serde_json::from_slice(&first.stdout)?;
     assert!(first.status.success());
-    assert_eq!(first_json["playlists"][0]["effect"], "created");
-    assert_eq!(first_json["playlists"][0]["entries"], 2);
-    let output = playlists.join("collection-1.m3u8");
+    assert_eq!(first_json["playlists"][0]["effect"], "updated");
+    assert_eq!(first_json["playlists"][0]["entries"], 3);
+    let output = named;
     assert_eq!(
         fs::read_to_string(&output)?,
-        "#EXTM3U\nyoutube/one.opus\nyoutube/two.opus\n"
+        "#EXTM3U\n../library/existing.opus\n../library/youtube/one.opus\n../library/youtube/two.opus\n"
     );
+    assert!(!legacy.exists());
 
     let repeated = run(&["playlist", "materialize", "--config", config_string])?;
     let repeated_json: serde_json::Value = serde_json::from_slice(&repeated.stdout)?;
@@ -1228,7 +1250,10 @@ fn playlist_materialization_is_atomic_idempotent_and_tracks_active_membership()
     let updated_json: serde_json::Value = serde_json::from_slice(&updated.stdout)?;
     assert!(updated.status.success());
     assert_eq!(updated_json["playlists"][0]["effect"], "updated");
-    assert_eq!(fs::read_to_string(output)?, "#EXTM3U\nyoutube/two.opus\n");
+    assert_eq!(
+        fs::read_to_string(output)?,
+        "#EXTM3U\n../library/existing.opus\n../library/youtube/two.opus\n"
+    );
     assert!(library.join("youtube/one.opus").exists());
     assert!(library.join("youtube/two.opus").exists());
     Ok(())
@@ -1256,14 +1281,19 @@ fn playlist_materialization_preserves_unknown_existing_output()
     let yt_dlp = root.path().join("yt-dlp");
     fs::write(
         &yt_dlp,
-        "#!/bin/sh\nprintf '%s' '{\"id\":\"one\",\"webpage_url\":\"https://youtu.be/one\",\"title\":\"One\"}'\n",
+        "#!/bin/sh\nprintf '%s' '{\"id\":\"playlist\",\"title\":\"One\",\"entries\":[{\"id\":\"one\",\"url\":\"https://youtu.be/one\"}]}'\n",
     )?;
     let mut permissions = fs::metadata(&yt_dlp)?.permissions();
     permissions.set_mode(0o700);
     fs::set_permissions(&yt_dlp, permissions)?;
     assert!(
         Command::new(env!("CARGO_BIN_EXE_music-sync"))
-            .args(["source", "add", "https://youtu.be/one", "--database",])
+            .args([
+                "source",
+                "add",
+                "https://www.youtube.com/playlist?list=one",
+                "--database",
+            ])
             .arg(&database)
             .output()?
             .status
@@ -1279,16 +1309,84 @@ fn playlist_materialization_preserves_unknown_existing_output()
             .status
             .success()
     );
-    let output_path = playlists.join("collection-1.m3u8");
+    let output_path = playlists.join("One.m3u8");
     fs::write(&output_path, b"user-owned\n")?;
     let output = Command::new(env!("CARGO_BIN_EXE_music-sync"))
         .args(["--json", "playlist", "materialize", "--config"])
         .arg(&config)
         .output()?;
     let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
-    assert_eq!(output.status.code(), Some(1));
-    assert_eq!(report["failures"].as_array().map(Vec::len), Some(1));
-    assert_eq!(fs::read(output_path)?, b"user-owned\n");
+    assert!(output.status.success());
+    assert_eq!(report["failures"].as_array().map(Vec::len), Some(0));
+    assert_eq!(fs::read(output_path)?, b"#EXTM3U\nuser-owned\n");
+    Ok(())
+}
+
+#[test]
+fn playlist_materialization_retires_owned_single_track_output()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = tempfile::tempdir()?;
+    let state = root.path().join("state");
+    let library = root.path().join("library");
+    let playlists = root.path().join("playlists");
+    fs::create_dir_all(&state)?;
+    fs::create_dir_all(&library)?;
+    fs::create_dir_all(&playlists)?;
+    let database = state.join("music-sync.sqlite3");
+    let config = root.path().join("music-sync.toml");
+    fs::write(
+        &config,
+        format!(
+            "state_directory = {:?}\nlibrary_directory = {:?}\nplaylist_directory = {:?}\n",
+            state, library, playlists
+        ),
+    )?;
+    let yt_dlp = root.path().join("yt-dlp");
+    fs::write(
+        &yt_dlp,
+        "#!/bin/sh\nprintf '%s' '{\"id\":\"one\",\"webpage_url\":\"https://youtu.be/one\",\"title\":\"One\"}'\n",
+    )?;
+    let mut permissions = fs::metadata(&yt_dlp)?.permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&yt_dlp, permissions)?;
+    assert!(
+        Command::new(env!("CARGO_BIN_EXE_music-sync"))
+            .args(["source", "add", "https://youtu.be/one", "--database"])
+            .arg(&database)
+            .output()?
+            .status
+            .success()
+    );
+    assert!(
+        Command::new(env!("CARGO_BIN_EXE_music-sync"))
+            .args(["source", "reconcile", "1", "--database"])
+            .arg(&database)
+            .arg("--yt-dlp")
+            .arg(&yt_dlp)
+            .output()?
+            .status
+            .success()
+    );
+    let legacy = playlists.join("collection-1.m3u8");
+    let contents = b"#EXTM3U\n";
+    fs::write(&legacy, contents)?;
+    let sha256 = format!("{:x}", Sha256::digest(contents));
+    let connection = rusqlite::Connection::open(&database)?;
+    connection.execute(
+        "INSERT INTO playlist_outputs(collection_id, path, sha256) VALUES (1, ?1, ?2)",
+        rusqlite::params![legacy.to_string_lossy(), sha256],
+    )?;
+    drop(connection);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_music-sync"))
+        .args(["--json", "playlist", "materialize", "--config"])
+        .arg(&config)
+        .output()?;
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert!(output.status.success());
+    assert_eq!(report["playlists"].as_array().map(Vec::len), Some(0));
+    assert_eq!(report["failures"].as_array().map(Vec::len), Some(0));
+    assert!(!legacy.exists());
     Ok(())
 }
 
@@ -1368,7 +1466,7 @@ fn sync_run_completes_all_phases_and_isolates_one_source_failure()
         first_report["playlists"]["playlists"]
             .as_array()
             .map(Vec::len),
-        Some(2)
+        Some(0)
     );
     assert!(library.join("youtube/one.opus").exists());
     assert!(library.join("youtube/two.opus").exists());
@@ -1387,10 +1485,7 @@ fn sync_run_completes_all_phases_and_isolates_one_source_failure()
             .map(Vec::len),
         Some(0)
     );
-    assert_eq!(
-        fs::read_to_string(playlists.join("collection-2.m3u8"))?,
-        "#EXTM3U\nyoutube/two.opus\n"
-    );
+    assert!(fs::read_dir(&playlists)?.next().is_none());
     let history = Command::new(env!("CARGO_BIN_EXE_music-sync"))
         .args(["--json", "runs", "history", "--config"])
         .arg(&config)

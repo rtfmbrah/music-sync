@@ -271,6 +271,17 @@ successful service cycle. Production then reported 1,561 healthy artifacts, 1,12
 succeeded acquisition jobs, no pending/running work, and no missing or corrupt
 audio.
 
+Named playlist adoption was accepted and deployed on 2026-08-26 with schema 19 and
+release `0.1.0-20260826.5`. An isolated copy of production state proved that the
+eight real YouTube playlist sources adopted their existing `.m3u` files, while the
+four single-video sources produced no playlist output. The production upgrade first
+created a consistent SQLite backup and a complete copy of `/srv/music/_playlists`,
+then retired only legacy `collection-<id>.m3u8` files whose bytes matched their
+recorded music-sync SHA-256. A repeated materialization was unchanged. Final doctor
+reported schema 19; status reported eight playlist outputs, 1,562 healthy artifacts,
+and no missing or corrupt artifacts. No audio was modified or deleted, and the
+half-hour timer remained active after acceptance.
+
 The composed command was validated on 2026-08-24 with the static-musl binary and
 offline two-item fixtures under `/srv/music-sync-v2-test/sync-20260824`. Its first
 run reconciled one source, committed two acquisitions, and created one ordered
