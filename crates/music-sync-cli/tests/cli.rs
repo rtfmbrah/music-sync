@@ -7,6 +7,157 @@ use std::process::Command;
 use sha2::{Digest, Sha256};
 
 #[test]
+fn simple_list_full_reports_strict_member_states() -> Result<(), Box<dyn std::error::Error>> {
+    let root = tempfile::tempdir()?;
+    let state = root.path().join("state");
+    let library = root.path().join("library");
+    let playlists = root.path().join("playlists");
+    fs::create_dir(&library)?;
+    fs::create_dir(&playlists)?;
+    let config = root.path().join("config.toml");
+    fs::write(
+        &config,
+        format!(
+            "state_directory = {state:?}\nlibrary_directory = {library:?}\nplaylist_directory = {playlists:?}\n"
+        ),
+    )?;
+    let database_path = state.join("music-sync.sqlite3");
+    drop(music_sync::persistence::Database::open(&database_path)?);
+    let connection = rusqlite::Connection::open(&database_path)?;
+    connection.execute("INSERT INTO sources(provider,url,name) VALUES ('youtube','https://www.youtube.com/playlist?list=tree','Tree')", [])?;
+    connection.execute("INSERT INTO collections(provider,provider_collection_id,name) VALUES ('youtube','tree','Tree')", [])?;
+    connection.execute(
+        "INSERT INTO source_collections(source_id,collection_id) VALUES (1,1)",
+        [],
+    )?;
+    connection.execute(
+        "INSERT INTO sync_runs(status,finished_at) VALUES ('succeeded',CURRENT_TIMESTAMP)",
+        [],
+    )?;
+    for (offset, (provider_id, availability, job_status)) in [
+        ("ok", "permanently_unavailable", "succeeded"),
+        ("new", "available", "pending"),
+        ("bad", "available", "deferred"),
+        ("gone", "available", "deferred"),
+        ("rights", "available", "deferred"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        connection.execute(
+            "INSERT INTO provider_items(provider,provider_item_id,original_url,source_title,availability) VALUES ('youtube',?1,?2,?3,?4)",
+            rusqlite::params![provider_id, format!("https://youtu.be/{provider_id}"), format!("Title {provider_id}"), availability],
+        )?;
+        let item_id = i64::try_from(offset + 1)?;
+        connection.execute(
+            "INSERT INTO collection_memberships(collection_id,provider_item_id,active,position) VALUES (1,?1,1,?2)",
+            rusqlite::params![item_id, item_id - 1],
+        )?;
+        connection.execute(
+            "INSERT INTO jobs(run_id,kind,status,idempotency_key) VALUES (1,'acquire',?1,?2)",
+            rusqlite::params![job_status, format!("acquire:youtube:{provider_id}")],
+        )?;
+        connection.execute(
+            "INSERT INTO acquisition_jobs(job_id,provider_item_id) VALUES (?1,?1)",
+            [item_id],
+        )?;
+    }
+    connection.execute("INSERT INTO recordings DEFAULT VALUES", [])?;
+    let healthy = library.join("ok.opus");
+    fs::write(&healthy, b"healthy")?;
+    connection.execute(
+        "INSERT INTO artifacts(recording_id,path,health) VALUES (1,?1,'healthy')",
+        [healthy.to_str().ok_or("non-Unicode fixture path")?],
+    )?;
+    connection.execute(
+        "UPDATE recordings SET preferred_artifact_id=1 WHERE id=1",
+        [],
+    )?;
+    connection.execute(
+        "UPDATE provider_items SET recording_id=1 WHERE provider_item_id='ok'",
+        [],
+    )?;
+    connection.execute("INSERT INTO events(run_id,job_id,level,component,event,message) VALUES (1,4,'warning','acquisition','acquisition_deferred','provider failure (PermanentlyUnavailable): Video unavailable')", [])?;
+    connection.execute("INSERT INTO events(run_id,job_id,level,component,event,message) VALUES (1,5,'warning','acquisition','acquisition_deferred','Video unavailable due to copyright claim')", [])?;
+    drop(connection);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_music-sync"))
+        .args(["--json", "list", "--full", "--config"])
+        .arg(&config)
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let statuses = report[0]["members"]
+        .as_array()
+        .ok_or("members must be an array")?
+        .iter()
+        .map(|member| member["status"].as_str().unwrap_or_default())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        statuses,
+        ["success", "pending", "failed", "missing", "copyright"]
+    );
+    Ok(())
+}
+
+#[test]
+fn simple_duplicates_is_read_only_and_separates_evidence() -> Result<(), Box<dyn std::error::Error>>
+{
+    let root = tempfile::tempdir()?;
+    let state = root.path().join("state");
+    let library = root.path().join("library");
+    let playlists = root.path().join("playlists");
+    fs::create_dir(&library)?;
+    fs::create_dir(&playlists)?;
+    let config = root.path().join("config.toml");
+    fs::write(
+        &config,
+        format!(
+            "state_directory = {state:?}\nlibrary_directory = {library:?}\nplaylist_directory = {playlists:?}\n"
+        ),
+    )?;
+    let database_path = state.join("music-sync.sqlite3");
+    drop(music_sync::persistence::Database::open(&database_path)?);
+    let connection = rusqlite::Connection::open(&database_path)?;
+    let values = serde_json::to_string(&(0..130_u32).collect::<Vec<_>>())?;
+    for id in 1..=3_i64 {
+        connection.execute("INSERT INTO recordings(id) VALUES (?1)", [id])?;
+        let path = library.join(format!("{id}.opus"));
+        fs::write(&path, format!("audio {id}"))?;
+        connection.execute(
+            "INSERT INTO artifacts(id,recording_id,path,sha256,duration_ms,health) VALUES (?1,?1,?2,?3,120000,'healthy')",
+            rusqlite::params![id, path.to_str().ok_or("non-Unicode fixture path")?, if id < 3 { "same" } else { "different" }],
+        )?;
+        connection.execute(
+            "INSERT INTO artifact_fingerprints(artifact_id,algorithm,max_seconds,duration_ms,fingerprint_json,value_count) VALUES (?1,2,120,120000,?2,130)",
+            rusqlite::params![id, values],
+        )?;
+    }
+    drop(connection);
+    let before = fs::read(&database_path)?;
+    let output = Command::new(env!("CARGO_BIN_EXE_music-sync"))
+        .args(["--json", "duplicates", "--config"])
+        .arg(&config)
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(report["groups"][0]["evidence"], "exact_bytes");
+    assert_eq!(report["groups"][1]["evidence"], "audio_match_candidate");
+    assert_eq!(fs::read(&database_path)?, before);
+    assert!(!database_path.with_extension("sqlite3-wal").exists());
+    assert!(!database_path.with_extension("sqlite3-shm").exists());
+    Ok(())
+}
+
+#[test]
 fn adopted_provider_links_require_duration_and_fingerprint_proof()
 -> Result<(), Box<dyn std::error::Error>> {
     let root = tempfile::tempdir()?;
@@ -575,8 +726,19 @@ fn help_describes_only_implemented_commands() -> Result<(), Box<dyn std::error::
     let stdout = String::from_utf8(output.stdout)?;
     assert!(output.status.success());
     assert!(stdout.contains("doctor"));
-    assert!(stdout.contains("library"));
-    assert!(!stdout.contains("sync\n"));
+    assert!(stdout.contains("list"));
+    assert!(stdout.contains("duplicates"));
+    assert!(stdout.contains("sync"));
+    assert!(
+        !stdout
+            .lines()
+            .any(|line| line.trim_start().starts_with("library "))
+    );
+    assert!(
+        !stdout
+            .lines()
+            .any(|line| line.trim_start().starts_with("acquisition "))
+    );
     Ok(())
 }
 

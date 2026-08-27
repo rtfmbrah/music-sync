@@ -313,6 +313,190 @@ impl Database {
         })
     }
 
+    /// Reads configured sources and their active provider members without mutation.
+    pub fn source_tree_read_only(path: &Path) -> Result<Vec<SourceTreeEntry>, DatabaseError> {
+        let connection = open_immutable_current_schema(path)?;
+        let mut sources_statement = connection
+            .prepare(
+                "SELECT sources.id, sources.provider, sources.url, sources.name,
+                        sources.active, collections.provider_collection_id
+                 FROM sources
+                 LEFT JOIN source_collections ON source_collections.source_id = sources.id
+                 LEFT JOIN collections ON collections.id = source_collections.collection_id
+                 WHERE sources.active = 1
+                 ORDER BY sources.id",
+            )
+            .map_err(DatabaseError::Sqlite)?;
+        let source_rows = sources_statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, bool>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                ))
+            })
+            .map_err(DatabaseError::Sqlite)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(DatabaseError::Sqlite)?;
+        drop(sources_statement);
+
+        let mut result = Vec::with_capacity(source_rows.len());
+        for (id, provider, url, name, active, provider_collection_id) in source_rows {
+            let mut members_statement = connection
+                .prepare(
+                    "SELECT provider_items.provider_item_id, provider_items.source_title,
+                            collection_memberships.position, provider_items.availability,
+                            jobs.status, artifacts.health,
+                            (SELECT metadata_observations.value
+                             FROM metadata_selections
+                             JOIN metadata_observations ON metadata_observations.id =
+                                  metadata_selections.observation_id
+                             WHERE metadata_selections.recording_id = recordings.id
+                               AND metadata_selections.field = 'title'),
+                            (SELECT metadata_observations.value
+                             FROM metadata_selections
+                             JOIN metadata_observations ON metadata_observations.id =
+                                  metadata_selections.observation_id
+                             WHERE metadata_selections.recording_id = recordings.id
+                               AND metadata_selections.field = 'artist_credit'),
+                            (SELECT events.message FROM events
+                             WHERE events.job_id = jobs.id
+                               AND events.level IN ('warning', 'error')
+                             ORDER BY events.id DESC LIMIT 1)
+                     FROM source_collections
+                     JOIN collection_memberships ON collection_memberships.collection_id =
+                          source_collections.collection_id
+                     JOIN provider_items ON provider_items.id =
+                          collection_memberships.provider_item_id
+                     LEFT JOIN acquisition_jobs ON acquisition_jobs.provider_item_id =
+                          provider_items.id
+                     LEFT JOIN jobs ON jobs.id = acquisition_jobs.job_id
+                     LEFT JOIN recordings ON recordings.id = provider_items.recording_id
+                     LEFT JOIN artifacts ON artifacts.id = recordings.preferred_artifact_id
+                     WHERE source_collections.source_id = ?1
+                       AND collection_memberships.active = 1
+                     ORDER BY collection_memberships.position, provider_items.id",
+                )
+                .map_err(DatabaseError::Sqlite)?;
+            let members = members_statement
+                .query_map([id], |row| {
+                    let availability: String = row.get(3)?;
+                    let job_status: Option<String> = row.get(4)?;
+                    let artifact_health: Option<String> = row.get(5)?;
+                    let diagnostic: Option<String> = row.get(8)?;
+                    Ok(SourceTreeMember {
+                        provider_item_id: row.get(0)?,
+                        provider_title: row.get(1)?,
+                        position: row.get(2)?,
+                        canonical_title: row.get(6)?,
+                        canonical_artist: row.get(7)?,
+                        status: source_member_status(
+                            &availability,
+                            job_status.as_deref(),
+                            artifact_health.as_deref(),
+                            diagnostic.as_deref(),
+                        ),
+                        diagnostic,
+                    })
+                })
+                .map_err(DatabaseError::Sqlite)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(DatabaseError::Sqlite)?;
+            result.push(SourceTreeEntry {
+                source: ConfiguredSource {
+                    id: SourceId(id),
+                    provider,
+                    url,
+                    name,
+                    active,
+                },
+                provider_collection_id: provider_collection_id
+                    .filter(|value| !value.starts_with("source:")),
+                members,
+            });
+        }
+        Ok(result)
+    }
+
+    /// Reads healthy artifact identity evidence for an offline duplicate report.
+    pub fn duplicate_evidence_read_only(
+        path: &Path,
+    ) -> Result<Vec<DuplicateArtifactEvidence>, DatabaseError> {
+        let connection = open_immutable_current_schema(path)?;
+        let mut statement = connection
+            .prepare(
+                "SELECT artifacts.id, artifacts.recording_id, artifacts.path,
+                        artifacts.sha256, artifacts.duration_ms,
+                        artifact_fingerprints.duration_ms,
+                        artifact_fingerprints.fingerprint_json,
+                        (SELECT metadata_observations.value
+                         FROM metadata_selections
+                         JOIN metadata_observations ON metadata_observations.id =
+                              metadata_selections.observation_id
+                         WHERE metadata_selections.recording_id = recordings.id
+                           AND metadata_selections.field = 'title'),
+                        (SELECT metadata_observations.value
+                         FROM metadata_selections
+                         JOIN metadata_observations ON metadata_observations.id =
+                              metadata_selections.observation_id
+                         WHERE metadata_selections.recording_id = recordings.id
+                           AND metadata_selections.field = 'artist_credit')
+                 FROM artifacts
+                 JOIN recordings ON recordings.id = artifacts.recording_id
+                 LEFT JOIN artifact_fingerprints ON artifact_fingerprints.artifact_id =
+                      artifacts.id
+                 WHERE artifacts.health = 'healthy'
+                 ORDER BY artifacts.id",
+            )
+            .map_err(DatabaseError::Sqlite)?;
+        let artifact_rows = statement
+            .query_map([], |row| {
+                Ok(DuplicateArtifactEvidence {
+                    artifact_id: row.get(0)?,
+                    recording_id: row.get(1)?,
+                    path: PathBuf::from(row.get::<_, String>(2)?),
+                    sha256: row.get(3)?,
+                    duration_ms: row.get(4)?,
+                    fingerprint_duration_ms: row.get(5)?,
+                    fingerprint_json: row.get(6)?,
+                    canonical_title: row.get(7)?,
+                    canonical_artist: row.get(8)?,
+                    provider_objects: Vec::new(),
+                })
+            })
+            .map_err(DatabaseError::Sqlite)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(DatabaseError::Sqlite)?;
+        drop(statement);
+
+        let mut result = Vec::with_capacity(artifact_rows.len());
+        for mut artifact in artifact_rows {
+            let mut provider_statement = connection
+                .prepare(
+                    "SELECT provider, provider_item_id
+                     FROM provider_items
+                     WHERE recording_id = ?1
+                     ORDER BY provider, provider_item_id",
+                )
+                .map_err(DatabaseError::Sqlite)?;
+            artifact.provider_objects = provider_statement
+                .query_map([artifact.recording_id], |row| {
+                    Ok(ProviderObjectReference {
+                        provider: row.get(0)?,
+                        provider_item_id: row.get(1)?,
+                    })
+                })
+                .map_err(DatabaseError::Sqlite)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(DatabaseError::Sqlite)?;
+            result.push(artifact);
+        }
+        Ok(result)
+    }
+
     /// Starts one mutually exclusive durable service cycle.
     pub fn start_service_run(
         &mut self,
@@ -4427,6 +4611,118 @@ fn apply_migration(
 pub struct DatabaseInspection {
     /// Schema version declared by SQLite.
     pub version: u32,
+}
+
+/// One configured source with its currently active provider members.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SourceTreeEntry {
+    /// Durable source configuration.
+    pub source: ConfiguredSource,
+    /// Real provider collection ID, absent for a single-video source.
+    pub provider_collection_id: Option<String>,
+    /// Active provider members in provider order.
+    pub members: Vec<SourceTreeMember>,
+}
+
+/// One active provider member and its locally derived synchronization state.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SourceTreeMember {
+    /// Provider-owned object ID; not a recording identity.
+    pub provider_item_id: String,
+    /// Provider order when supplied by the source snapshot.
+    pub position: Option<i64>,
+    /// Provider-supplied title retained without parsing guesses.
+    pub provider_title: Option<String>,
+    /// Canonical selected title when independently resolved.
+    pub canonical_title: Option<String>,
+    /// Canonical selected artist credit when independently resolved.
+    pub canonical_artist: Option<String>,
+    /// Strict status derived from durable local and provider evidence.
+    pub status: SourceMemberStatus,
+    /// Latest durable failure diagnostic when present.
+    pub diagnostic: Option<String>,
+}
+
+/// Operator-facing state of one source member.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceMemberStatus {
+    /// A healthy preferred local artifact exists, regardless of remote state.
+    Success,
+    /// Acquisition is new, pending, or currently running.
+    Pending,
+    /// No healthy artifact exists and explicit durable evidence names copyright.
+    Copyright,
+    /// No healthy artifact exists and the provider object is permanently unavailable.
+    Missing,
+    /// No healthy artifact exists and acquisition failed or was deferred.
+    Failed,
+}
+
+/// Read-only healthy artifact evidence used by duplicate analysis.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DuplicateArtifactEvidence {
+    /// Durable physical artifact ID.
+    pub artifact_id: i64,
+    /// Durable recording currently associated with the artifact.
+    pub recording_id: i64,
+    /// Registered local media path.
+    pub path: PathBuf,
+    /// Exact byte digest when known.
+    pub sha256: Option<String>,
+    /// Structurally probed duration when known.
+    pub duration_ms: Option<i64>,
+    /// Duration emitted with raw Chromaprint evidence.
+    pub fingerprint_duration_ms: Option<i64>,
+    /// Raw algorithm-2 Chromaprint JSON array when known.
+    pub fingerprint_json: Option<String>,
+    /// Independently selected canonical title when available.
+    pub canonical_title: Option<String>,
+    /// Independently selected canonical artist credit when available.
+    pub canonical_artist: Option<String>,
+    /// Provider objects associated with the artifact's current recording.
+    pub provider_objects: Vec<ProviderObjectReference>,
+}
+
+/// Provider-owned identity associated with one recording.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+pub struct ProviderObjectReference {
+    /// Provider adapter name.
+    pub provider: String,
+    /// Provider-owned object ID; not a recording identity.
+    pub provider_item_id: String,
+}
+
+fn source_member_status(
+    availability: &str,
+    job_status: Option<&str>,
+    artifact_health: Option<&str>,
+    diagnostic: Option<&str>,
+) -> SourceMemberStatus {
+    if artifact_health == Some("healthy") {
+        return SourceMemberStatus::Success;
+    }
+    let explicitly_copyright = diagnostic.is_some_and(|message| {
+        let message = message.to_ascii_lowercase();
+        message.contains("copyright") || message.contains("copyrighted")
+    });
+    let explicitly_missing = diagnostic.is_some_and(|message| {
+        let message = message.to_ascii_lowercase();
+        message.contains("provider failure (permanentlyunavailable)")
+            || message.contains("video unavailable")
+            || message.contains("private video")
+            || message.contains("has been removed")
+            || message.contains("no longer available")
+    });
+    if explicitly_copyright {
+        SourceMemberStatus::Copyright
+    } else if availability == "permanently_unavailable" || explicitly_missing {
+        SourceMemberStatus::Missing
+    } else if matches!(job_status, Some("failed" | "deferred" | "succeeded")) {
+        SourceMemberStatus::Failed
+    } else {
+        SourceMemberStatus::Pending
+    }
 }
 
 /// Read-only durable operational summary.

@@ -51,6 +51,15 @@ durations within three seconds. These deliberately strict near-identity threshol
 produce match, mismatch, or insufficient-evidence results; they do not identify
 covers or infer identity from names.
 
+The read-only `duplicates` report reuses this exact strict comparator without
+promoting a match to canonical identity. It reports exact SHA-256 groups, multiple
+healthy artifacts associated with one provider object, and duration-compatible raw
+Chromaprint match candidates as separate evidence classes. Exact-byte equality does
+not authorize deletion, provider identity is not recording identity, and a
+fingerprint match remains an operator-review candidate. Artifacts lacking usable
+fingerprints are counted explicitly. The report neither contacts providers nor
+changes SQLite or media.
+
 Schema version 8 separates repair cases and candidate attempts from acquisition jobs.
 The explicit `repair assess` workflow checks only active provider items whose
 preferred artifact is already missing or corrupt. A durable eligible case requires a

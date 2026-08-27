@@ -55,6 +55,13 @@
 - Status black-box coverage creates a deferred acquisition and proves typed counts
   and its warning event are reported without changing database bytes, SQLite sidecar
   files, library files, or playlist files.
+- Simplified-CLI black-box coverage proves the primary help hides technical command
+  groups while keeping them callable, and validates `list --full` precedence across
+  success, pending, failed, missing, and copyright evidence. A healthy local artifact
+  remains successful despite permanent remote state.
+- Duplicate-report unit and black-box coverage separates exact-byte groups from
+  strict audio-match candidates and proves immutable execution leaves database bytes,
+  SQLite sidecars, and media unchanged.
 - Acquisition transition coverage proves deferred jobs are not selected by ordinary
   runs, explicit retry is audited and attempted later, succeeded work cannot be
   released again, abandoned running recovery retains staging, and immutable history

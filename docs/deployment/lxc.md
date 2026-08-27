@@ -282,6 +282,26 @@ reported schema 19; status reported eight playlist outputs, 1,562 healthy artifa
 and no missing or corrupt artifacts. No audio was modified or deleted, and the
 half-hour timer remained active after acceptance.
 
+The simplified operator CLI and immutable duplicate report were accepted against a
+consistent production-state copy on 2026-08-27. `list --full` classified all 1,571
+active members across eight playlist and four single-video sources in 156 ms: 1,129
+had healthy local audio, 321 retained failed/deferred acquisition diagnostics, 120
+were explicitly missing, and one carried explicit copyright evidence. Healthy local
+audio took precedence over every provider state. The duplicate report considered
+1,562 healthy artifacts, used 1,473 stored raw fingerprints, explicitly counted 89
+with insufficient fingerprint evidence, and produced 125 evidence groups in 8.526
+seconds. The copied SQLite SHA-256 was identical before and after both commands and
+no WAL or shared-memory sidecars were created. No provider or media file was read or
+changed by either report.
+
+Production release `0.1.0-20260827.6` activated the accepted CLI on 2026-08-27
+without a schema change. A consistent pre-upgrade SQLite backup was created first.
+Installed `doctor` passed every configuration, directory, schema-19, tool, secret,
+filesystem, and endpoint check using the default production config path. Direct
+production `list --full` and `duplicates` repeated the accepted 12-source,
+1,571-member, and 125-group results; the production SQLite SHA-256 was identical
+before and after. The timer was restored after validation.
+
 The composed command was validated on 2026-08-24 with the static-musl binary and
 offline two-item fixtures under `/srv/music-sync-v2-test/sync-20260824`. Its first
 run reconciled one source, committed two acquisitions, and created one ordered

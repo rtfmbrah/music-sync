@@ -59,6 +59,21 @@ named snapshot in an existing operator-provisioned directory. It never overwrite
 snapshot and does not delete old backups; retention remains an explicit operator
 policy.
 
+The public operator help is deliberately small: `list`, `add`, `remove`,
+`duplicates`, `backup`, `doctor`, `sync`, and `status`. Existing subsystem commands
+remain callable but hidden from primary help for deployment and recovery
+compatibility. Bare `sync` runs the same complete cycle as `service run`; the older
+`sync run` core cycle remains available. `status history` exposes durable service
+history and `status watch` follows the systemd unit journal.
+
+`list` reads configured playlist and single-video sources immutably. `list --full`
+adds active members in provider order with provider ID, proven canonical
+artist/title when available, and a strict operator state. Healthy preferred local
+audio always wins as `success`; new/running work is `pending`; explicit persisted
+copyright and permanent-unavailability diagnostics become `copyright` and
+`missing`; other deferred or terminal work is `failed` with its stored diagnostic.
+Provider titles are retained rather than split to guess artist identity.
+
 `just test-performance` runs the complete deterministic offline service cycle twice,
 checks idempotency and exclusivity, and fails if execution exceeds a deliberately
 generous ten-second regression ceiling. Build time is excluded. Target-LXC acceptance

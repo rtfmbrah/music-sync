@@ -25,6 +25,7 @@ use music_sync::content_hash::Sha256FileHasher;
 use music_sync::diagnostics::{CheckStatus, DoctorReport, run_doctor};
 use music_sync::discovery::{DfFreeSpace, run_discovery};
 use music_sync::discovery_routing::route_approved_discovery;
+use music_sync::duplicates::{DuplicateEvidenceKind, analyze_duplicates};
 use music_sync::fingerprint::{Fpcalc, reconcile_artifact_fingerprints};
 use music_sync::health::reconcile_artifact_health;
 use music_sync::listenbrainz::ListenBrainz;
@@ -35,6 +36,7 @@ use music_sync::musicbrainz::MusicBrainz;
 use music_sync::navidrome::NavidromeFavorites;
 use music_sync::persistence::{
     Database, ServiceRunHistoryStatus, ServiceRunTerminalStatus, ServiceRunTrigger,
+    SourceMemberStatus, SourceTreeEntry,
 };
 use music_sync::playlist::{PlaylistMaterializationReport, materialize_playlists};
 use music_sync::provider::{SourceId, SourceSnapshot, is_supported_youtube_url};
@@ -79,82 +81,142 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// List configured playlist and single-track sources without provider access.
+    List {
+        /// Include every active member with local synchronization status.
+        #[arg(long)]
+        full: bool,
+        /// TOML configuration identifying application state.
+        #[arg(short, long, default_value = "/etc/music-sync/music-sync.toml")]
+        config: PathBuf,
+    },
+    /// Add or reactivate one supported source.
+    Add {
+        /// HTTPS YouTube video or playlist URL.
+        url: String,
+        /// Optional user-facing source name.
+        #[arg(long)]
+        name: Option<String>,
+        /// TOML configuration identifying application state.
+        #[arg(short, long, default_value = "/etc/music-sync/music-sync.toml")]
+        config: PathBuf,
+    },
+    /// Disable one source while preserving all local audio.
+    Remove {
+        /// Durable source ID shown by `list`.
+        id: i64,
+        /// TOML configuration identifying application state.
+        #[arg(short, long, default_value = "/etc/music-sync/music-sync.toml")]
+        config: PathBuf,
+    },
+    /// Report exact and conservatively fingerprint-matched duplicate artifacts.
+    Duplicates {
+        /// TOML configuration identifying application state.
+        #[arg(short, long, default_value = "/etc/music-sync/music-sync.toml")]
+        config: PathBuf,
+    },
+    /// Create a consistent database snapshot using configured backup storage.
+    Backup {
+        /// Existing destination directory; defaults to configured backup storage.
+        #[arg(long)]
+        directory: Option<PathBuf>,
+        /// TOML configuration identifying application state.
+        #[arg(short, long, default_value = "/etc/music-sync/music-sync.toml")]
+        config: PathBuf,
+    },
     /// Check configuration, local paths, database health, and media tools.
     Doctor {
         /// TOML configuration file to validate.
-        #[arg(short, long, default_value = "music-sync.toml")]
+        #[arg(short, long, default_value = "/etc/music-sync/music-sync.toml")]
         config: PathBuf,
     },
     /// Inspect or adopt an existing generic music library.
+    #[command(hide = true)]
     Library {
         #[command(subcommand)]
         command: LibraryCommand,
     },
     /// Inspect remote source membership without downloading media.
+    #[command(hide = true)]
     Source {
         #[command(subcommand)]
         command: SourceCommand,
     },
     /// Process durable media acquisition jobs.
+    #[command(hide = true)]
     Acquisition {
         #[command(subcommand)]
         command: AcquisitionCommand,
     },
     /// Assess and process conservative lost-media repair cases.
+    #[command(hide = true)]
     Repair {
         #[command(subcommand)]
         command: RepairCommand,
     },
     /// Resolve canonical recording, artist, and release metadata.
+    #[command(hide = true)]
     Metadata {
         #[command(subcommand)]
         command: MetadataCommand,
     },
     /// Resolve and immutably cache canonical release artwork.
+    #[command(hide = true)]
     Artwork {
         #[command(subcommand)]
         command: ArtworkCommand,
     },
     /// Resolve and materialize adjacent synchronized or plain lyrics.
+    #[command(hide = true)]
     Lyrics {
         #[command(subcommand)]
         command: LyricsCommand,
     },
     /// Generate explainable recommendations within hard safety budgets.
+    #[command(hide = true)]
     Discovery {
         #[command(subcommand)]
         command: DiscoveryCommand,
     },
     /// Materialize Navidrome-compatible playlists from durable collections.
+    #[command(hide = true)]
     Playlist {
         #[command(subcommand)]
         command: PlaylistCommand,
     },
-    /// Run one bounded source, acquisition, and playlist synchronization cycle.
+    /// Run the complete autonomous cycle; `sync run` remains a compatible core cycle.
     Sync {
         #[command(subcommand)]
-        command: SyncCommand,
+        command: Option<SyncCommand>,
+        /// TOML configuration used by the complete bare `sync` command.
+        #[arg(short, long, default_value = "/etc/music-sync/music-sync.toml")]
+        config: PathBuf,
     },
     /// Run the complete bounded autonomous service cycle.
+    #[command(hide = true)]
     Service {
         #[command(subcommand)]
         command: ServiceCommand,
     },
     /// Show read-only durable operational state without contacting providers.
     Status {
+        #[command(subcommand)]
+        command: Option<StatusCommand>,
         /// TOML configuration identifying the application database.
-        #[arg(short, long, default_value = "music-sync.toml")]
+        #[arg(short, long, default_value = "/etc/music-sync/music-sync.toml")]
         config: PathBuf,
         /// Maximum newest warning/error events to show (1 through 100).
         #[arg(long, default_value = "20")]
         recent_events: NonZeroUsize,
     },
     /// Inspect or explicitly recover durable service-cycle history.
+    #[command(hide = true)]
     Runs {
         #[command(subcommand)]
         command: RunsCommand,
     },
     /// Query bounded persisted operational events without mutation.
+    #[command(hide = true)]
     Events {
         /// TOML configuration identifying application state.
         #[arg(short, long, default_value = "music-sync.toml")]
@@ -176,10 +238,26 @@ enum Command {
         job_id: Option<i64>,
     },
     /// Perform explicit offline-safe operational maintenance.
+    #[command(hide = true)]
     Maintenance {
         #[command(subcommand)]
         command: MaintenanceCommand,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum StatusCommand {
+    /// Show bounded newest-first synchronization history.
+    History {
+        /// Maximum history rows (1 through 1000).
+        #[arg(long, default_value = "100")]
+        limit: NonZeroUsize,
+        /// Optional exact durable status filter.
+        #[arg(long, value_enum)]
+        status: Option<RunStatusFilter>,
+    },
+    /// Follow the systemd service journal until interrupted.
+    Watch,
 }
 
 #[derive(Debug, Subcommand)]
@@ -793,6 +871,135 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> Result<ExitCode, Box<dyn Error>> {
     match cli.command {
+        Command::Sync {
+            command: None,
+            config,
+        } => run(Cli {
+            verbose: cli.verbose,
+            json: cli.json,
+            no_progress: cli.no_progress,
+            command: Command::Service {
+                command: ServiceCommand::Run {
+                    config,
+                    trigger: SyncTrigger::Manual,
+                },
+            },
+        }),
+        Command::List { full, config } => {
+            let config = AppConfig::from_file(&config)?;
+            let sources = Database::source_tree_read_only(&config.database_path())?;
+            render_source_tree(&sources, full, cli.json)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Duplicates { config } => {
+            let config = AppConfig::from_file(&config)?;
+            let evidence = Database::duplicate_evidence_read_only(&config.database_path())?;
+            let report = analyze_duplicates(evidence);
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "Healthy artifacts:             {}",
+                    report.healthy_artifacts
+                );
+                println!(
+                    "Artifacts with fingerprints:    {}",
+                    report.fingerprinted_artifacts
+                );
+                println!(
+                    "Insufficient fingerprint data:  {}",
+                    report.insufficient_fingerprint_artifacts
+                );
+                println!("Duplicate evidence groups:     {}", report.groups.len());
+                for group in &report.groups {
+                    let evidence = match group.evidence {
+                        DuplicateEvidenceKind::ExactBytes => "exact bytes",
+                        DuplicateEvidenceKind::SameProviderObject => "same provider object",
+                        DuplicateEvidenceKind::AudioMatchCandidate => "audio match candidate",
+                    };
+                    println!("\nGroup {}: {evidence}", group.group_id);
+                    if let Some(object) = &group.provider_object {
+                        println!(
+                            "  Provider: {}:{}",
+                            object.provider, object.provider_item_id
+                        );
+                    }
+                    for artifact in &group.artifacts {
+                        let display = match (
+                            artifact.canonical_artist.as_deref(),
+                            artifact.canonical_title.as_deref(),
+                        ) {
+                            (Some(artist), Some(title)) => format!("{artist} - {title}"),
+                            (_, Some(title)) => title.to_owned(),
+                            _ => "[canonical metadata unavailable]".to_owned(),
+                        };
+                        println!("  Artifact {}: {display}", artifact.artifact_id);
+                        println!("    {}", artifact.path);
+                    }
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Add { url, name, config } => {
+            if !is_supported_youtube_url(&url) {
+                return Err("source URL must be an HTTPS youtube.com or youtu.be URL".into());
+            }
+            if name.as_deref().is_some_and(|name| name.trim().is_empty()) {
+                return Err("source name must not be empty".into());
+            }
+            let config = AppConfig::from_file(&config)?;
+            let mut database = Database::open(&config.database_path())?;
+            let result = database.add_source(&url, name.as_deref())?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                println!("Source ID:   {}", result.id.0);
+                println!("Inserted:    {}", result.inserted);
+                println!("Reactivated: {}", result.reactivated);
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Remove { id, config } => {
+            if id <= 0 {
+                return Err("source ID must be greater than zero".into());
+            }
+            let config = AppConfig::from_file(&config)?;
+            let mut database = Database::open(&config.database_path())?;
+            let deactivated = database.deactivate_source(SourceId(id))?;
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "source_id": id,
+                        "deactivated": deactivated,
+                        "audio_deleted": false
+                    }))?
+                );
+            } else {
+                println!("Source ID:    {id}");
+                println!("Deactivated:  {deactivated}");
+                println!("Audio deleted: false");
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Backup { directory, config } => {
+            let config = AppConfig::from_file(&config)?;
+            let directory = directory.unwrap_or_else(|| config.state_directory.join("backups"));
+            std::fs::create_dir_all(&directory)?;
+            let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+            let destination = directory.join(format!("music-sync-{timestamp}.sqlite3"));
+            let database = Database::open(&config.database_path())?;
+            database.backup_to(&destination)?;
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::json!({"backup": destination, "created": true})
+                );
+            } else {
+                println!("Database backup created: {}", destination.display());
+            }
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Maintenance {
             command: MaintenanceCommand::Backup { config, directory },
         } => {
@@ -1620,6 +1827,39 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn Error>> {
             })
         }
         Command::Status {
+            command: Some(StatusCommand::History { limit, status }),
+            config,
+            ..
+        } => run(Cli {
+            verbose: cli.verbose,
+            json: cli.json,
+            no_progress: cli.no_progress,
+            command: Command::Runs {
+                command: RunsCommand::History {
+                    config,
+                    limit,
+                    status,
+                },
+            },
+        }),
+        Command::Status {
+            command: Some(StatusCommand::Watch),
+            ..
+        } => {
+            let mut command = std::process::Command::new("journalctl");
+            command.args(["--follow", "--unit", "music-sync.service"]);
+            if cli.json {
+                command.args(["--output", "json"]);
+            }
+            let status = command.status()?;
+            Ok(if status.success() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(1)
+            })
+        }
+        Command::Status {
+            command: None,
             config,
             recent_events,
         } => {
@@ -2267,7 +2507,7 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn Error>> {
         }
         Command::Sync {
             command:
-                SyncCommand::Run {
+                Some(SyncCommand::Run {
                     config,
                     max_jobs,
                     yt_dlp,
@@ -2280,7 +2520,8 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn Error>> {
                     fpcalc,
                     fingerprint_timeout_seconds,
                     trigger,
-                },
+                }),
+            ..
         } => {
             let config = AppConfig::from_file(&config)?;
             let mut database = Database::open(&config.database_path())?;
@@ -2555,6 +2796,88 @@ fn render_adoption(
     println!("Files modified:      {}", effects.files_modified);
     println!("Files deleted:       {}", effects.files_deleted);
     println!("Files downloaded:    {}", effects.files_downloaded);
+    Ok(())
+}
+
+fn render_source_tree(
+    sources: &[SourceTreeEntry],
+    full: bool,
+    json: bool,
+) -> Result<(), serde_json::Error> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(sources)?);
+        return Ok(());
+    }
+    if sources.is_empty() {
+        println!("No configured sources.");
+        return Ok(());
+    }
+    for (source_index, entry) in sources.iter().enumerate() {
+        let is_playlist = entry.provider_collection_id.is_some();
+        let provider_id = entry
+            .provider_collection_id
+            .as_deref()
+            .or_else(|| {
+                entry
+                    .members
+                    .first()
+                    .map(|member| member.provider_item_id.as_str())
+            })
+            .unwrap_or("unknown");
+        let name = entry
+            .source
+            .name
+            .as_deref()
+            .or_else(|| {
+                (!is_playlist)
+                    .then(|| entry.members.first()?.provider_title.as_deref())
+                    .flatten()
+            })
+            .unwrap_or("[unnamed]");
+        println!(
+            "{}. {:8} {}  {}-id={}",
+            source_index + 1,
+            if is_playlist { "playlist" } else { "track" },
+            name,
+            entry.source.provider,
+            provider_id
+        );
+        if !full {
+            continue;
+        }
+        for (member_index, member) in entry.members.iter().enumerate() {
+            let last = member_index + 1 == entry.members.len();
+            let branch = if last { "└──" } else { "├──" };
+            let continuation = if last { "   " } else { "│  " };
+            let status = match member.status {
+                SourceMemberStatus::Success => "success",
+                SourceMemberStatus::Pending => "pending",
+                SourceMemberStatus::Copyright => "copyright",
+                SourceMemberStatus::Missing => "missing",
+                SourceMemberStatus::Failed => "failed",
+            };
+            let title = match (
+                member.canonical_artist.as_deref(),
+                member.canonical_title.as_deref(),
+            ) {
+                (Some(artist), Some(title)) => format!("{artist} - {title}"),
+                (_, Some(title)) => title.to_owned(),
+                _ => member
+                    .provider_title
+                    .clone()
+                    .unwrap_or_else(|| "[title unavailable]".to_owned()),
+            };
+            println!(
+                "   {branch} {status:9} {:<16} {title}",
+                member.provider_item_id
+            );
+            if member.status == SourceMemberStatus::Failed
+                && let Some(diagnostic) = &member.diagnostic
+            {
+                println!("   {continuation}    └── {diagnostic}");
+            }
+        }
+    }
     Ok(())
 }
 

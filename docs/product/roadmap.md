@@ -71,6 +71,8 @@ in ad hoc TODO documents.
 - Acquisition job history and explicit retry/recovery (complete).
 - Run-level history plus exact run/event/component/job filtering and expanded
   offline doctor checks (complete).
+- Simplified operator CLI, full per-source member status trees, and immutable
+  evidence-separated duplicate reporting (complete and production accepted).
 - Complete mutually exclusive service-cycle orchestration (complete); interactive
   progress and persistent log policy remain.
 - JSON phase summaries, hardened systemd examples, consistent state backup, and
