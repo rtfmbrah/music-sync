@@ -51,10 +51,11 @@ in ad hoc TODO documents.
 - Cover Art Archive selection and immutable content-addressed cache (complete).
 - Synchronized/plain LRCLIB lyrics with crash-safe adjacent-file output (complete).
 - Source-preserving atomic tag normalization and canonical artwork priority (complete).
-- Provenance-aware provider display enrichment (schema 20): complete YouTube payloads
+- Provenance-aware provider display enrichment (schemas 20–21): complete YouTube payloads
   for managed media, provider title/artist/album/genre/thumbnail fallbacks for lyrics,
   artwork, and tags without identity claims, plus explicit zero-work phase status
-  (complete; isolated LXC acceptance and Navidrome verification remain).
+  (complete and production accepted, including compatible PNG-cover rematerialization,
+  durable lyrics mismatch migration, and real Navidrome/Feishin verification).
 
 ## P4 — Autonomous discovery
 

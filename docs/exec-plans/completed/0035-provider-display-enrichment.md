@@ -1,7 +1,8 @@
 # Provider display enrichment and conservative fallbacks
 
-- Status: In progress (local implementation complete, LXC acceptance pending)
+- Status: Complete
 - Started: 2026-08-31
+- Completed: 2026-08-31
 - Roadmap: P3 metadata enrichment
 
 ## Goal
@@ -46,19 +47,42 @@ committed work in status output.
 - [x] Deterministic tests: unit, persistence fallback scenario, adapter single-item
       metadata, acquisition info-JSON fixtures, 15-phase CLI cycle.
 - [x] Architecture docs, roadmap, and status output updated.
-- [ ] Isolated LXC acceptance: schema-19 production-state copy migrates to 20.
-- [ ] Production release activation with pre-upgrade backup.
-- [ ] Real Navidrome acceptance: title, artist, album, genre, cover, lyrics, and
+- [x] Isolated LXC acceptance: schema-19 production-state copy migrates to 20.
+- [x] Production release activation with pre-upgrade backup.
+- [x] Production evidence: provider metadata resolved for 20 owned recordings, tags
+      committed for 20, artwork resolved for 19, and three initial `.lrc` sidecars
+      committed without modifying audio streams.
+- [x] Follow-up implementation: prefer JPEG/PNG provider thumbnails, treat thumbnail
+      404 as durable unavailable, convert cached WebP to validated PNG before tag
+      embedding, and provide audited no-media-change release of incompatible prior
+      materializations.
+- [x] Contradictory exact LRCLIB responses become durable unavailable outcomes instead
+      of recurring transient failures.
+- [x] Schema 21 safely backfills prior exact-signature mismatch deferrals while
+      preserving unrelated retryable failures and any selected/output lyrics.
+- [x] Production compatibility release and audited rematerialization of all 22 WebP
+      tag outputs.
+- [x] Real Navidrome acceptance: title, artist, album, genre, cover, lyrics, and
       playlist assignment for the managed items.
 
 ## Acceptance evidence (so far)
 
-- `just check` passed: formatting, Clippy with `-D warnings`, all 142 deterministic
+- `just check` passed: formatting, Clippy with `-D warnings`, all 143 deterministic
   tests, the architecture check, deployment-script checks, and the performance gate.
 - Committed as `5cb7078`; portable static binary SHA-256
   `c2c5ede3d0aa5cbbaf69e5a0bc8b9cd0e8fc812f3c947e67d3458fb7dae83b7b` staged on the
   LXC as `music-sync-enrichment` under the established deployment directory.
-- Release `0.1.0-20260831.10` upgrade script prepared (quiesce, backup, install,
-  doctor, one manual service cycle, durable evidence capture, timer restore) plus a
-  root-only Navidrome Subsonic-API verification script; both await the explicit root
-  invocation.
+- Release `0.1.0-20260831.10` is active with schema 20. The production run exposed a
+  real Navidrome compatibility gap: ffprobe reported WebP attached-picture MIME as
+  unknown. Nineteen provider artworks resolved, one thumbnail returned HTTP 404, and
+  two exact LRCLIB lookups returned contradictory signatures. The compatibility
+  follow-up above addresses all three outcomes without weakening identity checks.
+- Release `0.1.0-20260831.12` is active with schema 21. Production verification
+  confirmed 22 committed tag outputs with readable title/artist fields and compatible
+  embedded PNG front covers, five exact validated `.lrc` sidecars, eleven durable
+  unavailable lyrics outcomes, and zero deferred artwork, lyrics, or tag outputs.
+  The one-shot compatibility release selected zero items on repeat.
+- Navidrome imported all 22 changed managed tracks and refreshed 18 albums. Its own UI
+  displayed the embedded covers. Feishin initially retained stale Subsonic cover state
+  and received temporary `getCoverArt` 429 responses; logging out and back in refreshed
+  the client state and displayed every cover without another media rewrite or scan.

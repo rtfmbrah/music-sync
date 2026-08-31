@@ -248,6 +248,15 @@ pub fn resolve_release_artwork(
     for candidate in provider_candidates {
         let bytes = match provider.fetch_provider_image(&candidate.source_url) {
             Ok(bytes) => bytes,
+            Err(error) if error.is_not_found() => {
+                database.record_provider_artwork_state(
+                    &candidate,
+                    ArtworkResolutionState::Unavailable,
+                    &error.to_string(),
+                )?;
+                report.unavailable += 1;
+                continue;
+            }
             Err(error) => {
                 database.record_provider_artwork_state(
                     &candidate,
@@ -500,6 +509,12 @@ pub enum ArtworkProviderError {
     Json(serde_json::Error),
 }
 
+impl ArtworkProviderError {
+    fn is_not_found(&self) -> bool {
+        matches!(self, Self::Http(ureq::Error::StatusCode(404)))
+    }
+}
+
 /// Artwork workflow or immutable-cache failure.
 #[derive(Debug, Error)]
 pub enum ArtworkResolutionError {
@@ -578,5 +593,11 @@ mod tests {
             Some(("image/webp", "webp"))
         );
         assert_eq!(image_type(b"<html>"), None);
+    }
+
+    #[test]
+    fn classifies_only_http_404_as_unavailable() {
+        assert!(ArtworkProviderError::Http(ureq::Error::StatusCode(404)).is_not_found());
+        assert!(!ArtworkProviderError::Http(ureq::Error::StatusCode(403)).is_not_found());
     }
 }

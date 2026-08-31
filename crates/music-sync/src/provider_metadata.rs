@@ -46,13 +46,24 @@ impl ProviderDisplayMetadata {
                 push_genre(&mut genres, category.to_owned());
             }
         }
-        let thumbnail_url = value
+        let secure_thumbnail_urls: Vec<&str> = value
             .get("thumbnails")
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
             .filter_map(|thumbnail| thumbnail.get("url").and_then(Value::as_str))
-            .rfind(|url| url.starts_with("https://"))
+            .filter(|url| url.starts_with("https://"))
+            .collect();
+        let thumbnail_url = secure_thumbnail_urls
+            .iter()
+            .rfind(|url| has_image_suffix(url, &[".jpg", ".jpeg", ".png"]))
+            .or_else(|| {
+                secure_thumbnail_urls
+                    .iter()
+                    .rfind(|url| !has_image_suffix(url, &[".webp"]))
+            })
+            .or_else(|| secure_thumbnail_urls.last())
+            .copied()
             .map(str::to_owned)
             .or_else(|| text(value, "thumbnail").filter(|url| url.starts_with("https://")));
         Some(Self {
@@ -86,6 +97,12 @@ fn text(value: &Value, field: &str) -> Option<String> {
         .filter(|value| !value.is_empty() && value != "NA")
 }
 
+fn has_image_suffix(url: &str, suffixes: &[&str]) -> bool {
+    let path = url.split(['?', '#']).next().unwrap_or_default();
+    let lower = path.to_ascii_lowercase();
+    suffixes.iter().any(|suffix| lower.ends_with(suffix))
+}
+
 fn push_genre(genres: &mut Vec<String>, genre: String) {
     let genre = genre.trim();
     if genre.is_empty()
@@ -113,7 +130,11 @@ mod tests {
             "title": "Video title", "track": "Track title", "artist": "Artist",
             "channel": "Channel", "album": "Album", "release_year": 2026,
             "genre": "Frenchcore", "categories": ["Music", "Electronic"],
-            "thumbnails": [{"url":"http://unsafe"},{"url":"https://img/large.jpg"}]
+            "thumbnails": [
+                {"url":"http://unsafe"},
+                {"url":"https://img/large.jpg?size=large"},
+                {"url":"https://img/largest.webp"}
+            ]
         });
         let metadata = ProviderDisplayMetadata::from_ytdlp(&value)
             .ok_or("expected complete provider display metadata")?;
@@ -123,7 +144,7 @@ mod tests {
         assert_eq!(metadata.genres, ["Frenchcore", "Electronic"]);
         assert_eq!(
             metadata.thumbnail_url.as_deref(),
-            Some("https://img/large.jpg")
+            Some("https://img/large.jpg?size=large")
         );
         assert!(metadata.lyrics_artist_is_explicit());
         Ok(())

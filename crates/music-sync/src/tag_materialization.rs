@@ -77,6 +77,50 @@ impl FfmpegMetadataRemuxer {
             timeout,
         }
     }
+
+    fn convert_webp_to_png(
+        &self,
+        source: &Path,
+        destination: &Path,
+    ) -> Result<(), MetadataRemuxError> {
+        if destination.exists() {
+            return Err(MetadataRemuxError::ExistingDestination(destination.into()));
+        }
+        let mut command = Command::new(&self.executable);
+        command
+            .args(["-nostdin", "-v", "error", "-n", "-i"])
+            .arg(source)
+            .args(["-frames:v", "1"])
+            .arg(destination)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        let result = run_bounded_command(&mut command, &self.executable, self.timeout);
+        if let Err(error) = result {
+            let _ = fs::remove_file(destination);
+            return Err(error);
+        }
+        let bytes = fs::read(destination).map_err(|source| MetadataRemuxError::ArtworkRead {
+            path: destination.into(),
+            source,
+        })?;
+        if bytes.is_empty()
+            || bytes.len() > 20 * 1024 * 1024
+            || !bytes.starts_with(b"\x89PNG\r\n\x1a\n")
+        {
+            let _ = fs::remove_file(destination);
+            return Err(MetadataRemuxError::InvalidArtwork);
+        }
+        Ok(())
+    }
+}
+
+struct OwnedTemporaryFile(PathBuf);
+
+impl Drop for OwnedTemporaryFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
 }
 
 impl MetadataRemuxer for FfmpegMetadataRemuxer {
@@ -90,6 +134,21 @@ impl MetadataRemuxer for FfmpegMetadataRemuxer {
         if destination.exists() {
             return Err(MetadataRemuxError::ExistingDestination(destination.into()));
         }
+        let converted_artwork =
+            if let Some(artwork) = artwork.filter(|artwork| artwork.mime_type == "image/webp") {
+                let path = destination.with_extension("music-sync-artwork.png");
+                self.convert_webp_to_png(&artwork.path, &path)?;
+                Some(OwnedTemporaryFile(path))
+            } else {
+                None
+            };
+        let converted_input = converted_artwork
+            .as_ref()
+            .map(|temporary| CanonicalArtworkInput {
+                path: temporary.0.clone(),
+                mime_type: "image/png".into(),
+            });
+        let artwork = converted_input.as_ref().or(artwork);
         let mut command = Command::new(&self.executable);
         command
             .args(["-nostdin", "-v", "error", "-n", "-i"])
@@ -200,6 +259,44 @@ impl MetadataRemuxer for FfmpegMetadataRemuxer {
         }
         Ok(())
     }
+}
+
+fn run_bounded_command(
+    command: &mut Command,
+    executable: &Path,
+    timeout: Duration,
+) -> Result<(), MetadataRemuxError> {
+    let mut child = command
+        .spawn()
+        .map_err(|source| MetadataRemuxError::Spawn {
+            executable: executable.into(),
+            source,
+        })?;
+    let stderr = child.stderr.take().ok_or(MetadataRemuxError::MissingPipe)?;
+    let reader = thread::spawn(move || read_bounded(stderr));
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or(MetadataRemuxError::InvalidTimeout)?;
+    let status = loop {
+        if let Some(status) = child.try_wait().map_err(MetadataRemuxError::Wait)? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = join_reader(reader)?;
+            return Err(MetadataRemuxError::Timeout(timeout));
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    let stderr = join_reader(reader)?;
+    if !status.success() {
+        return Err(MetadataRemuxError::Failed {
+            code: status.code(),
+            stderr: String::from_utf8_lossy(&stderr).trim().into(),
+        });
+    }
+    Ok(())
 }
 
 fn write_ffmetadata(
@@ -802,6 +899,7 @@ pub enum MetadataMaterializationError {
 mod tests {
     use super::*;
     use crate::content_hash::{ContentHasher, Sha256FileHasher};
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn visible_commit_recovers_only_the_prepared_result_hash()
@@ -864,5 +962,58 @@ mod tests {
         assert_eq!(base64_encode(b"a"), "YQ==");
         assert_eq!(base64_encode(b"ab"), "YWI=");
         assert_eq!(base64_encode(b"abc"), "YWJj");
+    }
+
+    #[test]
+    fn webp_artwork_is_converted_to_png_before_ogg_embedding()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let executable = directory.path().join("ffmpeg");
+        let marker = directory.path().join("arguments");
+        fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$@\" >> '{}'\nsource=\nprevious=\nconversion=false\nfor argument in \"$@\"; do\n  if test \"$previous\" = -i && test -z \"$source\"; then source=$argument; fi\n  if test \"$argument\" = -frames:v; then conversion=true; fi\n  previous=$argument\n  destination=$argument\ndone\nif test \"$conversion\" = true; then\n  printf '\\211PNG\\r\\n\\032\\nfixture' > \"$destination\"\nelse\n  cp \"$source\" \"$destination\"\nfi\n",
+                marker.display()
+            ),
+        )?;
+        let mut permissions = fs::metadata(&executable)?.permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&executable, permissions)?;
+        let source = directory.path().join("track.opus");
+        let destination = directory.path().join(".track.tags.opus");
+        let artwork = directory.path().join("cover.webp");
+        fs::write(&source, b"opus fixture")?;
+        fs::write(&artwork, b"RIFF0000WEBPfixture")?;
+        let metadata = CanonicalTagSnapshot {
+            title: "Track".into(),
+            artist: "Artist".into(),
+            album: None,
+            genres: vec!["Frenchcore".into()],
+            artist_provenance: Some("artist".into()),
+            date: None,
+            musicbrainz_recording_id: None,
+            isrc: None,
+        };
+        FfmpegMetadataRemuxer::new(executable, Duration::from_secs(1)).remux(
+            &source,
+            &destination,
+            &metadata,
+            Some(&CanonicalArtworkInput {
+                path: artwork,
+                mime_type: "image/webp".into(),
+            }),
+        )?;
+        assert_eq!(fs::read(destination)?, b"opus fixture");
+        let arguments = fs::read_to_string(marker)?;
+        assert!(arguments.contains("-frames:v\n1\n"));
+        assert!(arguments.contains("music-sync-artwork.png"));
+        assert!(
+            !directory
+                .path()
+                .join(".track.tags.music-sync-artwork.png")
+                .exists()
+        );
+        Ok(())
     }
 }

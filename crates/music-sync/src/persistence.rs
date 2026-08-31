@@ -60,10 +60,14 @@ const MIGRATIONS: &[(u32, &str)] = &[
         20,
         include_str!("../migrations/0020_provider_enrichment.sql"),
     ),
+    (
+        21,
+        include_str!("../migrations/0021_durable_lyrics_mismatches.sql"),
+    ),
 ];
 
 /// Current durable schema version.
-pub const CURRENT_SCHEMA_VERSION: u32 = 20;
+pub const CURRENT_SCHEMA_VERSION: u32 = 21;
 
 /// A connection to music-sync's private application state.
 #[derive(Debug)]
@@ -6700,6 +6704,64 @@ mod tests {
 
         assert_eq!(database.schema_version()?, CURRENT_SCHEMA_VERSION);
         assert_eq!(database.table_count("acquisition_jobs")?, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn migration_twenty_one_reclassifies_only_prior_signature_mismatches()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("v20.sqlite3");
+        let connection = Connection::open(&path)?;
+        for (version, sql) in &MIGRATIONS[..20] {
+            connection.execute_batch(sql)?;
+            connection.execute(
+                "INSERT INTO schema_migrations(version) VALUES (?1)",
+                [version],
+            )?;
+            connection.pragma_update(None, "user_version", version)?;
+        }
+        connection.execute("INSERT INTO recordings DEFAULT VALUES", [])?;
+        connection.execute("INSERT INTO recordings DEFAULT VALUES", [])?;
+        connection.execute(
+            "INSERT INTO lyrics_resolutions(recording_id,state,message,raw_response_json)
+             VALUES (1,'deferred','LRCLIB result contradicts the canonical request signature','')",
+            [],
+        )?;
+        connection.execute(
+            "INSERT INTO lyrics_resolutions(recording_id,state,message,raw_response_json)
+             VALUES (2,'deferred','LRCLIB HTTP failure: timeout','')",
+            [],
+        )?;
+        drop(connection);
+
+        let database = Database::open(&path)?;
+        assert_eq!(database.schema_version()?, CURRENT_SCHEMA_VERSION);
+        assert_eq!(
+            database.connection.query_row(
+                "SELECT state FROM lyrics_resolutions WHERE recording_id=1",
+                [],
+                |row| row.get::<_, String>(0),
+            )?,
+            "unavailable"
+        );
+        assert_eq!(
+            database.connection.query_row(
+                "SELECT state FROM lyrics_resolutions WHERE recording_id=2",
+                [],
+                |row| row.get::<_, String>(0),
+            )?,
+            "deferred"
+        );
+        assert_eq!(
+            database.connection.query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE event='lyrics_signature_mismatch_reclassified'",
+                [],
+                |row| row.get::<_, u64>(0),
+            )?,
+            1
+        );
         Ok(())
     }
 

@@ -43,6 +43,12 @@ Selection and provider JSON are persisted only after cache validation. Repeated 
 do no HTTP or filesystem work for resolved or unavailable releases. Artwork enrichment
 does not rewrite audio and does not place files in the library.
 
+Provider-thumbnail fallback prefers HTTPS JPEG or PNG variants over WebP variants.
+An HTTP 404 is a durable unavailable result rather than retryable work. Cached WebP
+remains valid immutable source evidence, but tag materialization converts it to PNG
+before embedding because Ogg/Opus consumers do not consistently accept WebP picture
+blocks. The conversion is bounded, magic-byte validated, and does not transcode audio.
+
 Schema version 13 and `lyrics fetch` resolve exact canonical title, artist-credit,
 release, and probed-duration signatures sequentially through LRCLIB. The adapter
 requires an identifying User-Agent, uses a 2 MiB response limit and explicit deadline,
@@ -50,6 +56,16 @@ and treats 404, instrumental, and retryable failures as distinct durable states.
 Returned title, artist, album, and duration must match independently before text is
 accepted. Synchronized lyrics outrank plain text; synchronized content must contain a
 timestamp and all text is NUL-free and bounded.
+
+An LRCLIB response that contradicts the exact requested title, artist, optional album,
+or duration is recorded as durably unavailable. It is never accepted and is not
+retried on every service cycle; transport and malformed-provider failures remain
+deferred.
+
+Schema version 21 applies that durable classification to exact-signature mismatches
+recorded by earlier builds. It changes only unresolved rows without a selected lyric
+or sidecar, retains unrelated transient deferrals, and writes one audit event per
+reclassified recording.
 
 Adjacent `.lrc` output is restricted to healthy preferred artifacts proven owned by
 a committed acquisition or repair. Adopted files are never mutated. Output intent is
@@ -100,6 +116,14 @@ without blocking canonical work.
 
 Service phases with work selection report `skipped` instead of `succeeded` when zero
 candidates were selected, so idle phases are distinguishable from committed work.
+
+`deploy/reset-webp-tag-materializations.py` is an explicit offline maintenance tool
+for tag outputs committed before PNG cover compatibility was enforced. Dry-run is the
+default. Apply requires an idle service and prior database backup, verifies current
+owned artifact paths and hashes, records the complete prior row in an audit event, and
+releases only the materialization state. It never changes media bytes. The ordinary
+materializer then retains the current tagged bytes in immutable artifact history and
+performs one new stream-copy materialization with the compatible cover.
 
 ## PLANNED
 

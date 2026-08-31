@@ -233,7 +233,21 @@ fn process_one(
                 duration_seconds: (work.duration_ms + 500) / 1000,
             };
             let signature_json = serde_json::to_string(&signature)?;
-            match provider.resolve(&signature)? {
+            let lookup = match provider.resolve(&signature) {
+                Ok(lookup) => lookup,
+                Err(LyricsProviderError::SignatureMismatch) => {
+                    database.record_lyrics_resolution_state(
+                        work.recording_id,
+                        LyricsResolutionState::Unavailable,
+                        "LRCLIB returned a result that contradicted the exact request signature",
+                        "",
+                    )?;
+                    report.unavailable += 1;
+                    return Ok(());
+                }
+                Err(error) => return Err(error.into()),
+            };
+            match lookup {
                 LyricsLookup::Unavailable { raw_response_json } => {
                     database.record_lyrics_resolution_state(
                         work.recording_id,
