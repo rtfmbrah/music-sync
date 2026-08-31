@@ -53,5 +53,12 @@ committed work in status output.
 
 ## Acceptance evidence (so far)
 
-- `cargo fmt --check`, Clippy with `-D warnings`, all 142 deterministic tests, the
-  architecture check, and the deployment-script checks pass locally.
+- `just check` passed: formatting, Clippy with `-D warnings`, all 142 deterministic
+  tests, the architecture check, deployment-script checks, and the performance gate.
+- Committed as `5cb7078`; portable static binary SHA-256
+  `c2c5ede3d0aa5cbbaf69e5a0bc8b9cd0e8fc812f3c947e67d3458fb7dae83b7b` staged on the
+  LXC as `music-sync-enrichment` under the established deployment directory.
+- Release `0.1.0-20260831.10` upgrade script prepared (quiesce, backup, install,
+  doctor, one manual service cycle, durable evidence capture, timer restore) plus a
+  root-only Navidrome Subsonic-API verification script; both await the explicit root
+  invocation.
