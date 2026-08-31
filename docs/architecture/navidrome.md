@@ -12,6 +12,16 @@ traversable managed provider directories (`0755`). This allows a separately runn
 Navidrome scanner to read committed media even though staging and the music-sync
 service remain private. Publication changes modes only; it never rewrites audio.
 
+`deploy/migrate-managed-webm.py` is an explicit offline maintenance migration for
+preferred, healthy, committed WebM artifacts below one managed provider directory.
+It accepts only Opus audio, stream-copies it into an Ogg/Opus container, verifies
+codec and bounded duration, hashes and no-clobber publishes the result, then changes
+preference and acquisition ownership in one SQLite transaction. Existing WebM bytes
+and their artifact rows remain preserved. Fingerprint evidence is copied because the
+decoded audio stream is unchanged, and an audit event records both artifact IDs,
+paths, and hashes. Dry-run is the default; production apply requires a prior backup
+and an idle service.
+
 The initial output is installed with no-clobber semantics. Only paths registered as
 music-sync-owned may subsequently be atomically replaced. Synchronized temporary
 files and directory metadata make normal repeats unchanged and permit exact-byte
