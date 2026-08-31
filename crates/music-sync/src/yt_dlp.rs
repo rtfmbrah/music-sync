@@ -116,6 +116,8 @@ impl YtDlp {
                 "--no-warnings",
                 "--quiet",
                 "--no-overwrites",
+                "--format",
+                "bestaudio",
                 "--paths",
             ])
             .arg(&staging)

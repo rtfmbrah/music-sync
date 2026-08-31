@@ -16,10 +16,12 @@ or resume.
 
 The yt-dlp adapter can download exactly one provider URL into prepared staging with
 a non-zero deadline, 16 MiB output bounds, playlist expansion disabled, a fixed
-`media.%(ext)s` template, and overwrite disabled. A successful subprocess result is
-accepted only when it reports exactly one absolute, non-empty regular file whose
-canonical parent is the staging directory. The file remains uncommitted staging
-evidence until acquisition orchestration validates and commits it.
+`media.%(ext)s` template, strict `bestaudio` selection without a combined-video
+fallback, and overwrite disabled. This preserves the provider's preferred audio
+stream without an unnecessary lossy conversion or bundled video stream. A successful
+subprocess result is accepted only when it reports exactly one absolute, non-empty
+regular file whose canonical parent is the staging directory. The file remains
+uncommitted staging evidence until acquisition orchestration validates and commits it.
 
 Autonomous service construction supplies validated request and randomized download
 sleep bounds to the adapter. The delay occurs inside yt-dlp and remains covered by
