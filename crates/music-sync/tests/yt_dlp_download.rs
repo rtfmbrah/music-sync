@@ -64,6 +64,7 @@ fn passes_request_and_randomized_download_pacing() -> Result<(), Box<dyn std::er
     assert!(arguments.contains("--extractor-args\nyoutube:player_client=default,web_embedded\n"));
     assert!(arguments.contains(&format!("--cache-dir\n{}\n", cache.display())));
     assert!(arguments.contains("--format\nbestaudio\n"));
+    assert!(arguments.contains("--remux-video\nwebm>opus\n"));
     Ok(())
 }
 

@@ -1,6 +1,7 @@
 //! Crash-safe acquisition staging primitives.
 
 use std::fs::{self, File};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use thiserror::Error;
@@ -214,14 +215,15 @@ pub(crate) fn commit_staged_file(
             resolved: canonical_parent,
         });
     }
+    fs::set_permissions(parent, fs::Permissions::from_mode(0o755)).map_err(|source| {
+        ArtifactCommitError::PublishPermissions {
+            path: parent.to_path_buf(),
+            source,
+        }
+    })?;
     match fs::hard_link(&staged, final_path) {
         Ok(()) => {
-            File::open(parent)
-                .and_then(|directory| directory.sync_all())
-                .map_err(|source| ArtifactCommitError::Sync {
-                    path: parent.to_path_buf(),
-                    source,
-                })?;
+            publish_artifact(final_path, parent)?;
             Ok(ArtifactCommitEffect::Created)
         }
         Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -236,6 +238,7 @@ pub(crate) fn commit_staged_file(
             if existing.bytes_hashed == validated.bytes
                 && hex_sha256(existing.sha256) == validated.sha256
             {
+                publish_artifact(final_path, parent)?;
                 Ok(ArtifactCommitEffect::RecoveredExisting)
             } else {
                 Err(ArtifactCommitError::ExistingMismatch(
@@ -249,6 +252,28 @@ pub(crate) fn commit_staged_file(
             source,
         }),
     }
+}
+
+fn publish_artifact(final_path: &Path, parent: &Path) -> Result<(), ArtifactCommitError> {
+    fs::set_permissions(final_path, fs::Permissions::from_mode(0o644)).map_err(|source| {
+        ArtifactCommitError::PublishPermissions {
+            path: final_path.to_path_buf(),
+            source,
+        }
+    })?;
+    File::open(final_path)
+        .and_then(|file| file.sync_all())
+        .map_err(|source| ArtifactCommitError::Sync {
+            path: final_path.to_path_buf(),
+            source,
+        })?;
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|source| ArtifactCommitError::Sync {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    Ok(())
 }
 
 /// Persists intent, performs the no-clobber filesystem commit, then finalizes SQLite.
@@ -542,6 +567,15 @@ pub enum ArtifactCommitError {
         /// Underlying filesystem error.
         source: std::io::Error,
     },
+    /// A managed artifact or its provider directory could not be made read-only
+    /// accessible to the library consumer.
+    #[error("failed to publish managed artifact permissions for {path}: {source}")]
+    PublishPermissions {
+        /// Managed file or directory whose mode could not be applied.
+        path: PathBuf,
+        /// Underlying filesystem error.
+        source: std::io::Error,
+    },
     /// A destination parent resolved through a symlink or other path indirection.
     #[error("managed artifact directory escaped its requested path {requested}: {resolved}")]
     DestinationEscaped {
@@ -796,6 +830,7 @@ mod tests {
         let state = tempfile::tempdir()?;
         let library = tempfile::tempdir_in(state.path().parent().ok_or("missing parent")?)?;
         let validated = validated_fixture(state.path())?;
+        fs::set_permissions(&validated.path, fs::Permissions::from_mode(0o600))?;
         let (mut database, work) = claimed_work()?;
 
         let first = commit_validated_acquisition(
@@ -816,6 +851,17 @@ mod tests {
         assert_eq!(first.filesystem, ArtifactCommitEffect::Created);
         assert!(first.database.inserted);
         assert_eq!(fs::read(&first.final_path)?, b"validated audio");
+        assert_eq!(
+            fs::metadata(&first.final_path)?.permissions().mode() & 0o777,
+            0o644
+        );
+        assert_eq!(
+            fs::metadata(first.final_path.parent().ok_or("missing parent")?)?
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
         assert_eq!(repeated.filesystem, ArtifactCommitEffect::RecoveredExisting);
         assert!(!repeated.database.inserted);
         assert_eq!(repeated.database.artifact_id, first.database.artifact_id);

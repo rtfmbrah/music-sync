@@ -17,11 +17,13 @@ or resume.
 The yt-dlp adapter can download exactly one provider URL into prepared staging with
 a non-zero deadline, 16 MiB output bounds, playlist expansion disabled, a fixed
 `media.%(ext)s` template, strict `bestaudio` selection without a combined-video
-fallback, and overwrite disabled. This preserves the provider's preferred audio
-stream without an unnecessary lossy conversion or bundled video stream. A successful
-subprocess result is accepted only when it reports exactly one absolute, non-empty
-regular file whose canonical parent is the staging directory. The file remains
-uncommitted staging evidence until acquisition orchestration validates and commits it.
+fallback, lossless `webm>opus` remuxing for Navidrome scanner compatibility, and
+overwrite disabled. Other audio containers remain unchanged. This preserves the
+provider's preferred audio stream without an unnecessary lossy conversion or bundled
+video stream. A successful subprocess result is accepted only when it reports exactly
+one absolute, non-empty regular file whose canonical parent is the staging directory.
+The file remains uncommitted staging evidence until acquisition orchestration validates
+and commits it.
 
 Autonomous service construction supplies validated request and randomized download
 sleep bounds to the adapter. The delay occurs inside yt-dlp and remains covered by
@@ -42,8 +44,11 @@ Schema version 5 persists prepared acquisition commits containing staged/final p
 and all validation evidence. Final paths derive only from bounded provider identity
 components and the staged extension. Filesystem commit uses a same-filesystem hard
 link, which atomically fails rather than overwriting an existing path, followed by
-directory synchronization and one SQLite transaction associating the provider item,
-recording, healthy artifact, committed intent, and succeeded job. Staging is retained.
+read-only consumer publication (`0644` artifact and `0755` managed provider
+directory), file and directory synchronization, and one SQLite transaction
+associating the provider item, recording, healthy artifact, committed intent, and
+succeeded job. Staging is retained. Applying the publication mode after linking also
+updates the retained hard-linked staging inode; it never changes media bytes.
 
 An exact-byte destination is recoverable only when the same job already had matching
 prepared intent before the destination was observed. Pre-existing paths—even with

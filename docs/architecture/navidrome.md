@@ -7,6 +7,11 @@ Navidrome database dependency. `playlist materialize` writes one stable UTF-8 M3
 per durable collection from ordered active memberships and explicit preferred
 healthy artifacts. Missing or unresolved artifacts are reported and omitted.
 
+New managed acquisition artifacts are published as read-only files (`0644`) below
+traversable managed provider directories (`0755`). This allows a separately running
+Navidrome scanner to read committed media even though staging and the music-sync
+service remain private. Publication changes modes only; it never rewrites audio.
+
 The initial output is installed with no-clobber semantics. Only paths registered as
 music-sync-owned may subsequently be atomically replaced. Synchronized temporary
 files and directory metadata make normal repeats unchanged and permit exact-byte

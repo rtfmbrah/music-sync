@@ -118,6 +118,8 @@ impl YtDlp {
                 "--no-overwrites",
                 "--format",
                 "bestaudio",
+                "--remux-video",
+                "webm>opus",
                 "--paths",
             ])
             .arg(&staging)
