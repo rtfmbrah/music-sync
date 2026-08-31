@@ -33,7 +33,7 @@ test-architecture:
 
 # Validate deployment shell scripts without network or side effects.
 test-scripts:
-    bash -n scripts/install-ytdlp deploy/install-release.sh deploy/rollback-release.sh crates/music-sync/tests/fixtures/acquisition/*.sh crates/music-sync/tests/fixtures/repair/*.sh crates/music-sync/tests/fixtures/tag/*.sh
+    bash -n scripts/install-ytdlp deploy/install-release.sh deploy/rollback-release.sh deploy/quiesce-service.sh crates/music-sync/tests/fixtures/acquisition/*.sh crates/music-sync/tests/fixtures/repair/*.sh crates/music-sync/tests/fixtures/tag/*.sh
 
 # Run the deterministic complete-service performance regression gate.
 test-performance:

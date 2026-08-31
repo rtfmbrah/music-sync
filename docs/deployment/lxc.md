@@ -241,8 +241,22 @@ the service account. The daily example timer performs the same consistent SQLite
 snapshot and intentionally does not delete old backups. Operators define and test
 retention outside music-sync.
 
+Never stop an active oneshot merely to begin maintenance: that leaves its exclusive
+durable service run truthfully `running` until explicit operator recovery, and every
+later timer invocation must refuse to overlap it. Run
+`deploy/quiesce-service.sh [TIMEOUT_SECONDS]` as root before backup or activation.
+It stops only the timer, waits for any current service cycle to finish naturally,
+and leaves the timer stopped for maintenance. On timeout or interruption it restores
+the previously active timer and performs no recovery. After maintenance, explicitly
+run `systemctl start music-sync.timer`.
+
+If a process was externally interrupted, first confirm that the unit is inactive and
+that no music-sync service process exists. Back up SQLite, inspect `runs history
+--status running`, and use `runs recover-interrupted` exactly once. This changes only
+the abandoned durable run/phase state; it never retries work or changes audio.
+
 `deploy/rollback-release.sh VERSION` validates a retained release and atomically
-repoints `current`. Stop the timer and service before rollback. Binary rollback is
+repoints `current`. Quiesce the timer and allow the service to finish before rollback. Binary rollback is
 safe only when that retained binary supports the current schema; otherwise restore
 the paired pre-upgrade SQLite snapshot first, while the service is stopped. Audio is
 never part of automated rollback and must not be deleted or replaced.
