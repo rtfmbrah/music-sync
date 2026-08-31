@@ -58,7 +58,9 @@
 - Simplified-CLI black-box coverage proves the primary help hides technical command
   groups while keeping them callable, and validates `list --full` precedence across
   success, pending, failed, missing, and copyright evidence. A healthy local artifact
-  remains successful despite permanent remote state.
+  remains successful despite permanent remote state. Combined status filters use OR
+  semantics, source selectors accept configured names and durable IDs, and filtered
+  JSON excludes nonmatching members.
 - Duplicate-report unit and black-box coverage separates exact-byte groups from
   strict audio-match candidates and proves immutable execution leaves database bytes,
   SQLite sidecars, and media unchanged.

@@ -13,6 +13,8 @@ music-sync status
 music-sync status watch
 music-sync list
 music-sync list --full
+music-sync list --failed --missing
+music-sync list --success --source winstreak
 music-sync duplicates
 music-sync sync
 ```

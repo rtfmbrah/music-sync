@@ -86,6 +86,24 @@ enum Command {
         /// Include every active member with local synchronization status.
         #[arg(long)]
         full: bool,
+        /// Include members with a healthy local artifact.
+        #[arg(long)]
+        success: bool,
+        /// Include members whose acquisition is pending or running.
+        #[arg(long)]
+        pending: bool,
+        /// Include members with a deferred or failed acquisition.
+        #[arg(long)]
+        failed: bool,
+        /// Include members that are permanently unavailable without copyright evidence.
+        #[arg(long)]
+        missing: bool,
+        /// Include members with explicit copyright restriction evidence.
+        #[arg(long)]
+        copyright: bool,
+        /// Restrict output to one source ID, name, or provider source ID.
+        #[arg(long)]
+        source: Option<String>,
         /// TOML configuration identifying application state.
         #[arg(short, long, default_value = "/etc/music-sync/music-sync.toml")]
         config: PathBuf,
@@ -885,10 +903,27 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn Error>> {
                 },
             },
         }),
-        Command::List { full, config } => {
+        Command::List {
+            full,
+            success,
+            pending,
+            failed,
+            missing,
+            copyright,
+            source,
+            config,
+        } => {
             let config = AppConfig::from_file(&config)?;
             let sources = Database::source_tree_read_only(&config.database_path())?;
-            render_source_tree(&sources, full, cli.json)?;
+            let filter = SourceTreeFilter {
+                success,
+                pending,
+                failed,
+                missing,
+                copyright,
+                source,
+            };
+            render_source_tree(&sources, full || filter.is_active(), &filter, cli.json)?;
             Ok(ExitCode::SUCCESS)
         }
         Command::Duplicates { config } => {
@@ -2799,20 +2834,96 @@ fn render_adoption(
     Ok(())
 }
 
+#[derive(Debug, Default)]
+struct SourceTreeFilter {
+    success: bool,
+    pending: bool,
+    failed: bool,
+    missing: bool,
+    copyright: bool,
+    source: Option<String>,
+}
+
+impl SourceTreeFilter {
+    fn has_status_filter(&self) -> bool {
+        self.success || self.pending || self.failed || self.missing || self.copyright
+    }
+
+    fn is_active(&self) -> bool {
+        self.has_status_filter() || self.source.is_some()
+    }
+
+    fn matches_source(&self, entry: &SourceTreeEntry) -> bool {
+        let Some(query) = self.source.as_deref() else {
+            return true;
+        };
+        entry.source.id.0.to_string() == query
+            || entry
+                .source
+                .name
+                .as_deref()
+                .is_some_and(|name| name.eq_ignore_ascii_case(query))
+            || entry
+                .provider_collection_id
+                .as_deref()
+                .is_some_and(|provider_id| provider_id == query)
+            || (entry.provider_collection_id.is_none()
+                && entry
+                    .members
+                    .first()
+                    .is_some_and(|member| member.provider_item_id == query))
+    }
+
+    fn matches_status(&self, status: SourceMemberStatus) -> bool {
+        !self.has_status_filter()
+            || match status {
+                SourceMemberStatus::Success => self.success,
+                SourceMemberStatus::Pending => self.pending,
+                SourceMemberStatus::Copyright => self.copyright,
+                SourceMemberStatus::Missing => self.missing,
+                SourceMemberStatus::Failed => self.failed,
+            }
+    }
+}
+
 fn render_source_tree(
     sources: &[SourceTreeEntry],
     full: bool,
+    filter: &SourceTreeFilter,
     json: bool,
 ) -> Result<(), serde_json::Error> {
+    let filtered = sources
+        .iter()
+        .filter(|entry| filter.matches_source(entry))
+        .filter_map(|entry| {
+            let mut entry = entry.clone();
+            if filter.has_status_filter() {
+                entry
+                    .members
+                    .retain(|member| filter.matches_status(member.status));
+                if entry.members.is_empty() {
+                    return None;
+                }
+            }
+            Some(entry)
+        })
+        .collect::<Vec<_>>();
     if json {
-        println!("{}", serde_json::to_string_pretty(sources)?);
+        println!("{}", serde_json::to_string_pretty(&filtered)?);
         return Ok(());
     }
-    if sources.is_empty() {
-        println!("No configured sources.");
+    if filtered.is_empty() {
+        println!(
+            "{}",
+            if filter.is_active() {
+                "No sources or members matched the filters."
+            } else {
+                "No configured sources."
+            }
+        );
         return Ok(());
     }
-    for (source_index, entry) in sources.iter().enumerate() {
+    for entry in &filtered {
         let is_playlist = entry.provider_collection_id.is_some();
         let provider_id = entry
             .provider_collection_id
@@ -2836,7 +2947,7 @@ fn render_source_tree(
             .unwrap_or("[unnamed]");
         println!(
             "{}. {:8} {}  {}-id={}",
-            source_index + 1,
+            entry.source.id.0,
             if is_playlist { "playlist" } else { "track" },
             name,
             entry.source.provider,

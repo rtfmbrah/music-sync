@@ -73,6 +73,9 @@ audio always wins as `success`; new/running work is `pending`; explicit persiste
 copyright and permanent-unavailability diagnostics become `copyright` and
 `missing`; other deferred or terminal work is `failed` with its stored diagnostic.
 Provider titles are retained rather than split to guess artist identity.
+Status flags filter the detailed tree with OR semantics, while `--source` accepts an
+exact durable source ID, case-insensitive configured name, or provider source ID.
+Either filter form implies detailed output and remains a read-only database query.
 
 `just test-performance` runs the complete deterministic offline service cycle twice,
 checks idempotency and exclusivity, and fails if execution exceeds a deliberately

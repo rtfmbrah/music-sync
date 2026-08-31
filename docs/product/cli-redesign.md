@@ -88,7 +88,8 @@ music-sync [--json] [-v]
 │   ├── watch                      # follow durable progress/events
 │   └── history                    # recent synchronization runs
 ├── sync                           # one complete foreground synchronization
-├── list [--full]                  # sources; optionally include member tracks
+├── list [--full] [STATUS] [--source <SOURCE>]
+│                                  # sources; optionally filter member tracks
 ├── add <url> [--name <name>]
 ├── remove <id>                    # disable source; never delete audio
 ├── duplicates                     # read-only evidence report
@@ -112,6 +113,16 @@ tree in provider order and includes every playlist member:
    └── copyright  mno345       Artist - Title
 2. track Standalone title  youtube-id=pqr678
    └── success    pqr678       Artist - Title
+```
+
+Status flags `--success`, `--pending`, `--failed`, `--missing`, and `--copyright`
+imply the detailed tree and may be combined with OR semantics. `--source <SOURCE>`
+restricts the tree to an exact source ID, case-insensitive source name, provider
+playlist ID, or single-video ID. It also implies the detailed tree. For example:
+
+```text
+music-sync list --failed --missing
+music-sync list --success --source winstreak
 ```
 
 Status precedence and meaning are strict:

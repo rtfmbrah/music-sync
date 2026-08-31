@@ -101,6 +101,41 @@ fn simple_list_full_reports_strict_member_states() -> Result<(), Box<dyn std::er
         statuses,
         ["success", "pending", "failed", "missing", "copyright"]
     );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_music-sync"))
+        .args(["--json", "list", "--failed", "--source", "tree", "--config"])
+        .arg(&config)
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(report[0]["members"].as_array().map(Vec::len), Some(1));
+    assert_eq!(report[0]["members"][0]["status"], "failed");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_music-sync"))
+        .args([
+            "--json",
+            "list",
+            "--success",
+            "--missing",
+            "--source",
+            "1",
+            "--config",
+        ])
+        .arg(&config)
+        .output()?;
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let statuses = report[0]["members"]
+        .as_array()
+        .ok_or("members must be an array")?
+        .iter()
+        .map(|member| member["status"].as_str().unwrap_or_default())
+        .collect::<Vec<_>>();
+    assert_eq!(statuses, ["success", "missing"]);
     Ok(())
 }
 
