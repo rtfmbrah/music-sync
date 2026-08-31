@@ -20,6 +20,11 @@ const MAX_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
 pub trait ReleaseArtworkProvider {
     /// Returns a selected image, or `None` when the release has no usable art.
     fn fetch(&self, release_mbid: &str) -> Result<ArtworkLookup, ArtworkProviderError>;
+
+    /// Fetches one exact secure provider-thumbnail URL as a bounded fallback.
+    fn fetch_provider_image(&self, _url: &str) -> Result<Vec<u8>, ArtworkProviderError> {
+        Err(ArtworkProviderError::ProviderImagesUnsupported)
+    }
 }
 
 /// Bounded provider result retained for durable audit.
@@ -152,6 +157,13 @@ impl ReleaseArtworkProvider for CoverArtArchive {
             raw_response_json,
         })
     }
+
+    fn fetch_provider_image(&self, url: &str) -> Result<Vec<u8>, ArtworkProviderError> {
+        if !url.starts_with("https://") {
+            return Err(ArtworkProviderError::InsecureImageUrl);
+        }
+        self.bounded_get(url, MAX_IMAGE_BYTES)
+    }
 }
 
 /// Resolves and caches a stable bounded set of canonical release covers.
@@ -227,6 +239,48 @@ pub fn resolve_release_artwork(
             &lookup.raw_response_json,
         )? {
             report.resolved += 1;
+        }
+    }
+    let remaining = maximum_releases.saturating_sub(report.selected as usize);
+    let provider_candidates = database.provider_artwork_candidates(remaining)?;
+    report.selected += provider_candidates.len() as u64;
+    report.provider_selected = provider_candidates.len() as u64;
+    for candidate in provider_candidates {
+        let bytes = match provider.fetch_provider_image(&candidate.source_url) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                database.record_provider_artwork_state(
+                    &candidate,
+                    ArtworkResolutionState::Deferred,
+                    &error.to_string(),
+                )?;
+                report.deferred += 1;
+                report.provider_failures.push(ProviderArtworkFailure {
+                    recording_id: candidate.recording_id,
+                    message: error.to_string(),
+                });
+                continue;
+            }
+        };
+        let blob = match cache_validated_image(state_directory, &bytes) {
+            Ok(blob) => blob,
+            Err(error) => {
+                database.record_provider_artwork_state(
+                    &candidate,
+                    ArtworkResolutionState::Deferred,
+                    &error.to_string(),
+                )?;
+                report.deferred += 1;
+                report.provider_failures.push(ProviderArtworkFailure {
+                    recording_id: candidate.recording_id,
+                    message: error.to_string(),
+                });
+                continue;
+            }
+        };
+        if database.record_provider_artwork(&candidate, &blob)? {
+            report.resolved += 1;
+            report.provider_resolved += 1;
         }
     }
     Ok(report)
@@ -383,14 +437,29 @@ struct Thumbnails {
 pub struct ArtworkResolutionReport {
     /// Candidate releases selected in stable order.
     pub selected: u64,
+    /// Provider-thumbnail fallback candidates within `selected`.
+    pub provider_selected: u64,
     /// Newly selected cached release images.
     pub resolved: u64,
+    /// Provider-thumbnail fallbacks within `resolved`.
+    pub provider_resolved: u64,
     /// Releases with no usable provider image.
     pub unavailable: u64,
     /// Releases deferred after ordinary failures.
     pub deferred: u64,
     /// Per-release provider or cache failures.
     pub failures: Vec<ArtworkResolutionFailure>,
+    /// Per-recording provider-thumbnail failures.
+    pub provider_failures: Vec<ProviderArtworkFailure>,
+}
+
+/// One non-fatal provider-thumbnail failure.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ProviderArtworkFailure {
+    /// Durable recording row.
+    pub recording_id: i64,
+    /// Auditable failure message.
+    pub message: String,
 }
 
 /// One non-fatal release-artwork failure.
@@ -417,6 +486,9 @@ pub enum ArtworkProviderError {
     /// Provider returned an insecure non-loopback download URL.
     #[error("Cover Art Archive returned an insecure image URL")]
     InsecureImageUrl,
+    /// This fixture/provider boundary does not implement direct image URLs.
+    #[error("artwork provider does not support provider thumbnail URLs")]
+    ProviderImagesUnsupported,
     /// HTTP request or bounded response read failed.
     #[error("Cover Art Archive HTTP failure: {0}")]
     Http(ureq::Error),

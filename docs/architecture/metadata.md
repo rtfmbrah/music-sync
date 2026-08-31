@@ -74,17 +74,44 @@ the historical artifact row, inserts the derived healthy artifact, and changes
 preference transactionally. Unknown hidden paths and changed source bytes are
 preserved/deferred; retry is explicit.
 
+Schema version 20 adds provenance-aware provider display enrichment for managed media.
+Source enumeration persists one bounded snapshot payload per provider item; acquisition
+persists the complete yt-dlp info JSON captured beside the staged media, and a bounded
+`provider_metadata` service phase refreshes owned items that still lack a complete
+single-item payload through `--dump-single-json` without downloading media. Extraction
+keeps explicit music fields (`track`, `artist`, `creator`, `album`, `genre`,
+`release_date`) and labels channel/uploader fallbacks with their source field as
+`artist_provenance`; generic categories such as `Music` or `Entertainment` are never
+retained as genres, and only HTTPS thumbnail URLs are kept. Missing albums and genres
+remain absent rather than fabricated.
+
+Provider display fields drive conservative fallbacks only when canonical selections are
+missing: lyrics signatures and tag materialization coalesce canonical title, artist
+credit, release, and date with provider display values, and materialization additionally
+carries explicit provider genres and artist provenance. Lyrics fall back to provider
+fields only when the canonical artist credit exists or the provider artist provenance is
+an explicit `artist`/`creator` field; channel/uploader display names never feed lyrics
+lookup. Canonical release art outranks provider thumbnails: a validated HTTPS thumbnail
+is selected only for owned committed recordings without canonical artwork, cached by
+SHA-256 with the same magic-byte and size bounds, and embedded through the existing
+tag-materialization picture path. Provider enrichment never creates recording identity,
+never changes metadata selections, and provider-only failures are deferred and audited
+without blocking canonical work.
+
+Service phases with work selection report `skipped` instead of `succeeded` when zero
+candidates were selected, so idle phases are distinguishable from committed work.
+
 ## PLANNED
 
 Extend canonical release context with
 track/disc positions through bounded release lookup. Do not model enrichment as
 whichever provider wrote last.
 
-Provider metadata—ID, URL, title, channel, description, duration, thumbnail, and
-playlist context—remains available for debugging and recovery. Canonical release art
-outranks a video thumbnail. Release selection accounts for original albums, singles,
-soundtracks, deluxe editions, compilations, and remasters without confusing them with
-recording identity.
+Remaining provider payload fields—description, duration, and playlist context—remain
+available in the retained raw enrichment JSON for debugging and recovery. Canonical
+release art outranks a video thumbnail. Release selection accounts for original albums,
+singles, soundtracks, deluxe editions, compilations, and remasters without confusing
+them with recording identity.
 
 Normalized filenames and future directory organization remain independent from codec
 uniformity and this tag-only visible path transition. Exact acquired bytes remain in

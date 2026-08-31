@@ -103,6 +103,16 @@ unknown existing entries remain byte-path-preserved across later materialization
 Playlist output ownership may move from the legacy internal-ID filename only after
 the old file matches its recorded SHA-256.
 
+Schema version 20 stores provenance-aware provider display enrichment separately
+from canonical identity. One row per provider item retains the display title, an
+optional display artist with its source-field provenance (`artist`, `creator`,
+`channel`, or `uploader`), an explicit provider album, release date, explicit
+non-generic genres as JSON, a secure HTTPS thumbnail URL, snapshot-versus-full
+completeness, and the bounded raw payload. It also stores one selected
+provider-thumbnail artwork per recording plus per-recording thumbnail resolution
+state. Provider enrichment is display fallback evidence only; it never establishes
+recording identity and never overrides canonical selections.
+
 ## PLANNED
 
 Add discovery seeds/candidates and expanded job attempts when a real workflow

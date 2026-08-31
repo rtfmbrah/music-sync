@@ -39,10 +39,12 @@ an operator-confirmed abandoned cycle and never retries work implicitly.
 `service run` is the complete headless cycle. It uses the same exclusive durable run
 for core source synchronization, discovery/taste import and verified acquisition,
 artifact health, post-acquisition fingerprinting, conservative repair
-assessment/execution, canonical metadata, artwork, lyrics, source-preserving tags,
-and final playlists. Verified repair attempts are rehashed and committed
-automatically; rejected, unresolved, deferred, and commit failures remain isolated
-and auditable. A repeat retries previously verified but uncommitted safe repair work.
+assessment/execution, canonical metadata, bounded provider display enrichment,
+artwork, lyrics, source-preserving tags, and final playlists. Verified repair
+attempts are rehashed and committed automatically; rejected, unresolved, deferred,
+and commit failures remain isolated and auditable. A repeat retries previously
+verified but uncommitted safe repair work. Work-selecting phases report `skipped`
+when they selected zero candidates, so `succeeded` always means committed work.
 
 `events` performs immutable newest-first queries with exact severity, component,
 run, and job filters plus a hard result bound. It never creates SQLite sidecars or

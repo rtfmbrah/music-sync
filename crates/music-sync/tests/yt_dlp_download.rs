@@ -18,6 +18,7 @@ fn downloads_one_nonempty_file_directly_inside_staging() -> Result<(), Box<dyn s
         "while test \"$1\" != '--paths'; do shift; done\n\
          staging=$2\n\
          printf '%s' 'fixture audio' > \"$staging/media.opus\"\n\
+         printf '%s' '{\"id\":\"fixture\",\"webpage_url\":\"https://youtu.be/fixture\",\"title\":\"Track\",\"artist\":\"Artist\"}' > \"$staging/media.info.json\"\n\
          printf '%s\\n' \"$staging/media.opus\"",
     )?;
     let staging = tempfile::tempdir()?;
@@ -30,6 +31,7 @@ fn downloads_one_nonempty_file_directly_inside_staging() -> Result<(), Box<dyn s
         staging.path().canonicalize()?.join("media.opus")
     );
     assert_eq!(media.bytes, 13);
+    assert_eq!(media.raw_metadata["artist"], "Artist");
     assert_eq!(fs::read(media.path)?, b"fixture audio");
     Ok(())
 }
@@ -43,7 +45,7 @@ fn passes_request_and_randomized_download_pacing() -> Result<(), Box<dyn std::er
     fs::write(
         &executable,
         format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" >{}\nwhile test \"$1\" != '--paths'; do shift; done\nstaging=$2\nprintf audio >\"$staging/media.opus\"\nprintf '%s\\n' \"$staging/media.opus\"\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" >{}\nwhile test \"$1\" != '--paths'; do shift; done\nstaging=$2\nprintf audio >\"$staging/media.opus\"\nprintf '%s' '{{\"id\":\"fixture\",\"webpage_url\":\"https://youtu.be/fixture\",\"title\":\"Track\"}}' >\"$staging/media.info.json\"\nprintf '%s\\n' \"$staging/media.opus\"\n",
             marker.display()
         ),
     )?;

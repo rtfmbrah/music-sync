@@ -38,8 +38,12 @@ pub struct CanonicalTagSnapshot {
     pub title: String,
     /// Ordered canonical artist credit.
     pub artist: String,
-    /// Canonical release title.
-    pub album: String,
+    /// Explicit canonical/provider album; absent is not fabricated.
+    pub album: Option<String>,
+    /// Explicit provider/canonical genres; never inferred from title text.
+    pub genres: Vec<String>,
+    /// Auditable artist display provenance.
+    pub artist_provenance: Option<String>,
     /// Release date at available precision.
     pub date: Option<String>,
     /// Strong MusicBrainz recording identity.
@@ -136,9 +140,15 @@ impl MetadataRemuxer for FfmpegMetadataRemuxer {
                 .arg("-metadata")
                 .arg(format!("title={}", metadata.title))
                 .arg("-metadata")
-                .arg(format!("artist={}", metadata.artist))
-                .arg("-metadata")
-                .arg(format!("album={}", metadata.album));
+                .arg(format!("artist={}", metadata.artist));
+            if let Some(value) = &metadata.album {
+                command.arg("-metadata").arg(format!("album={value}"));
+            }
+            if !metadata.genres.is_empty() {
+                command
+                    .arg("-metadata")
+                    .arg(format!("genre={}", metadata.genres.join("; ")));
+            }
             if let Some(value) = &metadata.date {
                 command.arg("-metadata").arg(format!("date={value}"));
             }
@@ -212,12 +222,17 @@ fn write_ffmetadata(
             .replace('\n', "\\n")
     };
     let mut text = format!(
-        ";FFMETADATA1\ntitle={}\nartist={}\nalbum={}\nMETADATA_BLOCK_PICTURE={}\n",
+        ";FFMETADATA1\ntitle={}\nartist={}\nMETADATA_BLOCK_PICTURE={}\n",
         escape(&metadata.title),
         escape(&metadata.artist),
-        escape(&metadata.album),
         picture
     );
+    if let Some(value) = &metadata.album {
+        text.push_str(&format!("album={}\n", escape(value)));
+    }
+    if !metadata.genres.is_empty() {
+        text.push_str(&format!("genre={}\n", escape(&metadata.genres.join("; "))));
+    }
     if let Some(value) = &metadata.date {
         text.push_str(&format!("date={}\n", escape(value)));
     }
@@ -334,6 +349,8 @@ fn process_one(
             title: candidate.title.clone(),
             artist: candidate.artist_credit.clone(),
             album: candidate.release_title.clone(),
+            genres: serde_json::from_str(&candidate.genres_json)?,
+            artist_provenance: candidate.artist_provenance.clone(),
             date: candidate.release_date.clone(),
             musicbrainz_recording_id: candidate.musicbrainz_recording_id.clone(),
             isrc: candidate.isrc.clone(),
@@ -808,8 +825,10 @@ mod tests {
             channels: Some(2),
             title: "Title".into(),
             artist_credit: "Artist".into(),
-            release_title: "Album".into(),
+            release_title: Some("Album".into()),
             release_date: None,
+            genres_json: "[]".into(),
+            artist_provenance: Some("artist".into()),
             musicbrainz_recording_id: None,
             isrc: None,
             prepared: true,

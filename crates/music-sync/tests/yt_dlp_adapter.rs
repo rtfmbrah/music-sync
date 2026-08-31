@@ -64,6 +64,36 @@ fn enumerates_stored_playlist_fixture_through_subprocess() -> Result<(), Box<dyn
 }
 
 #[test]
+fn captures_complete_single_item_metadata_without_media_download()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _execution = FIXTURE_EXECUTION
+        .lock()
+        .map_err(|_| "fixture execution lock was poisoned")?;
+    let json = include_str!("fixtures/yt-dlp/video.json");
+    let (directory, executable) = fixture_script(&format!("printf '%s' '{json}'"))?;
+    let marker = directory.path().join("args");
+    let wrapper = directory.path().join("wrapper");
+    fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" >{}\nexec {} \"$@\"\n",
+            marker.display(),
+            executable.display()
+        ),
+    )?;
+    let mut permissions = fs::metadata(&wrapper)?.permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&wrapper, permissions)?;
+    let metadata =
+        YtDlp::new(wrapper, Duration::from_secs(1)).metadata("https://youtu.be/vid001")?;
+    assert_eq!(metadata["channel"], "Fixture Artist");
+    let arguments = fs::read_to_string(marker)?;
+    assert!(arguments.contains("--dump-single-json"));
+    assert!(!arguments.contains("--flat-playlist"));
+    Ok(())
+}
+
+#[test]
 fn classifies_private_and_malformed_fixture_results() -> Result<(), Box<dyn std::error::Error>> {
     let _execution = FIXTURE_EXECUTION
         .lock()

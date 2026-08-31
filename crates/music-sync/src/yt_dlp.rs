@@ -1,5 +1,6 @@
 //! Bounded `yt-dlp` adapter for YouTube source enumeration.
 
+use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -84,6 +85,25 @@ impl YtDlp {
         parse_snapshot(&stdout)
     }
 
+    /// Fetches one complete provider object without downloading media.
+    pub fn metadata(&self, url: &str) -> Result<Value, YtDlpError> {
+        let mut command = Command::new(&self.executable);
+        self.apply_youtube_runtime(&mut command);
+        self.apply_authentication(&mut command);
+        self.apply_request_pacing(&mut command);
+        command.args([
+            "--no-playlist",
+            "--dump-single-json",
+            "--no-warnings",
+            "--",
+            url,
+        ]);
+        let stdout = self.execute(&mut command)?;
+        let value: Value = serde_json::from_slice(&stdout).map_err(YtDlpError::Json)?;
+        parse_item(&value)?;
+        Ok(value)
+    }
+
     /// Downloads one provider item into an existing job-specific staging directory.
     ///
     /// The returned file remains staging evidence. This method never writes to or
@@ -120,6 +140,7 @@ impl YtDlp {
                 "bestaudio",
                 "--remux-video",
                 "webm>opus",
+                "--write-info-json",
                 "--paths",
             ])
             .arg(&staging)
@@ -236,9 +257,20 @@ fn validate_download_output(bytes: &[u8], staging: &Path) -> Result<DownloadedMe
     if metadata.len() == 0 {
         return Err(YtDlpError::DownloadEmpty(path));
     }
+    let info_path = staging.join("media.info.json");
+    let info_bytes = fs::read(&info_path).map_err(|source| YtDlpError::DownloadMetadata {
+        path: info_path.clone(),
+        source,
+    })?;
+    if info_bytes.len() > MAX_OUTPUT_BYTES {
+        return Err(YtDlpError::OutputTooLarge);
+    }
+    let raw_metadata: Value = serde_json::from_slice(&info_bytes).map_err(YtDlpError::Json)?;
+    parse_item(&raw_metadata)?;
     Ok(DownloadedMedia {
         path,
         bytes: metadata.len(),
+        raw_metadata,
     })
 }
 
@@ -249,6 +281,8 @@ pub struct DownloadedMedia {
     pub path: PathBuf,
     /// Exact file length observed after yt-dlp exited successfully.
     pub bytes: u64,
+    /// Complete bounded yt-dlp info JSON captured beside staging media.
+    pub raw_metadata: Value,
 }
 
 fn read_limited(reader: impl Read) -> io::Result<Vec<u8>> {
@@ -415,6 +449,14 @@ pub enum YtDlpError {
     /// The reported media file was empty.
     #[error("yt-dlp download is empty: {0}")]
     DownloadEmpty(PathBuf),
+    /// Complete yt-dlp info JSON could not be read from staging.
+    #[error("failed to read yt-dlp download metadata {path}: {source}")]
+    DownloadMetadata {
+        /// Expected owned info-json path.
+        path: PathBuf,
+        /// Underlying filesystem failure.
+        source: io::Error,
+    },
 }
 
 impl YtDlpError {
@@ -440,7 +482,8 @@ impl YtDlpError {
             | Self::StagingNotDirectory(_)
             | Self::DownloadedFile { .. }
             | Self::DownloadNotFile(_)
-            | Self::DownloadEmpty(_) => ProviderFailureKind::Transient,
+            | Self::DownloadEmpty(_)
+            | Self::DownloadMetadata { .. } => ProviderFailureKind::Transient,
         }
     }
 }

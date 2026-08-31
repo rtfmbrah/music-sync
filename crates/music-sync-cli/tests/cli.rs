@@ -210,7 +210,7 @@ fn adopted_provider_links_require_duration_and_fingerprint_proof()
     fs::write(
         &yt_dlp,
         format!(
-            "#!/bin/sh\ncase \" $* \" in *' --dump-single-json '*) printf '%s' '{{\"id\":\"{provider_id}\",\"webpage_url\":\"https://youtu.be/{provider_id}\",\"title\":\"Existing Track\",\"duration\":180}}' ;; *) previous=; for argument in \"$@\"; do if [ \"$previous\" = paths ]; then directory=$argument; break; fi; previous=${{argument#--}}; done; printf staged >\"$directory/media.opus\"; printf '%s\\n' \"$directory/media.opus\" ;; esac\n"
+            "#!/bin/sh\ncase \" $* \" in *' --dump-single-json '*) printf '%s' '{{\"id\":\"{provider_id}\",\"webpage_url\":\"https://youtu.be/{provider_id}\",\"title\":\"Existing Track\",\"duration\":180}}' ;; *) previous=; for argument in \"$@\"; do if [ \"$previous\" = paths ]; then directory=$argument; break; fi; previous=${{argument#--}}; done; printf staged >\"$directory/media.opus\"; printf '%s' '{{\"id\":\"{provider_id}\",\"webpage_url\":\"https://youtu.be/{provider_id}\",\"title\":\"Existing Track\"}}' >\"$directory/media.info.json\"; printf '%s\\n' \"$directory/media.opus\" ;; esac\n"
         ),
     )?;
     fs::write(
@@ -731,7 +731,7 @@ fn complete_service_runs_every_offline_phase_and_repeats_idempotently()
         .output()?;
     let history: serde_json::Value = serde_json::from_slice(&history.stdout)?;
     assert_eq!(history[0]["status"], "succeeded");
-    assert_eq!(history[0]["phase_count"], 14);
+    assert_eq!(history[0]["phase_count"], 15);
     assert_eq!(history[1]["status"], "succeeded");
     let database = state.join("music-sync.sqlite3");
     let connection = rusqlite::Connection::open(&database)?;
@@ -1166,7 +1166,7 @@ fn acquisition_run_one_defers_failure_then_commits_and_becomes_idle()
     fs::write(
         &yt_dlp,
         format!(
-            "#!/bin/sh\ncase \" $* \" in *' --dump-single-json '*) printf '%s' '{enumeration}' ;; *) while test \"$1\" != '--paths'; do shift; done; printf '%s' 'fixture audio' > \"$2/media.opus\"; printf '%s\\n' \"$2/media.opus\" ;; esac\n"
+            "#!/bin/sh\ncase \" $* \" in *' --dump-single-json '*) printf '%s' '{enumeration}' ;; *) while test \"$1\" != '--paths'; do shift; done; printf '%s' 'fixture audio' > \"$2/media.opus\"; printf '%s' '{{\"id\":\"fixture\",\"webpage_url\":\"https://youtu.be/fixture\",\"title\":\"Track\"}}' > \"$2/media.info.json\"; printf '%s\\n' \"$2/media.opus\" ;; esac\n"
         ),
     )?;
     let committed = run()?;
@@ -1233,7 +1233,7 @@ fn acquisition_run_pending_is_bounded_and_one_failure_does_not_block_others()
     let ffprobe = root.path().join("ffprobe");
     fs::write(
         &yt_dlp,
-        "#!/bin/sh\ncase \" $* \" in\n  *' --dump-single-json '*) printf '%s' '{\"id\":\"batch\",\"title\":\"Batch\",\"entries\":[{\"id\":\"good1\",\"url\":\"https://youtu.be/good1\"},{\"id\":\"bad\",\"url\":\"https://youtu.be/bad\"},{\"id\":\"good2\",\"url\":\"https://youtu.be/good2\"}]}' ;;\n  *' https://youtu.be/bad '*) printf '%s' 'temporary failure' >&2; exit 1 ;;\n  *) while test \"$1\" != '--paths'; do shift; done; printf '%s' 'fixture audio' > \"$2/media.opus\"; printf '%s\\n' \"$2/media.opus\" ;;\nesac\n",
+        "#!/bin/sh\ncase \" $* \" in\n  *' --dump-single-json '*) printf '%s' '{\"id\":\"batch\",\"title\":\"Batch\",\"entries\":[{\"id\":\"good1\",\"url\":\"https://youtu.be/good1\",\"title\":\"Good 1\"},{\"id\":\"bad\",\"url\":\"https://youtu.be/bad\",\"title\":\"Bad\"},{\"id\":\"good2\",\"url\":\"https://youtu.be/good2\",\"title\":\"Good 2\"}]}' ;;\n  *' https://youtu.be/bad '*) printf '%s' 'temporary failure' >&2; exit 1 ;;\n  *) while test \"$1\" != '--paths'; do shift; done; printf '%s' 'fixture audio' > \"$2/media.opus\"; printf '%s' '{\"id\":\"fixture\",\"webpage_url\":\"https://youtu.be/fixture\",\"title\":\"Track\"}' > \"$2/media.info.json\"; printf '%s\\n' \"$2/media.opus\" ;;\nesac\n",
     )?;
     fs::write(
         &ffprobe,
@@ -1345,7 +1345,7 @@ fn playlist_materialization_is_atomic_idempotent_and_tracks_active_membership()
         fs::write(
             &yt_dlp,
             format!(
-                "#!/bin/sh\ncase \" $* \" in\n  *' --dump-single-json '*) printf '%s' '{{\"id\":\"playlist\",\"title\":\"Fixture\",\"entries\":[{entries}]}}' ;;\n  *) while test \"$1\" != '--paths'; do shift; done; output=$2; shift 2; printf '%s' 'fixture audio' > \"$output/media.opus\"; printf '%s\\n' \"$output/media.opus\" ;;\nesac\n"
+                "#!/bin/sh\ncase \" $* \" in\n  *' --dump-single-json '*) printf '%s' '{{\"id\":\"playlist\",\"title\":\"Fixture\",\"entries\":[{entries}]}}' ;;\n  *) while test \"$1\" != '--paths'; do shift; done; output=$2; shift 2; printf '%s' 'fixture audio' > \"$output/media.opus\"; printf '%s' '{{\"id\":\"fixture\",\"webpage_url\":\"https://youtu.be/fixture\",\"title\":\"Track\"}}' > \"$output/media.info.json\"; printf '%s\\n' \"$output/media.opus\" ;;\nesac\n"
             ),
         )?;
         let mut permissions = fs::metadata(&yt_dlp)?.permissions();
@@ -1613,7 +1613,7 @@ fn sync_run_completes_all_phases_and_isolates_one_source_failure()
     fs::write(
         &yt_dlp,
         format!(
-            "#!/bin/sh\ncase \" $* \" in\n  *' --dump-single-json '*) case \" $* \" in *source-two*) if test -f {:?}; then printf '%s' 'temporary failure' >&2; exit 1; fi; printf '%s' '{{\"id\":\"two\",\"webpage_url\":\"https://youtu.be/two\",\"title\":\"Two\"}}' ;; *) printf '%s' '{{\"id\":\"one\",\"webpage_url\":\"https://youtu.be/one\",\"title\":\"One\"}}' ;; esac ;;\n  *) while test \"$1\" != '--paths'; do shift; done; output=$2; printf '%s' 'fixture audio' > \"$output/media.opus\"; printf '%s\\n' \"$output/media.opus\" ;;\nesac\n",
+            "#!/bin/sh\ncase \" $* \" in\n  *' --dump-single-json '*) case \" $* \" in *source-two*) if test -f {:?}; then printf '%s' 'temporary failure' >&2; exit 1; fi; printf '%s' '{{\"id\":\"two\",\"webpage_url\":\"https://youtu.be/two\",\"title\":\"Two\"}}' ;; *) printf '%s' '{{\"id\":\"one\",\"webpage_url\":\"https://youtu.be/one\",\"title\":\"One\"}}' ;; esac ;;\n  *) while test \"$1\" != '--paths'; do shift; done; output=$2; printf '%s' 'fixture audio' > \"$output/media.opus\"; printf '%s' '{{\"id\":\"fixture\",\"webpage_url\":\"https://youtu.be/fixture\",\"title\":\"Track\"}}' > \"$output/media.info.json\"; printf '%s\\n' \"$output/media.opus\" ;;\nesac\n",
             marker
         ),
     )?;
@@ -1837,7 +1837,7 @@ fn repair_verification_and_explicit_commit_preserve_the_lost_artifact_path()
     let fpcalc = root.path().join("fpcalc");
     fs::write(
         &yt_dlp,
-        "#!/bin/sh\nset -eu\ncase \" $* \" in\n  *' --dump-single-json '*) printf '%s' '{\"id\":\"original\",\"webpage_url\":\"https://youtu.be/original\",\"title\":\"Fixture Track\"}' ;;\n  *) while test \"$1\" != '--paths'; do shift; done; output=$2; printf '%s' 'candidate audio' > \"$output/media.opus\"; printf '%s\\n' \"$output/media.opus\" ;;\nesac\n",
+        "#!/bin/sh\nset -eu\ncase \" $* \" in\n  *' --dump-single-json '*) printf '%s' '{\"id\":\"original\",\"webpage_url\":\"https://youtu.be/original\",\"title\":\"Fixture Track\"}' ;;\n  *) while test \"$1\" != '--paths'; do shift; done; output=$2; printf '%s' 'candidate audio' > \"$output/media.opus\"; printf '%s' '{\"id\":\"fixture\",\"webpage_url\":\"https://youtu.be/fixture\",\"title\":\"Track\"}' > \"$output/media.info.json\"; printf '%s\\n' \"$output/media.opus\" ;;\nesac\n",
     )?;
     let mbid = "f59c5520-5f46-4d2c-b2c4-822eabf53419";
     fs::write(

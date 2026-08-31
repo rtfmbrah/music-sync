@@ -28,6 +28,8 @@ pub mod persistence;
 pub mod playlist;
 pub mod preservation;
 pub mod provider;
+pub mod provider_enrichment;
+pub mod provider_metadata;
 pub mod repair;
 pub mod service;
 pub mod sync;

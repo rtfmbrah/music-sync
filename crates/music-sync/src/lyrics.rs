@@ -24,8 +24,8 @@ pub struct LyricsSignature {
     pub track_name: String,
     /// Selected canonical artist credit.
     pub artist_name: String,
-    /// Selected canonical release title.
-    pub album_name: String,
+    /// Explicit canonical/provider album when known.
+    pub album_name: Option<String>,
     /// Probed duration rounded to whole seconds.
     pub duration_seconds: i64,
 }
@@ -125,14 +125,18 @@ impl LyricsProvider for Lrclib {
         *previous = Some(Instant::now());
         drop(previous);
         let duration = signature.duration_seconds.to_string();
-        let response = self
+        let request = self
             .agent
             .get(format!("{}/get", self.base_url))
             .query("track_name", &signature.track_name)
             .query("artist_name", &signature.artist_name)
-            .query("album_name", &signature.album_name)
-            .query("duration", &duration)
-            .call();
+            .query("duration", &duration);
+        let request = if let Some(album) = &signature.album_name {
+            request.query("album_name", album)
+        } else {
+            request
+        };
+        let response = request.call();
         let mut response = match response {
             Ok(response) => response,
             Err(ureq::Error::StatusCode(404)) => {
@@ -381,7 +385,10 @@ fn validate_signature(
     let same = |a: &str, b: &str| a.trim().to_lowercase() == b.trim().to_lowercase();
     if !same(&signature.track_name, &response.track_name)
         || !same(&signature.artist_name, &response.artist_name)
-        || !same(&signature.album_name, &response.album_name)
+        || signature
+            .album_name
+            .as_deref()
+            .is_some_and(|album| !same(album, &response.album_name))
         || (signature.duration_seconds - response.duration.round() as i64).abs() > 2
     {
         return Err(LyricsProviderError::SignatureMismatch);

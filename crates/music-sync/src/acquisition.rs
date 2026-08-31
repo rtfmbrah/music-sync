@@ -336,6 +336,7 @@ fn run_claimed_acquisition(
     let result = (|| {
         let staging = AcquisitionStaging::new(state_directory).prepare(work.job_id)?;
         let downloaded = downloader.download(&work.original_url, &staging)?;
+        database.record_acquisition_provider_metadata(work.job_id, &downloaded.raw_metadata)?;
         let validated = validate_staged_media(&downloaded.path, probe, hasher)?;
         if downloaded.bytes != validated.bytes {
             return Err(AcquisitionRunError::DownloadSizeChanged {

@@ -25,6 +25,12 @@ one absolute, non-empty regular file whose canonical parent is the staging direc
 The file remains uncommitted staging evidence until acquisition orchestration validates
 and commits it.
 
+The adapter also requests a `media.info.json` sidecar and requires it to be present,
+bounded, and parseable as a single provider object before a download is accepted.
+Acquisition persists that complete payload as full provider display enrichment for the
+owning provider item (schema version 20), so future metadata, artwork, and lyrics
+fallbacks never depend on re-contacting the provider for already-acquired media.
+
 Autonomous service construction supplies validated request and randomized download
 sleep bounds to the adapter. The delay occurs inside yt-dlp and remains covered by
 the bounded subprocess deadline. This pacing complements serial job processing and

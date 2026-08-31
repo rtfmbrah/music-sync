@@ -1959,7 +1959,32 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn Error>> {
                     "Metadata fields selected:{}",
                     report.metadata.selected_fields
                 );
+                println!("Provider metadata full:  {}", report.provider_metadata.full);
+                println!(
+                    "Provider metadata queued:{}",
+                    report.provider_metadata.snapshot
+                );
+                println!(
+                    "Provider artists:        {}",
+                    report.provider_metadata.with_artist
+                );
+                println!(
+                    "Provider albums:         {}",
+                    report.provider_metadata.with_album
+                );
+                println!(
+                    "Provider genres:         {}",
+                    report.provider_metadata.with_genres
+                );
+                println!(
+                    "Provider thumbnails:     {}",
+                    report.provider_metadata.with_thumbnail
+                );
                 println!("Artwork resolved:        {}", report.artwork.resolved);
+                println!(
+                    "Provider artwork:        {}",
+                    report.artwork.provider_resolved
+                );
                 println!("Artwork unavailable:     {}", report.artwork.unavailable);
                 println!("Artwork deferred:        {}", report.artwork.deferred);
                 println!("Artwork cached blobs:    {}", report.artwork.cached_blobs);

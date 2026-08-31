@@ -22,6 +22,7 @@ use crate::persistence::{
     Database, DatabaseError, DiscoverySeedReport, RepairVerificationDecision, ServicePhaseStatus,
 };
 use crate::playlist::{PlaylistMaterializationReport, materialize_playlists};
+use crate::provider_enrichment::{ProviderMetadataReport, enrich_provider_metadata};
 use crate::repair::{
     RepairAssessmentReport, RepairCandidateReport, RepairCommitReport, RepairRunOutcome,
     assess_repair_eligibility, commit_verified_repair, generate_repair_candidates,
@@ -210,13 +211,7 @@ pub fn run_complete_service(
                 limits.items,
             )
         },
-        |report| {
-            if report.failures.is_empty() {
-                ServicePhaseStatus::Succeeded
-            } else {
-                ServicePhaseStatus::Partial
-            }
-        },
+        |report| phase_for_work(report.selected, report.failures.is_empty()),
     )?;
     ordinal += 1;
     let health = execute_database_phase(
@@ -233,13 +228,7 @@ pub fn run_complete_service(
                 limits.items,
             )
         },
-        |report| {
-            if report.failures.is_empty() {
-                ServicePhaseStatus::Succeeded
-            } else {
-                ServicePhaseStatus::Partial
-            }
-        },
+        |report| phase_for_work(report.selected, report.failures.is_empty()),
     )?;
     ordinal += 1;
     let fingerprints = execute_database_phase(
@@ -315,13 +304,16 @@ pub fn run_complete_service(
         |database| {
             resolve_canonical_metadata(database, boundaries.canonical_metadata, limits.items)
         },
-        |report| {
-            if report.failures.is_empty() {
-                ServicePhaseStatus::Succeeded
-            } else {
-                ServicePhaseStatus::Partial
-            }
-        },
+        |report| phase_for_work(report.selected, report.failures.is_empty()),
+    )?;
+    ordinal += 1;
+    let provider_metadata = execute_database_phase(
+        database,
+        service_run_id,
+        "provider_metadata",
+        ordinal,
+        |database| enrich_provider_metadata(database, boundaries.source_adapter, limits.items),
+        |report| phase_for_work(report.selected, report.failures.is_empty()),
     )?;
     ordinal += 1;
     let artwork = execute_database_phase(
@@ -338,11 +330,10 @@ pub fn run_complete_service(
             )
         },
         |report| {
-            if report.failures.is_empty() {
-                ServicePhaseStatus::Succeeded
-            } else {
-                ServicePhaseStatus::Partial
-            }
+            phase_for_work(
+                report.selected,
+                report.failures.is_empty() && report.provider_failures.is_empty(),
+            )
         },
     )?;
     ordinal += 1;
@@ -352,13 +343,7 @@ pub fn run_complete_service(
         "lyrics",
         ordinal,
         |database| resolve_lyrics(database, boundaries.lyrics, limits.items),
-        |report| {
-            if report.failures.is_empty() {
-                ServicePhaseStatus::Succeeded
-            } else {
-                ServicePhaseStatus::Partial
-            }
-        },
+        |report| phase_for_work(report.selected, report.failures.is_empty()),
     )?;
     ordinal += 1;
     let tags = execute_database_phase(
@@ -376,13 +361,7 @@ pub fn run_complete_service(
                 limits.items,
             )
         },
-        |report| {
-            if report.failures.is_empty() {
-                ServicePhaseStatus::Succeeded
-            } else {
-                ServicePhaseStatus::Partial
-            }
-        },
+        |report| phase_for_work(report.selected, report.failures.is_empty()),
     )?;
     ordinal += 1;
     let playlists = execute_database_phase(
@@ -410,11 +389,22 @@ pub fn run_complete_service(
         repair_assessment,
         repair_execution,
         metadata,
+        provider_metadata,
         artwork,
         lyrics,
         tags,
         playlists,
     })
+}
+
+fn phase_for_work(selected: u64, successful: bool) -> ServicePhaseStatus {
+    if selected == 0 {
+        ServicePhaseStatus::Skipped
+    } else if successful {
+        ServicePhaseStatus::Succeeded
+    } else {
+        ServicePhaseStatus::Partial
+    }
 }
 
 fn run_automated_repairs(
@@ -544,6 +534,8 @@ pub struct CompleteServiceReport {
     pub repair_execution: AutomatedRepairReport,
     /// Canonical metadata.
     pub metadata: MetadataResolutionReport,
+    /// Complete provider display metadata kept separate from identity.
+    pub provider_metadata: ProviderMetadataReport,
     /// Canonical artwork.
     pub artwork: ArtworkResolutionReport,
     /// Adjacent lyrics.
@@ -569,7 +561,9 @@ impl CompleteServiceReport {
             && self.repair_assessment.failures.is_empty()
             && self.repair_execution.failures.is_empty()
             && self.metadata.failures.is_empty()
+            && self.provider_metadata.failures.is_empty()
             && self.artwork.failures.is_empty()
+            && self.artwork.provider_failures.is_empty()
             && self.lyrics.failures.is_empty()
             && self.tags.failures.is_empty()
             && self.playlists.failures.is_empty()

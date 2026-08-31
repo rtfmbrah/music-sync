@@ -13,6 +13,7 @@ use crate::discovery::{DiscoveryLane, Recommendation, score as discovery_score};
 use crate::musicbrainz::{CanonicalRecording, CanonicalRelease};
 use crate::provider::SourceSnapshot;
 use crate::provider::{AddSourceResult, ConfiguredSource, SourceId};
+use crate::provider_metadata::ProviderDisplayMetadata;
 
 const MIGRATIONS: &[(u32, &str)] = &[
     (1, include_str!("../migrations/0001_initial.sql")),
@@ -55,10 +56,14 @@ const MIGRATIONS: &[(u32, &str)] = &[
         include_str!("../migrations/0018_artifact_fingerprint_deferrals.sql"),
     ),
     (19, include_str!("../migrations/0019_playlist_adoption.sql")),
+    (
+        20,
+        include_str!("../migrations/0020_provider_enrichment.sql"),
+    ),
 ];
 
 /// Current durable schema version.
-pub const CURRENT_SCHEMA_VERSION: u32 = 19;
+pub const CURRENT_SCHEMA_VERSION: u32 = 20;
 
 /// A connection to music-sync's private application state.
 #[derive(Debug)]
@@ -251,6 +256,26 @@ impl Database {
                 )?,
                 selected_fields: count("SELECT COUNT(*) FROM metadata_selections")?,
             },
+            provider_metadata: ProviderMetadataCounts {
+                snapshot: count(
+                    "SELECT COUNT(*) FROM provider_item_enrichments WHERE completeness='snapshot'",
+                )?,
+                full: count(
+                    "SELECT COUNT(*) FROM provider_item_enrichments WHERE completeness='full'",
+                )?,
+                with_artist: count(
+                    "SELECT COUNT(*) FROM provider_item_enrichments WHERE display_artist IS NOT NULL",
+                )?,
+                with_album: count(
+                    "SELECT COUNT(*) FROM provider_item_enrichments WHERE album IS NOT NULL",
+                )?,
+                with_genres: count(
+                    "SELECT COUNT(*) FROM provider_item_enrichments WHERE json_array_length(genres_json)>0",
+                )?,
+                with_thumbnail: count(
+                    "SELECT COUNT(*) FROM provider_item_enrichments WHERE thumbnail_url IS NOT NULL",
+                )?,
+            },
             artwork: ArtworkResolutionCounts {
                 resolved: count(
                     "SELECT COUNT(*) FROM artwork_resolutions WHERE state = 'resolved'",
@@ -262,6 +287,7 @@ impl Database {
                     "SELECT COUNT(*) FROM artwork_resolutions WHERE state = 'deferred'",
                 )?,
                 cached_blobs: count("SELECT COUNT(*) FROM artwork_blobs")?,
+                provider_resolved: count("SELECT COUNT(*) FROM recording_provider_artwork")?,
             },
             lyrics: LyricsResolutionCounts {
                 resolved: count(
@@ -347,21 +373,24 @@ impl Database {
         for (id, provider, url, name, active, provider_collection_id) in source_rows {
             let mut members_statement = connection
                 .prepare(
-                    "SELECT provider_items.provider_item_id, provider_items.source_title,
+                    "SELECT provider_items.provider_item_id,
+                            COALESCE(provider_item_enrichments.display_title,provider_items.source_title),
                             collection_memberships.position, provider_items.availability,
                             jobs.status, artifacts.health,
-                            (SELECT metadata_observations.value
+                            COALESCE((SELECT metadata_observations.value
                              FROM metadata_selections
                              JOIN metadata_observations ON metadata_observations.id =
                                   metadata_selections.observation_id
                              WHERE metadata_selections.recording_id = recordings.id
                                AND metadata_selections.field = 'title'),
-                            (SELECT metadata_observations.value
+                             provider_item_enrichments.display_title),
+                            COALESCE((SELECT metadata_observations.value
                              FROM metadata_selections
                              JOIN metadata_observations ON metadata_observations.id =
                                   metadata_selections.observation_id
                              WHERE metadata_selections.recording_id = recordings.id
                                AND metadata_selections.field = 'artist_credit'),
+                             provider_item_enrichments.display_artist),
                             (SELECT events.message FROM events
                              WHERE events.job_id = jobs.id
                                AND events.level IN ('warning', 'error')
@@ -371,6 +400,8 @@ impl Database {
                           source_collections.collection_id
                      JOIN provider_items ON provider_items.id =
                           collection_memberships.provider_item_id
+                     LEFT JOIN provider_item_enrichments ON
+                          provider_item_enrichments.provider_item_id=provider_items.id
                      LEFT JOIN acquisition_jobs ON acquisition_jobs.provider_item_id =
                           provider_items.id
                      LEFT JOIN jobs ON jobs.id = acquisition_jobs.job_id
@@ -1359,6 +1390,130 @@ impl Database {
         Ok(changed)
     }
 
+    /// Loads managed recordings needing a provider-thumbnail fallback.
+    pub fn provider_artwork_candidates(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<ProviderArtworkCandidate>, DatabaseError> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut statement = self
+            .connection
+            .prepare(
+                "WITH ranked AS (
+               SELECT recordings.id AS recording_id, provider_items.id AS provider_item_id,
+                      provider_item_enrichments.thumbnail_url,
+                      ROW_NUMBER() OVER (PARTITION BY recordings.id ORDER BY
+                        CASE provider_item_enrichments.completeness WHEN 'full' THEN 0 ELSE 1 END,
+                        provider_items.id) AS rank
+               FROM recordings
+               JOIN artifacts ON artifacts.id=recordings.preferred_artifact_id
+               JOIN provider_items ON provider_items.recording_id=recordings.id
+               JOIN provider_item_enrichments ON
+                    provider_item_enrichments.provider_item_id=provider_items.id
+               WHERE artifacts.health='healthy'
+                 AND provider_item_enrichments.thumbnail_url IS NOT NULL
+                 AND EXISTS (SELECT 1 FROM acquisition_commits
+                             WHERE acquisition_commits.final_path=artifacts.path
+                               AND acquisition_commits.status='committed')
+             )
+             SELECT ranked.recording_id, ranked.provider_item_id, ranked.thumbnail_url
+             FROM ranked
+             LEFT JOIN recording_provider_artwork ON
+                  recording_provider_artwork.recording_id=ranked.recording_id
+             LEFT JOIN provider_artwork_resolutions ON
+                  provider_artwork_resolutions.recording_id=ranked.recording_id
+             WHERE ranked.rank=1 AND recording_provider_artwork.recording_id IS NULL
+               AND (provider_artwork_resolutions.recording_id IS NULL
+                    OR provider_artwork_resolutions.state='deferred')
+             ORDER BY ranked.recording_id LIMIT ?1",
+            )
+            .map_err(DatabaseError::Sqlite)?;
+        statement
+            .query_map([limit], |row| {
+                Ok(ProviderArtworkCandidate {
+                    recording_id: row.get(0)?,
+                    provider_item_id: row.get(1)?,
+                    source_url: row.get(2)?,
+                })
+            })
+            .map_err(DatabaseError::Sqlite)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(DatabaseError::Sqlite)
+    }
+
+    /// Records a provider-thumbnail fallback state without changing audio.
+    pub fn record_provider_artwork_state(
+        &mut self,
+        candidate: &ProviderArtworkCandidate,
+        state: ArtworkResolutionState,
+        message: &str,
+    ) -> Result<(), DatabaseError> {
+        if state == ArtworkResolutionState::Resolved {
+            return Err(DatabaseError::InvalidArtworkResolutionTransition);
+        }
+        self.connection.execute(
+            "INSERT INTO provider_artwork_resolutions(recording_id,provider_item_id,state,message)
+             VALUES (?1,?2,?3,?4) ON CONFLICT(recording_id) DO UPDATE SET
+             provider_item_id=excluded.provider_item_id,state=excluded.state,
+             message=excluded.message,updated_at=CURRENT_TIMESTAMP",
+            rusqlite::params![candidate.recording_id,candidate.provider_item_id,state.as_str(),message],
+        ).map_err(DatabaseError::Sqlite)?;
+        Ok(())
+    }
+
+    /// Selects one validated immutable provider thumbnail for a recording.
+    pub fn record_provider_artwork(
+        &mut self,
+        candidate: &ProviderArtworkCandidate,
+        blob: &ArtworkBlob,
+    ) -> Result<bool, DatabaseError> {
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(DatabaseError::Sqlite)?;
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO artwork_blobs(sha256,relative_path,mime_type,byte_count)
+             VALUES (?1,?2,?3,?4)",
+                rusqlite::params![
+                    blob.sha256,
+                    blob.relative_path,
+                    blob.mime_type,
+                    blob.byte_count
+                ],
+            )
+            .map_err(DatabaseError::Sqlite)?;
+        let blob_id = transaction
+            .query_row(
+                "SELECT id FROM artwork_blobs WHERE sha256=?1",
+                [&blob.sha256],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(DatabaseError::Sqlite)?;
+        let changed = transaction
+            .execute(
+                "INSERT OR IGNORE INTO recording_provider_artwork(
+             recording_id,provider_item_id,blob_id,source_url) VALUES (?1,?2,?3,?4)",
+                rusqlite::params![
+                    candidate.recording_id,
+                    candidate.provider_item_id,
+                    blob_id,
+                    candidate.source_url
+                ],
+            )
+            .map_err(DatabaseError::Sqlite)?
+            > 0;
+        transaction.execute(
+            "INSERT INTO provider_artwork_resolutions(recording_id,provider_item_id,state,message)
+             VALUES (?1,?2,'resolved','validated provider thumbnail cached and selected')
+             ON CONFLICT(recording_id) DO UPDATE SET provider_item_id=excluded.provider_item_id,
+             state='resolved',message=excluded.message,updated_at=CURRENT_TIMESTAMP",
+            rusqlite::params![candidate.recording_id,candidate.provider_item_id],
+        ).map_err(DatabaseError::Sqlite)?;
+        transaction.commit().map_err(DatabaseError::Sqlite)?;
+        Ok(changed)
+    }
+
     /// Loads managed healthy recordings needing lyrics resolution or sidecar completion.
     pub fn lyrics_work_candidates(
         &self,
@@ -1368,27 +1523,42 @@ impl Database {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT recordings.id, artifacts.id, artifacts.path, artifacts.duration_ms,
-                    title.value, artist.value, release.value,
+                "WITH ranked_provider AS (
+                   SELECT provider_items.recording_id, provider_item_enrichments.*,
+                     ROW_NUMBER() OVER (PARTITION BY provider_items.recording_id ORDER BY
+                       CASE completeness WHEN 'full' THEN 0 ELSE 1 END, provider_items.id) rank
+                   FROM provider_items JOIN provider_item_enrichments ON
+                     provider_item_enrichments.provider_item_id=provider_items.id
+                   WHERE provider_items.recording_id IS NOT NULL
+                 )
+                 SELECT recordings.id, artifacts.id, artifacts.path, artifacts.duration_ms,
+                    COALESCE(title.value, provider.display_title),
+                    COALESCE(artist.value, provider.display_artist),
+                    COALESCE(release.value, provider.album),
                     lyrics_observations.id, lyrics_observations.kind,
                     lyrics_observations.content, lyrics_outputs.state
              FROM recordings
              JOIN artifacts ON artifacts.id = recordings.preferred_artifact_id
-             JOIN metadata_selections title_selection ON title_selection.recording_id =
+             LEFT JOIN metadata_selections title_selection ON title_selection.recording_id =
                   recordings.id AND title_selection.field = 'title'
-             JOIN metadata_observations title ON title.id = title_selection.observation_id
-             JOIN metadata_selections artist_selection ON artist_selection.recording_id =
+             LEFT JOIN metadata_observations title ON title.id = title_selection.observation_id
+             LEFT JOIN metadata_selections artist_selection ON artist_selection.recording_id =
                   recordings.id AND artist_selection.field = 'artist_credit'
-             JOIN metadata_observations artist ON artist.id = artist_selection.observation_id
-             JOIN metadata_selections release_selection ON release_selection.recording_id =
+             LEFT JOIN metadata_observations artist ON artist.id = artist_selection.observation_id
+             LEFT JOIN metadata_selections release_selection ON release_selection.recording_id =
                   recordings.id AND release_selection.field = 'release'
-             JOIN metadata_observations release ON release.id = release_selection.observation_id
+             LEFT JOIN metadata_observations release ON release.id = release_selection.observation_id
+             LEFT JOIN ranked_provider provider ON provider.recording_id=recordings.id
+                  AND provider.rank=1
              LEFT JOIN lyrics_selections ON lyrics_selections.recording_id = recordings.id
              LEFT JOIN lyrics_observations ON lyrics_observations.id =
                   lyrics_selections.observation_id
              LEFT JOIN lyrics_resolutions ON lyrics_resolutions.recording_id = recordings.id
              LEFT JOIN lyrics_outputs ON lyrics_outputs.recording_id = recordings.id
              WHERE artifacts.health = 'healthy' AND artifacts.duration_ms > 0
+               AND COALESCE(title.value, provider.display_title) IS NOT NULL
+               AND COALESCE(artist.value, provider.display_artist) IS NOT NULL
+               AND (artist.value IS NOT NULL OR provider.artist_provenance IN ('artist','creator'))
                AND (EXISTS (SELECT 1 FROM acquisition_commits
                             WHERE acquisition_commits.final_path = artifacts.path
                               AND acquisition_commits.status = 'committed')
@@ -1590,20 +1760,35 @@ impl Database {
     ) -> Result<Vec<MetadataMaterializationCandidate>, DatabaseError> {
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let mut statement = self.connection.prepare(
-            "SELECT recordings.id, artifacts.id, artifacts.path, artifacts.sha256,
+            "WITH ranked_provider AS (
+               SELECT provider_items.recording_id, provider_item_enrichments.*,
+                 ROW_NUMBER() OVER (PARTITION BY provider_items.recording_id ORDER BY
+                   CASE completeness WHEN 'full' THEN 0 ELSE 1 END, provider_items.id) rank
+               FROM provider_items JOIN provider_item_enrichments ON
+                 provider_item_enrichments.provider_item_id=provider_items.id
+               WHERE provider_items.recording_id IS NOT NULL
+             )
+             SELECT recordings.id, artifacts.id, artifacts.path, artifacts.sha256,
                     artifacts.codec, artifacts.duration_ms, artifacts.sample_rate_hz,
-                    artifacts.channels, title.value, artist.value, release.value,
-                    date.value, recordings.musicbrainz_recording_id, recordings.isrc,
+                    artifacts.channels, COALESCE(title.value,provider.display_title),
+                    COALESCE(artist.value,provider.display_artist),
+                    COALESCE(release.value,provider.album),
+                    COALESCE(date.value,provider.release_date), COALESCE(provider.genres_json,'[]'),
+                    CASE WHEN artist.value IS NOT NULL THEN 'musicbrainz'
+                         ELSE provider.artist_provenance END,
+                    recordings.musicbrainz_recording_id, recordings.isrc,
                     metadata_materializations.state, artwork_blobs.relative_path,
-                    artwork_blobs.mime_type, metadata_materialization_staging.recording_id
+                    artwork_blobs.mime_type, provider_art.relative_path,
+                    provider_art.mime_type, metadata_materialization_staging.recording_id
              FROM recordings
              JOIN artifacts ON artifacts.id = recordings.preferred_artifact_id
-             JOIN metadata_selections ts ON ts.recording_id=recordings.id AND ts.field='title'
-             JOIN metadata_observations title ON title.id=ts.observation_id
-             JOIN metadata_selections ars ON ars.recording_id=recordings.id AND ars.field='artist_credit'
-             JOIN metadata_observations artist ON artist.id=ars.observation_id
-             JOIN metadata_selections rs ON rs.recording_id=recordings.id AND rs.field='release'
-             JOIN metadata_observations release ON release.id=rs.observation_id
+             LEFT JOIN metadata_selections ts ON ts.recording_id=recordings.id AND ts.field='title'
+             LEFT JOIN metadata_observations title ON title.id=ts.observation_id
+             LEFT JOIN metadata_selections ars ON ars.recording_id=recordings.id AND ars.field='artist_credit'
+             LEFT JOIN metadata_observations artist ON artist.id=ars.observation_id
+             LEFT JOIN metadata_selections rs ON rs.recording_id=recordings.id AND rs.field='release'
+             LEFT JOIN metadata_observations release ON release.id=rs.observation_id
+             LEFT JOIN ranked_provider provider ON provider.recording_id=recordings.id AND provider.rank=1
              LEFT JOIN metadata_selections ds ON ds.recording_id=recordings.id AND ds.field='release_date'
              LEFT JOIN metadata_observations date ON date.id=ds.observation_id
              LEFT JOIN metadata_materializations ON metadata_materializations.recording_id=recordings.id
@@ -1611,8 +1796,12 @@ impl Database {
              LEFT JOIN releases selected_release ON selected_release.musicbrainz_release_id=release.source_entity_id
              LEFT JOIN release_artwork ON release_artwork.release_id=selected_release.id
              LEFT JOIN artwork_blobs ON artwork_blobs.id=release_artwork.blob_id
+             LEFT JOIN recording_provider_artwork ON recording_provider_artwork.recording_id=recordings.id
+             LEFT JOIN artwork_blobs provider_art ON provider_art.id=recording_provider_artwork.blob_id
              LEFT JOIN metadata_materialization_staging ON metadata_materialization_staging.recording_id=recordings.id
              WHERE artifacts.health='healthy' AND artifacts.sha256 IS NOT NULL
+               AND COALESCE(title.value,provider.display_title) IS NOT NULL
+               AND COALESCE(artist.value,provider.display_artist) IS NOT NULL
                AND (EXISTS (SELECT 1 FROM acquisition_commits WHERE final_path=artifacts.path AND status='committed')
                     OR EXISTS (SELECT 1 FROM repair_commits WHERE final_path=artifacts.path AND committed_at IS NOT NULL))
                AND (metadata_materializations.recording_id IS NULL OR metadata_materializations.state='prepared')
@@ -1634,12 +1823,14 @@ impl Database {
                     artist_credit: row.get(9)?,
                     release_title: row.get(10)?,
                     release_date: row.get(11)?,
-                    musicbrainz_recording_id: row.get(12)?,
-                    isrc: row.get(13)?,
-                    prepared: row.get::<_, Option<String>>(14)?.as_deref() == Some("prepared"),
-                    artwork_relative_path: row.get(15)?,
-                    artwork_mime_type: row.get(16)?,
-                    staging_reserved: row.get::<_, Option<i64>>(17)?.is_some(),
+                    genres_json: row.get(12)?,
+                    artist_provenance: row.get(13)?,
+                    musicbrainz_recording_id: row.get(14)?,
+                    isrc: row.get(15)?,
+                    prepared: row.get::<_, Option<String>>(16)?.as_deref() == Some("prepared"),
+                    artwork_relative_path: row.get::<_, Option<String>>(17)?.or(row.get(19)?),
+                    artwork_mime_type: row.get::<_, Option<String>>(18)?.or(row.get(20)?),
+                    staging_reserved: row.get::<_, Option<i64>>(21)?.is_some(),
                 })
             })
             .map_err(DatabaseError::Sqlite)?
@@ -3509,6 +3700,12 @@ impl Database {
                 summary.provider_items_inserted += 1;
                 transaction.last_insert_rowid()
             };
+            upsert_provider_display_metadata(
+                &transaction,
+                provider_item_id,
+                &item.raw_metadata,
+                "snapshot",
+            )?;
             seen.insert(provider_item_id);
             if previously_active.contains(&provider_item_id) {
                 summary.memberships_unchanged += 1;
@@ -3560,6 +3757,77 @@ impl Database {
             .map_err(DatabaseError::Sqlite)?;
         transaction.commit().map_err(DatabaseError::Sqlite)?;
         Ok(summary)
+    }
+
+    /// Loads v2-owned provider objects that still lack complete single-item metadata.
+    pub fn provider_metadata_candidates(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<ProviderMetadataCandidate>, DatabaseError> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT DISTINCT provider_items.id, provider_items.original_url
+             FROM provider_items
+             JOIN recordings ON recordings.id=provider_items.recording_id
+             JOIN artifacts ON artifacts.id=recordings.preferred_artifact_id
+             LEFT JOIN provider_item_enrichments ON
+                  provider_item_enrichments.provider_item_id=provider_items.id
+             WHERE provider_items.provider='youtube' AND artifacts.health='healthy'
+               AND EXISTS (SELECT 1 FROM acquisition_commits
+                           WHERE acquisition_commits.final_path=artifacts.path
+                             AND acquisition_commits.status='committed')
+               AND (provider_item_enrichments.provider_item_id IS NULL
+                    OR provider_item_enrichments.completeness!='full')
+             ORDER BY provider_items.id LIMIT ?1",
+            )
+            .map_err(DatabaseError::Sqlite)?;
+        statement
+            .query_map([limit], |row| {
+                Ok(ProviderMetadataCandidate {
+                    provider_item_id: row.get(0)?,
+                    original_url: row.get(1)?,
+                })
+            })
+            .map_err(DatabaseError::Sqlite)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(DatabaseError::Sqlite)
+    }
+
+    /// Persists a bounded complete provider payload and derived display fields.
+    pub fn record_provider_metadata(
+        &mut self,
+        provider_item_id: i64,
+        raw_metadata: &serde_json::Value,
+    ) -> Result<(), DatabaseError> {
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(DatabaseError::Sqlite)?;
+        upsert_provider_display_metadata(&transaction, provider_item_id, raw_metadata, "full")?;
+        transaction.commit().map_err(DatabaseError::Sqlite)
+    }
+
+    /// Persists complete download metadata for the provider object owned by a job.
+    pub fn record_acquisition_provider_metadata(
+        &mut self,
+        job_id: i64,
+        raw_metadata: &serde_json::Value,
+    ) -> Result<(), DatabaseError> {
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(DatabaseError::Sqlite)?;
+        let provider_item_id = transaction
+            .query_row(
+                "SELECT provider_item_id FROM acquisition_jobs WHERE job_id=?1",
+                [job_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(DatabaseError::Sqlite)?;
+        upsert_provider_display_metadata(&transaction, provider_item_id, raw_metadata, "full")?;
+        transaction.commit().map_err(DatabaseError::Sqlite)
     }
 
     /// Atomically claims the oldest explicitly pending acquisition job.
@@ -4606,6 +4874,52 @@ fn apply_migration(
     Ok(())
 }
 
+fn upsert_provider_display_metadata(
+    transaction: &Transaction<'_>,
+    provider_item_id: i64,
+    raw_metadata: &serde_json::Value,
+    completeness: &str,
+) -> Result<(), DatabaseError> {
+    let Some(metadata) = ProviderDisplayMetadata::from_ytdlp(raw_metadata) else {
+        return Ok(());
+    };
+    let genres_json = serde_json::to_string(&metadata.genres).map_err(DatabaseError::Json)?;
+    let raw_metadata_json = serde_json::to_string(raw_metadata).map_err(DatabaseError::Json)?;
+    transaction.execute(
+        "INSERT INTO provider_item_enrichments(provider_item_id,display_title,
+         display_artist,artist_provenance,album,release_date,genres_json,thumbnail_url,
+         completeness,raw_metadata_json)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+         ON CONFLICT(provider_item_id) DO UPDATE SET
+           display_title=excluded.display_title,
+           display_artist=COALESCE(excluded.display_artist,provider_item_enrichments.display_artist),
+           artist_provenance=COALESCE(excluded.artist_provenance,provider_item_enrichments.artist_provenance),
+           album=COALESCE(excluded.album,provider_item_enrichments.album),
+           release_date=COALESCE(excluded.release_date,provider_item_enrichments.release_date),
+           genres_json=CASE WHEN excluded.genres_json!='[]' THEN excluded.genres_json
+                            ELSE provider_item_enrichments.genres_json END,
+           thumbnail_url=COALESCE(excluded.thumbnail_url,provider_item_enrichments.thumbnail_url),
+           completeness=CASE WHEN provider_item_enrichments.completeness='full' THEN 'full'
+                             ELSE excluded.completeness END,
+           raw_metadata_json=CASE WHEN excluded.completeness='full' THEN excluded.raw_metadata_json
+                                  ELSE provider_item_enrichments.raw_metadata_json END,
+           updated_at=CURRENT_TIMESTAMP",
+        rusqlite::params![
+            provider_item_id,
+            metadata.title,
+            metadata.artist,
+            metadata.artist_provenance,
+            metadata.album,
+            metadata.release_date,
+            genres_json,
+            metadata.thumbnail_url,
+            completeness,
+            raw_metadata_json,
+        ],
+    ).map_err(DatabaseError::Sqlite)?;
+    Ok(())
+}
+
 /// Result of a read-only database inspection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DatabaseInspection {
@@ -4752,6 +5066,8 @@ pub struct OperationalStatus {
     pub repair_attempts: RepairAttemptCounts,
     /// Canonical metadata resolution and selected-field counts.
     pub metadata: MetadataResolutionCounts,
+    /// Provenance-aware provider display-metadata coverage.
+    pub provider_metadata: ProviderMetadataCounts,
     /// Release artwork resolution and immutable-cache counts.
     pub artwork: ArtworkResolutionCounts,
     /// Lyrics resolution and committed adjacent-output counts.
@@ -4841,6 +5157,23 @@ pub struct MetadataResolutionCounts {
     pub selected_fields: u64,
 }
 
+/// Coverage of provider display metadata kept separate from canonical identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct ProviderMetadataCounts {
+    /// Flat source-snapshot payloads awaiting a full single-item refresh.
+    pub snapshot: u64,
+    /// Complete persisted single-item payloads.
+    pub full: u64,
+    /// Items with explicit or provenance-labelled display artists.
+    pub with_artist: u64,
+    /// Items with an explicit provider album.
+    pub with_album: u64,
+    /// Items with at least one explicit non-generic genre.
+    pub with_genres: u64,
+    /// Items with a secure provider thumbnail URL.
+    pub with_thumbnail: u64,
+}
+
 /// Durable release-artwork and immutable-cache counts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct ArtworkResolutionCounts {
@@ -4852,6 +5185,8 @@ pub struct ArtworkResolutionCounts {
     pub deferred: u64,
     /// Unique content-addressed image blobs.
     pub cached_blobs: u64,
+    /// Recordings using a validated provider-thumbnail fallback.
+    pub provider_resolved: u64,
 }
 
 /// Durable lyrics resolution and sidecar counts.
@@ -5009,7 +5344,8 @@ pub enum ServicePhaseStatus {
     Partial,
     /// Phase failed.
     Failed,
-    /// Dependency or configuration deliberately skipped the phase.
+    /// Dependency or configuration deliberately skipped the phase, or the phase
+    /// selected zero candidates and therefore committed no work.
     Skipped,
 }
 impl ServicePhaseStatus {
@@ -5319,6 +5655,15 @@ pub struct MetadataResolutionCandidate {
     pub isrc: Option<String>,
 }
 
+/// One owned provider object requiring complete single-item display metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderMetadataCandidate {
+    /// Durable provider-item row.
+    pub provider_item_id: i64,
+    /// Original provider URL used for the bounded metadata request.
+    pub original_url: String,
+}
+
 /// Strong lookup method used for one durable resolution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MetadataResolutionMethod {
@@ -5379,6 +5724,17 @@ pub struct ArtworkResolutionCandidate {
     pub release_id: i64,
     /// Exact MusicBrainz release MBID.
     pub musicbrainz_release_id: String,
+}
+
+/// Managed recording and secure provider thumbnail selected as artwork fallback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderArtworkCandidate {
+    /// Durable recording.
+    pub recording_id: i64,
+    /// Provider object supplying the thumbnail.
+    pub provider_item_id: i64,
+    /// Exact HTTPS thumbnail URL.
+    pub source_url: String,
 }
 
 /// Non-destructive durable artwork resolution state.
@@ -5444,7 +5800,7 @@ pub struct LyricsWorkCandidate {
     /// Selected canonical artist credit.
     pub artist_credit: String,
     /// Selected canonical release title.
-    pub release_title: String,
+    pub release_title: Option<String>,
     /// Existing selected lyrics observation, when resolution already succeeded.
     pub observation_id: Option<i64>,
     /// Existing selected synchronized/plain kind.
@@ -5518,9 +5874,13 @@ pub struct MetadataMaterializationCandidate {
     /// Selected artist credit.
     pub artist_credit: String,
     /// Selected release title.
-    pub release_title: String,
+    pub release_title: Option<String>,
     /// Selected release date.
     pub release_date: Option<String>,
+    /// Explicit provider genres serialized as a JSON string array.
+    pub genres_json: String,
+    /// Provider artist source when canonical artist credit is unavailable.
+    pub artist_provenance: Option<String>,
     /// Strong recording MBID when known.
     pub musicbrainz_recording_id: Option<String>,
     /// Normalized ISRC when known.
@@ -6633,6 +6993,73 @@ mod tests {
         assert!(database.artwork_resolution_candidates(10)?.is_empty());
         assert_eq!(database.table_count("artwork_blobs")?, 1);
         assert_eq!(database.table_count("release_artwork")?, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn provider_fallback_drives_owned_artwork_lyrics_and_tags_without_identity_claims()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut database = Database::open_in_memory()?;
+        database
+            .connection
+            .execute("INSERT INTO recordings DEFAULT VALUES", [])?;
+        database.connection.execute(
+            "INSERT INTO artifacts(recording_id,path,sha256,duration_ms,codec,health)
+             VALUES (1,'/music/youtube/item.opus',?1,180000,'opus','healthy')",
+            ["00".repeat(32)],
+        )?;
+        database.connection.execute(
+            "UPDATE recordings SET preferred_artifact_id=1 WHERE id=1",
+            [],
+        )?;
+        database.connection.execute(
+            "INSERT INTO provider_items(provider,provider_item_id,original_url,recording_id)
+             VALUES ('youtube','item','https://youtu.be/item',1)",
+            [],
+        )?;
+        database.connection.execute(
+            "INSERT INTO sync_runs(status,finished_at) VALUES ('succeeded',CURRENT_TIMESTAMP)",
+            [],
+        )?;
+        database.connection.execute(
+            "INSERT INTO jobs(run_id,kind,status,idempotency_key)
+             VALUES (1,'acquire','succeeded','acquire:youtube:item')",
+            [],
+        )?;
+        database.connection.execute(
+            "INSERT INTO acquisition_jobs(job_id,provider_item_id) VALUES (1,1)",
+            [],
+        )?;
+        database.connection.execute(
+            "INSERT INTO acquisition_commits(job_id,staged_path,final_path,sha256,bytes,
+             codec,duration_ms,status,committed_at)
+             VALUES (1,'/state/media.opus','/music/youtube/item.opus',?1,10,
+                     'opus',180000,'committed',CURRENT_TIMESTAMP)",
+            ["00".repeat(32)],
+        )?;
+        database.record_provider_metadata(
+            1,
+            &serde_json::json!({
+                "id":"item", "webpage_url":"https://youtu.be/item",
+                "track":"Provider Track", "artist":"Provider Artist",
+                "album":"Provider Album", "genre":"Frenchcore",
+                "release_year":2026,
+                "thumbnails":[{"url":"https://img.example/item.jpg"}]
+            }),
+        )?;
+
+        assert!(database.metadata_resolution_candidates(10)?.is_empty());
+        assert!(database.provider_metadata_candidates(10)?.is_empty());
+        let artwork = database.provider_artwork_candidates(10)?;
+        assert_eq!(artwork.len(), 1);
+        let lyrics = database.lyrics_work_candidates(10)?;
+        assert_eq!(lyrics[0].title, "Provider Track");
+        assert_eq!(lyrics[0].artist_credit, "Provider Artist");
+        assert_eq!(lyrics[0].release_title.as_deref(), Some("Provider Album"));
+        let tags = database.metadata_materialization_candidates(10)?;
+        assert_eq!(tags[0].release_title.as_deref(), Some("Provider Album"));
+        assert_eq!(tags[0].genres_json, "[\"Frenchcore\"]");
+        assert_eq!(tags[0].artist_provenance.as_deref(), Some("artist"));
         Ok(())
     }
 

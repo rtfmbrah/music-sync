@@ -15,6 +15,12 @@ provider order, absent memberships are only deactivated, and acquisition jobs us
 stable provider-item idempotency key. Provider failures occur before reconciliation
 and therefore cannot masquerade as an empty snapshot.
 
+During reconciliation, each upserted snapshot item also persists a bounded
+snapshot-completeness provider display-enrichment row (schema version 20) derived
+from the enumeration payload. This gives managed media an immediate, provenance-
+labelled display fallback before any single-item refresh; it is display evidence
+only and never establishes recording identity.
+
 `sync run` composes all currently implemented phases for timer-driven operation. It
 enumerates active sources in stable ID order, isolates enumeration failures, commits
 successful snapshots, attempts one bounded acquisition snapshot, and then atomically
