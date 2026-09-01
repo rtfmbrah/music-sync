@@ -731,7 +731,7 @@ fn complete_service_runs_every_offline_phase_and_repeats_idempotently()
         .output()?;
     let history: serde_json::Value = serde_json::from_slice(&history.stdout)?;
     assert_eq!(history[0]["status"], "succeeded");
-    assert_eq!(history[0]["phase_count"], 15);
+    assert_eq!(history[0]["phase_count"], 16);
     assert_eq!(history[1]["status"], "succeeded");
     let database = state.join("music-sync.sqlite3");
     let connection = rusqlite::Connection::open(&database)?;

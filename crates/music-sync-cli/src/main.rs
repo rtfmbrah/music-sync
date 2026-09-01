@@ -27,6 +27,7 @@ use music_sync::discovery::{DfFreeSpace, run_discovery};
 use music_sync::discovery_routing::route_approved_discovery;
 use music_sync::duplicates::{DuplicateEvidenceKind, analyze_duplicates};
 use music_sync::fingerprint::{Fpcalc, reconcile_artifact_fingerprints};
+use music_sync::genre::resolve_genres;
 use music_sync::health::reconcile_artifact_health;
 use music_sync::listenbrainz::ListenBrainz;
 use music_sync::lyrics::{Lrclib, resolve_lyrics};
@@ -416,6 +417,15 @@ enum DiscoveryCommand {
 
 #[derive(Debug, Subcommand)]
 enum MetadataCommand {
+    /// Resolve identity-verified recording genres through configured MusicBrainz.
+    Genres {
+        /// TOML configuration identifying state and MusicBrainz policy.
+        #[arg(short, long, default_value = "music-sync.toml")]
+        config: PathBuf,
+        /// Maximum recordings attempted once in stable order.
+        #[arg(long, default_value = "100")]
+        max_recordings: NonZeroUsize,
+    },
     /// Resolve a bounded set of strong recording identities through MusicBrainz.
     Resolve {
         /// TOML configuration identifying application state.
@@ -1218,6 +1228,7 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn Error>> {
                     hasher: &Sha256FileHasher,
                     fingerprinter: &fingerprinter,
                     canonical_metadata: &musicbrainz,
+                    genres: &musicbrainz,
                     artwork: &artwork,
                     lyrics: &lyrics,
                     remuxer: &remuxer,
@@ -1636,6 +1647,54 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn Error>> {
         }
         Command::Metadata {
             command:
+                MetadataCommand::Genres {
+                    config,
+                    max_recordings,
+                },
+        } => {
+            let config = AppConfig::from_file(&config)?;
+            let user_agent = config
+                .service
+                .user_agent
+                .as_deref()
+                .ok_or("genre enrichment requires service.user_agent")?;
+            let endpoint = &config.service.musicbrainz_endpoint;
+            let loopback =
+                endpoint.starts_with("http://127.0.0.1:") || endpoint.starts_with("http://[::1]:");
+            if !endpoint.starts_with("https://") && !loopback {
+                return Err("genre endpoint must use HTTPS or loopback HTTP".into());
+            }
+            let provider = MusicBrainz::with_endpoint(
+                endpoint,
+                user_agent,
+                Duration::from_secs(config.service.http_timeout_seconds),
+                if loopback {
+                    Duration::ZERO
+                } else {
+                    Duration::from_secs(1)
+                },
+                !loopback,
+            )?;
+            let mut database = Database::open(&config.database_path())?;
+            let report = resolve_genres(&mut database, &provider, max_recordings.get())?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("Recordings selected:  {}", report.selected);
+                println!("Genres resolved:      {}", report.resolved);
+                println!("Genres unavailable:   {}", report.unavailable);
+                println!("Genres ambiguous:     {}", report.ambiguous);
+                println!("Genres deferred:      {}", report.deferred);
+                println!("Genre tags selected:  {}", report.genres_selected);
+            }
+            Ok(if report.failures.is_empty() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(1)
+            })
+        }
+        Command::Metadata {
+            command:
                 MetadataCommand::Resolve {
                     config,
                     user_agent,
@@ -1980,6 +2039,11 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn Error>> {
                     "Provider thumbnails:     {}",
                     report.provider_metadata.with_thumbnail
                 );
+                println!("Genres resolved:        {}", report.genres.resolved);
+                println!("Genres unavailable:     {}", report.genres.unavailable);
+                println!("Genres ambiguous:       {}", report.genres.ambiguous);
+                println!("Genres deferred:        {}", report.genres.deferred);
+                println!("Genre tags selected:    {}", report.genres.selected);
                 println!("Artwork resolved:        {}", report.artwork.resolved);
                 println!(
                     "Provider artwork:        {}",

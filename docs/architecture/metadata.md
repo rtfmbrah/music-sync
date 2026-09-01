@@ -67,6 +67,33 @@ recorded by earlier builds. It changes only unresolved rows without a selected l
 or sidecar, retains unrelated transient deferrals, and writes one audit event per
 reclassified recording.
 
+Schema version 22 adds external genre resolution separately from canonical fields and
+provider display payloads. MusicBrainz exact recording MBIDs are preferred. Recordings
+without a strong ID use a bounded search, but a result is accepted only when the
+normalized complete title and artist credit, local duration within three seconds,
+perfect provider score, and meaningful version qualifiers all agree. Zero matches,
+multiple matches, absent genre evidence, and retryable provider failures are durable
+distinct states. Only MusicBrainz's positive recording-genre vocabulary is selected;
+arbitrary folksonomy tags and artist-level genres are not silently applied to a track.
+
+Selected genres retain source recording identity, confidence, and recording scope.
+They are merged with explicit non-generic provider genres. A new selection releases
+only music-sync's prior tag-materialization intent and schedules a source-preserving
+stream-copy retag; it neither downloads nor transcodes audio, and prior exact bytes
+remain in immutable artifact history.
+MusicBrainz is intentionally the only external genre source. Rate-limit and temporary
+gateway responses use three bounded exponential retries in addition to the global
+request pacing; exhausted failures remain durable and retryable. Missing open genre
+evidence stays absent rather than falling back to a proprietary catalog or inference.
+
+Schema version 23 adds a lower-confidence MusicBrainz artist-scope fallback for the
+case where no identity-verified recording genre is available. It requires exactly one
+perfect-score artist search result whose normalized complete name equals the provider
+or canonical artist; it then reads only that artist entity's positive MusicBrainz
+genres. These values are stored with `artist` scope and 650,000 fixed-point confidence,
+never presented as recording identity. The migration releases prior empty schema-22
+results once so the new open-data strategy can evaluate them.
+
 Adjacent `.lrc` output is restricted to healthy preferred artifacts proven owned by
 a committed acquisition or repair. Adopted files are never mutated. Output intent is
 prepared in SQLite before a same-filesystem no-clobber commit, enabling exact-byte

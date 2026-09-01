@@ -16,6 +16,7 @@ pub mod discovery;
 pub mod discovery_routing;
 pub mod duplicates;
 pub mod fingerprint;
+pub mod genre;
 pub mod health;
 pub mod identity;
 pub mod listenbrainz;

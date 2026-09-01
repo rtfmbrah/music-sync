@@ -56,6 +56,10 @@ in ad hoc TODO documents.
   artwork, and tags without identity claims, plus explicit zero-work phase status
   (complete and production accepted, including compatible PNG-cover rematerialization,
   durable lyrics mismatch migration, and real Navidrome/Feishin verification).
+- Conservative external genre enrichment (schemas 22–23): bounded MusicBrainz
+  exact/search resolution, duration and version verification, provenance, provider
+  genre merging, exact-artist fallback, and lossless retagging (complete and
+  production accepted on schema 23).
 
 ## P4 — Autonomous discovery
 

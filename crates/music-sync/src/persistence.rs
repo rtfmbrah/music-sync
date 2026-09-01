@@ -64,10 +64,15 @@ const MIGRATIONS: &[(u32, &str)] = &[
         21,
         include_str!("../migrations/0021_durable_lyrics_mismatches.sql"),
     ),
+    (22, include_str!("../migrations/0022_genre_enrichment.sql")),
+    (
+        23,
+        include_str!("../migrations/0023_artist_genre_fallback.sql"),
+    ),
 ];
 
 /// Current durable schema version.
-pub const CURRENT_SCHEMA_VERSION: u32 = 21;
+pub const CURRENT_SCHEMA_VERSION: u32 = 23;
 
 /// A connection to music-sync's private application state.
 #[derive(Debug)]
@@ -279,6 +284,15 @@ impl Database {
                 with_thumbnail: count(
                     "SELECT COUNT(*) FROM provider_item_enrichments WHERE thumbnail_url IS NOT NULL",
                 )?,
+            },
+            genres: GenreResolutionCounts {
+                resolved: count("SELECT COUNT(*) FROM genre_resolutions WHERE state='resolved'")?,
+                unavailable: count(
+                    "SELECT COUNT(*) FROM genre_resolutions WHERE state='unavailable'",
+                )?,
+                ambiguous: count("SELECT COUNT(*) FROM genre_resolutions WHERE state='ambiguous'")?,
+                deferred: count("SELECT COUNT(*) FROM genre_resolutions WHERE state='deferred'")?,
+                selected: count("SELECT COUNT(*) FROM recording_genres")?,
             },
             artwork: ArtworkResolutionCounts {
                 resolved: count(
@@ -1777,7 +1791,11 @@ impl Database {
                     artifacts.channels, COALESCE(title.value,provider.display_title),
                     COALESCE(artist.value,provider.display_artist),
                     COALESCE(release.value,provider.album),
-                    COALESCE(date.value,provider.release_date), COALESCE(provider.genres_json,'[]'),
+                    COALESCE(date.value,provider.release_date),
+                    COALESCE((SELECT json_group_array(value) FROM (
+                        SELECT genre AS value FROM recording_genres genre WHERE genre.recording_id=recordings.id
+                        UNION SELECT value FROM json_each(COALESCE(provider.genres_json,'[]'))
+                    )), '[]'),
                     CASE WHEN artist.value IS NOT NULL THEN 'musicbrainz'
                          ELSE provider.artist_provenance END,
                     recordings.musicbrainz_recording_id, recordings.isrc,
@@ -1840,6 +1858,121 @@ impl Database {
             .map_err(DatabaseError::Sqlite)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(DatabaseError::Sqlite)
+    }
+
+    /// Loads owned healthy recordings still needing external genre evidence.
+    pub fn genre_resolution_candidates(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<GenreResolutionCandidate>, DatabaseError> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut statement = self.connection.prepare(
+            "WITH ranked_provider AS (
+               SELECT provider_items.recording_id, provider_item_enrichments.*,
+                 ROW_NUMBER() OVER (PARTITION BY provider_items.recording_id ORDER BY
+                   CASE completeness WHEN 'full' THEN 0 ELSE 1 END, provider_items.id) rank
+               FROM provider_items JOIN provider_item_enrichments ON provider_item_enrichments.provider_item_id=provider_items.id
+               WHERE provider_items.recording_id IS NOT NULL)
+             SELECT recordings.id, recordings.musicbrainz_recording_id,
+                    COALESCE(title.value, provider.display_title),
+                    COALESCE(artist.value, provider.display_artist), artifacts.duration_ms
+             FROM recordings JOIN artifacts ON artifacts.id=recordings.preferred_artifact_id
+             LEFT JOIN metadata_selections ts ON ts.recording_id=recordings.id AND ts.field='title'
+             LEFT JOIN metadata_observations title ON title.id=ts.observation_id
+             LEFT JOIN metadata_selections ars ON ars.recording_id=recordings.id AND ars.field='artist_credit'
+             LEFT JOIN metadata_observations artist ON artist.id=ars.observation_id
+             LEFT JOIN ranked_provider provider ON provider.recording_id=recordings.id AND provider.rank=1
+             LEFT JOIN genre_resolutions resolution ON resolution.recording_id=recordings.id
+             WHERE artifacts.health='healthy' AND artifacts.duration_ms IS NOT NULL
+               AND COALESCE(title.value,provider.display_title) IS NOT NULL
+               AND COALESCE(artist.value,provider.display_artist) IS NOT NULL
+               AND (resolution.recording_id IS NULL OR resolution.state='deferred')
+               AND (EXISTS (SELECT 1 FROM acquisition_commits WHERE final_path=artifacts.path AND status='committed')
+                    OR EXISTS (SELECT 1 FROM repair_commits WHERE final_path=artifacts.path AND committed_at IS NOT NULL))
+             ORDER BY recordings.id LIMIT ?1")
+            .map_err(DatabaseError::Sqlite)?;
+        statement
+            .query_map([limit], |row| {
+                Ok(GenreResolutionCandidate {
+                    recording_id: row.get(0)?,
+                    musicbrainz_recording_id: row.get(1)?,
+                    title: row.get(2)?,
+                    artist: row.get(3)?,
+                    duration_ms: row.get(4)?,
+                })
+            })
+            .map_err(DatabaseError::Sqlite)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(DatabaseError::Sqlite)
+    }
+
+    /// Persists genre resolution and schedules a source-preserving retag when changed.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "genre provenance fields cross one explicit transactional boundary"
+    )]
+    pub fn record_genre_resolution(
+        &mut self,
+        candidate: &GenreResolutionCandidate,
+        state: GenreResolutionState,
+        source_entity_id: Option<&str>,
+        genres: &[String],
+        scope: &str,
+        confidence_millionths: u32,
+        message: &str,
+        raw_response_json: &str,
+    ) -> Result<(), DatabaseError> {
+        let genres_json = serde_json::to_string(genres).map_err(DatabaseError::Json)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(DatabaseError::Sqlite)?;
+        transaction.execute(
+            "INSERT INTO genre_resolutions(recording_id,state,source_entity_id,genres_json,message,raw_response_json)
+             VALUES (?1,?2,?3,?4,?5,?6) ON CONFLICT(recording_id) DO UPDATE SET
+             state=excluded.state,source_entity_id=excluded.source_entity_id,genres_json=excluded.genres_json,
+             message=excluded.message,raw_response_json=excluded.raw_response_json,updated_at=CURRENT_TIMESTAMP",
+            rusqlite::params![candidate.recording_id,state.as_str(),source_entity_id,genres_json,message,raw_response_json]
+        ).map_err(DatabaseError::Sqlite)?;
+        if state == GenreResolutionState::Resolved {
+            transaction
+                .execute(
+                    "DELETE FROM recording_genres WHERE recording_id=?1",
+                    [candidate.recording_id],
+                )
+                .map_err(DatabaseError::Sqlite)?;
+            let entity = source_entity_id.ok_or(DatabaseError::InvalidGenreResolutionTransition)?;
+            for genre in genres {
+                transaction.execute("INSERT INTO recording_genres(recording_id,genre,source,source_entity_id,confidence_millionths,scope) VALUES (?1,?2,'musicbrainz',?3,?4,?5)",
+                    rusqlite::params![candidate.recording_id,genre,entity,confidence_millionths,scope]).map_err(DatabaseError::Sqlite)?;
+            }
+            let committed: Option<String> = transaction.query_row(
+                "SELECT canonical_snapshot_json FROM metadata_materializations WHERE recording_id=?1 AND state='committed'",
+                [candidate.recording_id], |row| row.get(0)).optional().map_err(DatabaseError::Sqlite)?;
+            if let Some(snapshot) = committed {
+                transaction.execute("INSERT INTO events(level,component,event,message,context_json) VALUES ('info','genre','genre_retag_scheduled','genre enrichment scheduled source-preserving retag',?1)",
+                    [serde_json::json!({"recording_id":candidate.recording_id,"prior_snapshot":snapshot}).to_string()]).map_err(DatabaseError::Sqlite)?;
+                transaction
+                    .execute(
+                        "DELETE FROM metadata_materializations WHERE recording_id=?1",
+                        [candidate.recording_id],
+                    )
+                    .map_err(DatabaseError::Sqlite)?;
+                transaction
+                    .execute(
+                        "DELETE FROM metadata_materialization_staging WHERE recording_id=?1",
+                        [candidate.recording_id],
+                    )
+                    .map_err(DatabaseError::Sqlite)?;
+                transaction
+                    .execute(
+                        "DELETE FROM metadata_materialization_states WHERE recording_id=?1",
+                        [candidate.recording_id],
+                    )
+                    .map_err(DatabaseError::Sqlite)?;
+            }
+        }
+        transaction.commit().map_err(DatabaseError::Sqlite)
     }
 
     /// Defers one failed materialization until explicit operator retry.
@@ -5072,6 +5205,8 @@ pub struct OperationalStatus {
     pub metadata: MetadataResolutionCounts,
     /// Provenance-aware provider display-metadata coverage.
     pub provider_metadata: ProviderMetadataCounts,
+    /// Identity-verified external genre resolution coverage.
+    pub genres: GenreResolutionCounts,
     /// Release artwork resolution and immutable-cache counts.
     pub artwork: ArtworkResolutionCounts,
     /// Lyrics resolution and committed adjacent-output counts.
@@ -5176,6 +5311,60 @@ pub struct ProviderMetadataCounts {
     pub with_genres: u64,
     /// Items with a secure provider thumbnail URL.
     pub with_thumbnail: u64,
+}
+
+/// Durable external genre-resolution coverage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct GenreResolutionCounts {
+    /// Identity-verified resolved recordings.
+    pub resolved: u64,
+    /// Recordings without safe genre evidence.
+    pub unavailable: u64,
+    /// Recordings with multiple valid candidates.
+    pub ambiguous: u64,
+    /// Retryable provider failures.
+    pub deferred: u64,
+    /// Individual selected genre values.
+    pub selected: u64,
+}
+
+/// One owned recording eligible for conservative genre lookup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenreResolutionCandidate {
+    /// Durable recording ID.
+    pub recording_id: i64,
+    /// Strong canonical identity when known.
+    pub musicbrainz_recording_id: Option<String>,
+    /// Canonical or provider display title.
+    pub title: String,
+    /// Canonical or provider display artist.
+    pub artist: String,
+    /// Structurally probed local duration.
+    pub duration_ms: u64,
+}
+
+/// Durable result of external genre lookup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GenreResolutionState {
+    /// Exactly one identity-verified candidate supplied genres.
+    Resolved,
+    /// No unique candidate or no positive genre evidence exists.
+    Unavailable,
+    /// More than one candidate passed all identity checks.
+    Ambiguous,
+    /// Provider or infrastructure failure is retryable.
+    Deferred,
+}
+
+impl GenreResolutionState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Resolved => "resolved",
+            Self::Unavailable => "unavailable",
+            Self::Ambiguous => "ambiguous",
+            Self::Deferred => "deferred",
+        }
+    }
 }
 
 /// Durable release-artwork and immutable-cache counts.
@@ -6134,6 +6323,9 @@ impl RepairVerificationDecision {
 /// Persistence initialization or migration failure.
 #[derive(Debug, Error)]
 pub enum DatabaseError {
+    /// Resolved genre rows require a verified source entity.
+    #[error("resolved genre transition lacks verified source identity")]
+    InvalidGenreResolutionTransition,
     /// Adoption/provider verification was not in its resumable running state.
     #[error("adoption provider verification is not running for provider item {0}")]
     AdoptionProviderVerificationNotRunning(i64),
@@ -7122,6 +7314,23 @@ mod tests {
         assert_eq!(tags[0].release_title.as_deref(), Some("Provider Album"));
         assert_eq!(tags[0].genres_json, "[\"Frenchcore\"]");
         assert_eq!(tags[0].artist_provenance.as_deref(), Some("artist"));
+        let genre_candidate = database.genre_resolution_candidates(10)?.remove(0);
+        assert_eq!(genre_candidate.title, "Provider Track");
+        assert_eq!(genre_candidate.duration_ms, 180_000);
+        database.record_genre_resolution(
+            &genre_candidate,
+            GenreResolutionState::Resolved,
+            Some("11111111-1111-1111-1111-111111111111"),
+            &["Hardcore".into(), "Electronic".into()],
+            "recording",
+            1_000_000,
+            "fixture identity verified",
+            "{}",
+        )?;
+        assert!(database.genre_resolution_candidates(10)?.is_empty());
+        let tags = database.metadata_materialization_candidates(10)?;
+        let genres: Vec<String> = serde_json::from_str(&tags[0].genres_json)?;
+        assert_eq!(genres, ["Electronic", "Frenchcore", "Hardcore"]);
         Ok(())
     }
 

@@ -12,11 +12,12 @@ use crate::content_hash::ContentHasher;
 use crate::discovery::{DiscoveryReport, FreeSpaceProbe, RecommendationProvider, run_discovery};
 use crate::discovery_routing::{DiscoveryRoutingReport, route_approved_discovery};
 use crate::fingerprint::{FingerprintReport, Fingerprinter, reconcile_artifact_fingerprints};
+use crate::genre::{GenreResolutionReport, resolve_genres};
 use crate::health::{ArtifactHealthReport, reconcile_artifact_health};
 use crate::lyrics::{LyricsProvider, LyricsReport, resolve_lyrics};
 use crate::media_probe::MediaProbe;
 use crate::metadata::{MetadataResolutionReport, resolve_canonical_metadata};
-use crate::musicbrainz::CanonicalMetadataProvider;
+use crate::musicbrainz::{CanonicalMetadataProvider, GenreMetadataProvider};
 use crate::navidrome::TasteSignalProvider;
 use crate::persistence::{
     Database, DatabaseError, DiscoverySeedReport, RepairVerificationDecision, ServicePhaseStatus,
@@ -48,6 +49,8 @@ pub struct ServiceBoundaries<'a> {
     pub fingerprinter: &'a dyn Fingerprinter,
     /// Canonical MusicBrainz metadata and relationship boundary.
     pub canonical_metadata: &'a dyn CanonicalMetadataProvider,
+    /// Identity-verified external genre boundary.
+    pub genres: &'a dyn GenreMetadataProvider,
     /// Canonical release-art boundary.
     pub artwork: &'a dyn ReleaseArtworkProvider,
     /// Lyrics boundary.
@@ -316,6 +319,15 @@ pub fn run_complete_service(
         |report| phase_for_work(report.selected, report.failures.is_empty()),
     )?;
     ordinal += 1;
+    let genres = execute_database_phase(
+        database,
+        service_run_id,
+        "genres",
+        ordinal,
+        |database| resolve_genres(database, boundaries.genres, limits.items),
+        |report| phase_for_work(report.selected, report.failures.is_empty()),
+    )?;
+    ordinal += 1;
     let artwork = execute_database_phase(
         database,
         service_run_id,
@@ -390,6 +402,7 @@ pub fn run_complete_service(
         repair_execution,
         metadata,
         provider_metadata,
+        genres,
         artwork,
         lyrics,
         tags,
@@ -536,6 +549,8 @@ pub struct CompleteServiceReport {
     pub metadata: MetadataResolutionReport,
     /// Complete provider display metadata kept separate from identity.
     pub provider_metadata: ProviderMetadataReport,
+    /// Identity-verified external genres.
+    pub genres: GenreResolutionReport,
     /// Canonical artwork.
     pub artwork: ArtworkResolutionReport,
     /// Adjacent lyrics.
@@ -562,6 +577,7 @@ impl CompleteServiceReport {
             && self.repair_execution.failures.is_empty()
             && self.metadata.failures.is_empty()
             && self.provider_metadata.failures.is_empty()
+            && self.genres.failures.is_empty()
             && self.artwork.failures.is_empty()
             && self.artwork.provider_failures.is_empty()
             && self.lyrics.failures.is_empty()

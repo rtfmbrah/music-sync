@@ -113,6 +113,11 @@ provider-thumbnail artwork per recording plus per-recording thumbnail resolution
 state. Provider enrichment is display fallback evidence only; it never establishes
 recording identity and never overrides canonical selections.
 
+Schemas 22–23 store one durable external genre-resolution state per recording
+and selected genre rows carrying source, source entity, fixed-point confidence, and
+recording or artist scope. Genre evidence does not establish recording identity. Retag scheduling is
+transactional with a newly resolved selection.
+
 ## PLANNED
 
 Add discovery seeds/candidates and expanded job attempts when a real workflow

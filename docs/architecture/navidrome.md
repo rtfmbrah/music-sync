@@ -12,8 +12,10 @@ traversable managed provider directories (`0755`). This allows a separately runn
 Navidrome scanner to read committed media even though staging and the music-sync
 service remain private. Publication changes modes only; it never rewrites audio.
 
-Managed Ogg/Opus display tags include title and artist plus available album, date, and
-non-generic provider genres. Artwork is embedded as a PNG or JPEG FLAC-picture block;
+Managed Ogg/Opus display tags include title and artist plus available album, date,
+non-generic provider genres, and identity-verified MusicBrainz recording genres. New
+genre evidence triggers source-preserving stream-copy rematerialization. Artwork is
+embedded as a PNG or JPEG FLAC-picture block;
 provider WebP thumbnails are converted to PNG first for Navidrome compatibility.
 Validated lyrics are published as adjacent UTF-8 `.lrc` files. Missing provider data
 stays absent rather than being fabricated.
