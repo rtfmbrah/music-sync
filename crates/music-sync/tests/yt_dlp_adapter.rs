@@ -13,22 +13,22 @@ static FIXTURE_EXECUTION: Mutex<()> = Mutex::new(());
 
 #[test]
 fn passes_explicit_cookie_file_without_reading_it() -> Result<(), Box<dyn std::error::Error>> {
+    let _execution = FIXTURE_EXECUTION
+        .lock()
+        .map_err(|_| "fixture execution lock was poisoned")?;
     let directory = tempfile::tempdir()?;
     let executable = directory.path().join("yt-dlp");
     let marker = directory.path().join("args");
     let cookies = directory.path().join("cookies.txt");
     let cache = directory.path().join("cache");
     fs::write(&cookies, "secret fixture")?;
-    fs::write(
+    write_executable_script(
         &executable,
-        format!(
+        &format!(
             "#!/bin/sh\nprintf '%s\\n' \"$@\" >{}\nprintf '%s' '{{\"id\":\"one\",\"webpage_url\":\"https://youtu.be/one\"}}'\n",
             marker.display()
         ),
     )?;
-    let mut permissions = fs::metadata(&executable)?.permissions();
-    permissions.set_mode(0o700);
-    fs::set_permissions(&executable, permissions)?;
     YtDlp::new(executable, Duration::from_secs(1))
         .with_cookie_file(Some(cookies.clone()))
         .with_cache_directory(cache.clone())
@@ -73,17 +73,14 @@ fn captures_complete_single_item_metadata_without_media_download()
     let (directory, executable) = fixture_script(&format!("printf '%s' '{json}'"))?;
     let marker = directory.path().join("args");
     let wrapper = directory.path().join("wrapper");
-    fs::write(
+    write_executable_script(
         &wrapper,
-        format!(
+        &format!(
             "#!/bin/sh\nprintf '%s\\n' \"$@\" >{}\nexec {} \"$@\"\n",
             marker.display(),
             executable.display()
         ),
     )?;
-    let mut permissions = fs::metadata(&wrapper)?.permissions();
-    permissions.set_mode(0o700);
-    fs::set_permissions(&wrapper, permissions)?;
     let metadata =
         YtDlp::new(wrapper, Duration::from_secs(1)).metadata("https://youtu.be/vid001")?;
     assert_eq!(metadata["channel"], "Fixture Artist");
@@ -139,12 +136,20 @@ fn require_error(
 
 fn fixture_script(body: &str) -> Result<(tempfile::TempDir, PathBuf), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
-    let staging = directory.path().join("yt-dlp.staging");
     let executable = directory.path().join("yt-dlp");
-    fs::write(&staging, format!("#!/bin/sh\n{body}\n"))?;
+    write_executable_script(&executable, &format!("#!/bin/sh\n{body}\n"))?;
+    Ok((directory, executable))
+}
+
+fn write_executable_script(
+    executable: &std::path::Path,
+    contents: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let staging = executable.with_extension("staging");
+    fs::write(&staging, contents)?;
     let mut permissions = fs::metadata(&staging)?.permissions();
     permissions.set_mode(0o700);
     fs::set_permissions(&staging, permissions)?;
-    fs::rename(staging, &executable)?;
-    Ok((directory, executable))
+    fs::rename(staging, executable)?;
+    Ok(())
 }

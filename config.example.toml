@@ -18,6 +18,12 @@ minimum_free_disk_gb = 20
 # listenbrainz_user = "your-public-listenbrainz-user"
 # navidrome_url = "https://music.example.invalid"
 # navidrome_user = "music-sync-readonly"
+# Optional conservative fallback for recommendations without a MusicBrainz YouTube URL.
+# Requires the ACOUSTID_CLIENT_KEY process secret. Audio bytes are never uploaded.
+youtube_search_fallback = false
+youtube_search_max_candidates = 3
+acoustid_minimum_score = 0.95
+acoustid_fingerprint_audio_seconds = 900
 
 [service]
 enabled = false
@@ -34,6 +40,7 @@ musicbrainz_endpoint = "https://musicbrainz.org/ws/2"
 cover_art_endpoint = "https://coverartarchive.org"
 lyrics_endpoint = "https://lrclib.net/api"
 listenbrainz_endpoint = "https://api.listenbrainz.org"
+acoustid_endpoint = "https://api.acoustid.org/v2/lookup"
 http_timeout_seconds = 30
 source_timeout_seconds = 60
 download_timeout_seconds = 600

@@ -19,6 +19,10 @@ music-sync duplicates
 music-sync sync
 ```
 
+ListenBrainz discovery normally requires an exact MusicBrainz YouTube relationship.
+An optional AcoustID-verified YouTube search fallback can handle recommendations
+without that relationship. It is disabled by default and never uploads audio.
+
 Manage sources with:
 
 ```bash

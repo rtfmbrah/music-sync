@@ -5,7 +5,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use music_sync::fingerprint::{FingerprintError, Fingerprinter, Fpcalc};
+use music_sync::fingerprint::{CompressedFingerprinter, FingerprintError, Fingerprinter, Fpcalc};
 
 fn executable(directory: &Path, body: &str) -> Result<std::path::PathBuf, std::io::Error> {
     let path = directory.join("fpcalc");
@@ -14,6 +14,24 @@ fn executable(directory: &Path, body: &str) -> Result<std::path::PathBuf, std::i
     permissions.set_mode(0o700);
     fs::set_permissions(&path, permissions)?;
     Ok(path)
+}
+
+#[test]
+fn extracts_compressed_fingerprint_for_external_lookup() -> Result<(), Box<dyn std::error::Error>> {
+    let root = tempfile::tempdir()?;
+    let media = root.path().join("audio.opus");
+    fs::write(&media, b"fixture")?;
+    let program = executable(
+        root.path(),
+        "test \"$1\" = -json\ntest \"$2\" = -algorithm\ntest \"$3\" = 2\ntest \"$4\" = -length\ntest \"$5\" = 120\nprintf '%s' '{\"duration\":179.6,\"fingerprint\":\"AQAD_fixture\"}'",
+    )?;
+
+    let result =
+        Fpcalc::new(program, Duration::from_secs(1), 120).compressed_fingerprint(&media)?;
+
+    assert_eq!(result.duration_seconds, 180);
+    assert_eq!(result.fingerprint, "AQAD_fixture");
+    Ok(())
 }
 
 #[test]

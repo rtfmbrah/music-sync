@@ -5,13 +5,17 @@ use std::path::Path;
 use serde::Serialize;
 use thiserror::Error;
 
+use crate::acoustid::AcoustIdProvider;
 use crate::acquisition::{AcquisitionBatchReport, run_pending_acquisitions};
 use crate::artwork::{ArtworkResolutionReport, ReleaseArtworkProvider, resolve_release_artwork};
 use crate::config::DiscoveryConfig;
 use crate::content_hash::ContentHasher;
 use crate::discovery::{DiscoveryReport, FreeSpaceProbe, RecommendationProvider, run_discovery};
-use crate::discovery_routing::{DiscoveryRoutingReport, route_approved_discovery};
-use crate::fingerprint::{FingerprintReport, Fingerprinter, reconcile_artifact_fingerprints};
+use crate::discovery_routing::{DiscoveryRoutingReport, route_approved_discovery_with_search};
+use crate::discovery_search::DiscoverySearchBoundaries;
+use crate::fingerprint::{
+    CompressedFingerprinter, FingerprintReport, Fingerprinter, reconcile_artifact_fingerprints,
+};
 use crate::genre::{GenreResolutionReport, resolve_genres};
 use crate::health::{ArtifactHealthReport, reconcile_artifact_health};
 use crate::lyrics::{LyricsProvider, LyricsReport, resolve_lyrics};
@@ -47,6 +51,10 @@ pub struct ServiceBoundaries<'a> {
     pub hasher: &'a dyn ContentHasher,
     /// Perceptual fingerprint boundary.
     pub fingerprinter: &'a dyn Fingerprinter,
+    /// Compressed fingerprint boundary used only by optional AcoustID discovery.
+    pub compressed_fingerprinter: &'a dyn CompressedFingerprinter,
+    /// Optional external identity provider for discovery search.
+    pub acoustid: Option<&'a dyn AcoustIdProvider>,
     /// Canonical MusicBrainz metadata and relationship boundary.
     pub canonical_metadata: &'a dyn CanonicalMetadataProvider,
     /// Identity-verified external genre boundary.
@@ -177,13 +185,34 @@ pub fn run_complete_service(
         None
     };
     let routing = if discovery.enabled {
+        let acoustid_search = if discovery.youtube_search_fallback {
+            let acoustid = boundaries.acoustid.ok_or(ServiceError::MissingAcoustId)?;
+            Some(DiscoverySearchBoundaries {
+                state_directory: directories.state,
+                yt_dlp: boundaries.acquisition_adapter,
+                probe: boundaries.probe,
+                hasher: boundaries.hasher,
+                fingerprinter: boundaries.compressed_fingerprinter,
+                acoustid,
+                maximum_candidates: discovery.youtube_search_max_candidates,
+                minimum_score_millionths: (discovery.acoustid_minimum_score * 1_000_000.0).round()
+                    as u32,
+            })
+        } else {
+            None
+        };
         let report = execute_database_phase(
             database,
             service_run_id,
             "discovery_routing",
             ordinal,
             |database| {
-                route_approved_discovery(database, boundaries.canonical_metadata, limits.items)
+                route_approved_discovery_with_search(
+                    database,
+                    boundaries.canonical_metadata,
+                    limits.items,
+                    acoustid_search.as_ref(),
+                )
             },
             |report| {
                 if report.failures.is_empty() {
@@ -614,6 +643,9 @@ pub enum ServiceError {
     /// Enabled discovery lacks a provider.
     #[error("enabled discovery requires a recommendation provider")]
     MissingRecommendations,
+    /// Search fallback was enabled without its secret-backed AcoustID boundary.
+    #[error("enabled discovery search requires an AcoustID client key")]
+    MissingAcoustId,
     /// One phase failed after durable recording.
     #[error("service phase {phase} failed: {message}")]
     Phase {

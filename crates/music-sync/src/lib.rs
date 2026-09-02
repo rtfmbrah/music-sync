@@ -5,6 +5,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod acoustid;
 pub mod acquisition;
 pub mod adoption;
 pub mod adoption_link;
@@ -14,6 +15,7 @@ pub mod content_hash;
 pub mod diagnostics;
 pub mod discovery;
 pub mod discovery_routing;
+pub mod discovery_search;
 pub mod duplicates;
 pub mod fingerprint;
 pub mod genre;

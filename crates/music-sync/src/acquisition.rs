@@ -334,15 +334,40 @@ fn run_claimed_acquisition(
     hasher: &dyn ContentHasher,
 ) -> Result<AcquisitionRunOutcome, AcquisitionRunError> {
     let result = (|| {
-        let staging = AcquisitionStaging::new(state_directory).prepare(work.job_id)?;
-        let downloaded = downloader.download(&work.original_url, &staging)?;
-        database.record_acquisition_provider_metadata(work.job_id, &downloaded.raw_metadata)?;
-        let validated = validate_staged_media(&downloaded.path, probe, hasher)?;
-        if downloaded.bytes != validated.bytes {
+        let verified = database.verified_discovery_staging(work.job_id)?;
+        let (download_path, observed_bytes, raw_metadata, expected_sha256) =
+            if let Some(verified) = verified {
+                let raw_metadata = serde_json::from_str(&verified.provider_metadata_json)
+                    .map_err(AcquisitionRunError::DiscoveryMetadata)?;
+                (
+                    verified.path,
+                    verified.bytes,
+                    raw_metadata,
+                    Some(verified.sha256),
+                )
+            } else {
+                let staging = AcquisitionStaging::new(state_directory).prepare(work.job_id)?;
+                let downloaded = downloader.download(&work.original_url, &staging)?;
+                (
+                    downloaded.path,
+                    downloaded.bytes,
+                    downloaded.raw_metadata,
+                    None,
+                )
+            };
+        database.record_acquisition_provider_metadata(work.job_id, &raw_metadata)?;
+        let validated = validate_staged_media(&download_path, probe, hasher)?;
+        if observed_bytes != validated.bytes {
             return Err(AcquisitionRunError::DownloadSizeChanged {
-                downloaded: downloaded.bytes,
+                downloaded: observed_bytes,
                 validated: validated.bytes,
             });
+        }
+        if expected_sha256
+            .as_ref()
+            .is_some_and(|expected| expected != &validated.sha256)
+        {
+            return Err(AcquisitionRunError::VerifiedStagingChanged);
         }
         let commit =
             commit_validated_acquisition(database, &work, &validated, library_directory, hasher)?;
@@ -650,6 +675,12 @@ pub enum AcquisitionRunError {
         /// Bytes consumed by validation.
         validated: u64,
     },
+    /// Persisted discovery provider metadata was malformed.
+    #[error("verified discovery metadata is malformed: {0}")]
+    DiscoveryMetadata(serde_json::Error),
+    /// Exact bytes changed after external identity verification.
+    #[error("verified discovery staging changed before acquisition commit")]
+    VerifiedStagingChanged,
     /// Prepared no-clobber artifact commit failed.
     #[error(transparent)]
     Commit(#[from] AcquisitionCommitError),

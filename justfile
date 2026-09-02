@@ -33,7 +33,7 @@ test-architecture:
 
 # Validate deployment shell scripts without network or side effects.
 test-scripts:
-    bash -n scripts/install-ytdlp deploy/install-release.sh deploy/rollback-release.sh deploy/quiesce-service.sh crates/music-sync/tests/fixtures/acquisition/*.sh crates/music-sync/tests/fixtures/repair/*.sh crates/music-sync/tests/fixtures/tag/*.sh
+    bash -n scripts/install-ytdlp deploy/configure-acoustid-discovery.sh deploy/install-release.sh deploy/rollback-release.sh deploy/quiesce-service.sh deploy/test-schema24-acoustid.sh deploy/test-schema24-acoustid-unprivileged.sh deploy/upgrade-schema24-acoustid.sh crates/music-sync/tests/fixtures/acquisition/*.sh crates/music-sync/tests/fixtures/repair/*.sh crates/music-sync/tests/fixtures/tag/*.sh
     PYTHONPYCACHEPREFIX=/tmp/music-sync-pycache python3 -m py_compile deploy/migrate-managed-webm.py deploy/reset-webp-tag-materializations.py
     python3 deploy/test_migrate_managed_webm.py
     python3 deploy/test_reset_webp_tag_materializations.py

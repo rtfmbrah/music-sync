@@ -88,7 +88,8 @@ pub fn run_doctor(config: &AppConfig) -> DoctorReport {
             &config.library_directory,
         ));
         checks.push(check_endpoint_security(config));
-        checks.push(check_secret_contract(config));
+        checks.push(check_navidrome_secret_contract(config));
+        checks.push(check_acoustid_secret_contract(config));
     } else {
         for tool in ["yt-dlp", "ffmpeg", "ffprobe", "fpcalc"] {
             checks.push(check_tool(tool));
@@ -204,6 +205,7 @@ fn check_endpoint_security(config: &AppConfig) -> DiagnosticCheck {
         &config.service.cover_art_endpoint,
         &config.service.lyrics_endpoint,
         &config.service.listenbrainz_endpoint,
+        &config.service.acoustid_endpoint,
     ];
     let secure = endpoints.iter().all(|endpoint| {
         endpoint.starts_with("https://")
@@ -225,7 +227,7 @@ fn check_endpoint_security(config: &AppConfig) -> DiagnosticCheck {
     }
 }
 
-fn check_secret_contract(config: &AppConfig) -> DiagnosticCheck {
+fn check_navidrome_secret_contract(config: &AppConfig) -> DiagnosticCheck {
     if config.discovery.navidrome_url.is_none() {
         return DiagnosticCheck {
             name: "navidrome_secrets".into(),
@@ -246,6 +248,35 @@ fn check_secret_contract(config: &AppConfig) -> DiagnosticCheck {
             "Required Navidrome secret variables are present".into()
         } else {
             "NAVIDROME_TOKEN and NAVIDROME_SALT are required without exposing their values".into()
+        },
+    }
+}
+
+fn check_acoustid_secret_contract(config: &AppConfig) -> DiagnosticCheck {
+    if !config.discovery.youtube_search_fallback {
+        return DiagnosticCheck {
+            name: "acoustid_secret".into(),
+            status: CheckStatus::Pass,
+            message: "AcoustID discovery search is not configured".into(),
+        };
+    }
+    let present = env::var("ACOUSTID_CLIENT_KEY").is_ok_and(|value| {
+        let value = value.trim();
+        !value.is_empty()
+            && value.len() <= 128
+            && value.bytes().all(|byte| byte.is_ascii_alphanumeric())
+    });
+    DiagnosticCheck {
+        name: "acoustid_secret".into(),
+        status: if present {
+            CheckStatus::Pass
+        } else {
+            CheckStatus::Failure
+        },
+        message: if present {
+            "Required AcoustID client-key variable is present".into()
+        } else {
+            "ACOUSTID_CLIENT_KEY is required for the configured discovery search fallback".into()
         },
     }
 }

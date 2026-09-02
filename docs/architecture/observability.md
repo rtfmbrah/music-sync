@@ -21,6 +21,9 @@ recent warning/error counts in text or JSON. It creates no WAL/shared-memory fil
 and performs no provider or managed-filesystem access. Because SQLite immutable mode
 deliberately ignores concurrent WAL changes, operators run it between oneshot sync
 invocations rather than concurrently with an active writer.
+It also reports approved, queued, acquired, and unresolved discovery totals plus
+generated, rejected, unresolved, deferred, and acquired AcoustID-search candidates.
+Complete service phase JSON contains the corresponding bounded search report.
 `acquisition history` provides bounded newest-first job/provider state with attempt
 counts and the latest persisted warning/error. Deferred jobs require audited
 `acquisition retry`; ordinary timer runs leave them untouched. Explicit

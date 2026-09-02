@@ -59,6 +59,8 @@ pub struct ServiceConfig {
     pub lyrics_endpoint: String,
     /// ListenBrainz API endpoint.
     pub listenbrainz_endpoint: String,
+    /// AcoustID fingerprint lookup endpoint.
+    pub acoustid_endpoint: String,
     /// Per-boundary global HTTP deadline in seconds.
     pub http_timeout_seconds: u64,
     /// Per-provider yt-dlp enumeration deadline in seconds.
@@ -94,6 +96,7 @@ impl Default for ServiceConfig {
             cover_art_endpoint: "https://coverartarchive.org".into(),
             lyrics_endpoint: "https://lrclib.net/api".into(),
             listenbrainz_endpoint: "https://api.listenbrainz.org".into(),
+            acoustid_endpoint: "https://api.acoustid.org/v2/lookup".into(),
             http_timeout_seconds: 30,
             source_timeout_seconds: 60,
             download_timeout_seconds: 600,
@@ -152,6 +155,14 @@ pub struct DiscoveryConfig {
     pub navidrome_url: Option<String>,
     /// Navidrome user paired with token/salt secrets from the process environment.
     pub navidrome_user: Option<String>,
+    /// Searches YouTube when canonical MusicBrainz URL evidence is absent.
+    pub youtube_search_fallback: bool,
+    /// Maximum yt-dlp results staged for one recommendation.
+    pub youtube_search_max_candidates: usize,
+    /// Minimum AcoustID confidence represented as a value from zero to one.
+    pub acoustid_minimum_score: f64,
+    /// Maximum audio seconds supplied to the AcoustID Chromaprint extractor.
+    pub acoustid_fingerprint_audio_seconds: u32,
 }
 
 impl Default for DiscoveryConfig {
@@ -167,6 +178,10 @@ impl Default for DiscoveryConfig {
             listenbrainz_user: None,
             navidrome_url: None,
             navidrome_user: None,
+            youtube_search_fallback: false,
+            youtube_search_max_candidates: 3,
+            acoustid_minimum_score: 0.95,
+            acoustid_fingerprint_audio_seconds: 900,
         }
     }
 }
@@ -291,6 +306,22 @@ impl AppConfig {
                     "Navidrome discovery URL and user must be configured together".into(),
                 ));
             }
+            if self.discovery.youtube_search_fallback
+                && (self.discovery.youtube_search_max_candidates == 0
+                    || self.discovery.acoustid_fingerprint_audio_seconds == 0)
+            {
+                return Err(ConfigError::Invalid(
+                    "enabled discovery YouTube search requires positive candidate and fingerprint limits".into(),
+                ));
+            }
+        }
+        if !(self.discovery.acoustid_minimum_score.is_finite()
+            && 0.0 < self.discovery.acoustid_minimum_score
+            && self.discovery.acoustid_minimum_score <= 1.0)
+        {
+            return Err(ConfigError::Invalid(
+                "AcoustID minimum score must be greater than zero and at most one".into(),
+            ));
         }
         let exploration = self.discovery.exploration_ratio;
         let wildcard = self.discovery.wildcard_ratio;

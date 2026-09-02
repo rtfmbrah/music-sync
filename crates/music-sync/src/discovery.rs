@@ -296,6 +296,7 @@ mod tests {
             listenbrainz_user: Some("fixture-user".into()),
             navidrome_url: None,
             navidrome_user: None,
+            ..DiscoveryConfig::default()
         }
     }
 

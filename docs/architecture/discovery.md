@@ -18,6 +18,23 @@ API. The adapter never reads Navidrome's database. Only favorite entries carryin
 exact recording MBID that already exists locally become active seeds. The precomputed
 Subsonic token and salt are process secrets; they are not stored in TOML or logs.
 
+When `youtube_search_fallback` is explicitly enabled, an approved recording MBID
+without a MusicBrainz recording-level YouTube relationship uses a bounded serial
+yt-dlp search. Canonical title, full artist credit, two-second duration, and version
+qualifiers reject candidates but never establish identity. Candidate audio stays in
+`discovery-search-staging` while it is structurally validated, hashed, and checked
+through AcoustID. AcoustID must return the exact expected recording MBID above the
+configured threshold without a competing above-threshold MBID. The exact verified
+SHA-256 is persisted and the ordinary acquisition path reuses those bytes for its
+atomic no-clobber commit; it never downloads again after verification.
+
+The fallback is disabled by default and requires `ACOUSTID_CLIENT_KEY` only when
+enabled. AcoustID receives the compressed fingerprint, rounded duration, and
+metadata selector, never media bytes. Empty or low-confidence coverage is
+unresolved rather than contradictory, so catalog gaps do not classify obscure
+remixes as wrong. Provider, fingerprint, and AcoustID failures are deferred and stop
+that recommendation's candidate sequence.
+
 ## PLANNED
 
 Expand signals beyond favorites and collaborative filtering to ratings,

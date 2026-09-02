@@ -11,6 +11,13 @@ The initial SQLite migration keeps identity and operational concepts separate:
 - `collections` and `collection_memberships`: playlists independent of artifacts;
 - `sync_runs`, `jobs`, and `events`: persistent operational state.
 
+Schema version 24 stores yt-dlp discovery candidates separately from canonical
+recordings and source membership. Rows retain provider metadata, the prefilter
+decision, stable staging path, exact SHA-256, compressed-fingerprint duration,
+bounded AcoustID response/decision, and eventual acquisition job. Generated,
+rejected, unresolved, deferred, verified, queued, and acquired states keep crashes
+and insufficient fingerprint coverage explicit.
+
 The schema is intentionally small and migrations are embedded, ordered, and applied
 inside a transaction. SQLite foreign keys are enabled. Domain states use constrained
 values rather than unconstrained state strings.

@@ -85,11 +85,14 @@ fingerprint, associates the independently verified candidate provider object, an
 makes the new artifact preferred. Live membership, permanent-loss, and unhealthy
 reference prerequisites are checked again before and during commit.
 
-## PLANNED
+The optional discovery search uses AcoustID to corroborate canonical evidence when
+provider URL and local tags are absent. It sends only a compressed Chromaprint and
+duration and requires the exact expected MusicBrainz recording MBID in a strict,
+non-contradictory response. No result is insufficient evidence rather than a
+mismatch. Meaningful version qualifiers come from MusicBrainz rather than title
+inference.
 
-AcoustID and MusicBrainz may corroborate embedded canonical evidence when local tags
-are absent. Meaningful version qualifiers require a canonical metadata source rather
-than title inference.
+## PLANNED
 
 Pipeline:
 

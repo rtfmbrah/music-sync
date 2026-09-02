@@ -21,6 +21,16 @@ pub trait Fingerprinter {
     fn fingerprint(&self, path: &Path) -> Result<RawFingerprint, FingerprintError>;
 }
 
+/// Boundary for deriving the compressed Chromaprint representation accepted by
+/// external audio-identification services.
+pub trait CompressedFingerprinter {
+    /// Derives one bounded compressed fingerprint without uploading media bytes.
+    fn compressed_fingerprint(
+        &self,
+        path: &Path,
+    ) -> Result<CompressedFingerprint, FingerprintError>;
+}
+
 /// Raw algorithm-2 Chromaprint evidence suitable for deterministic comparison.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawFingerprint {
@@ -28,6 +38,15 @@ pub struct RawFingerprint {
     pub duration_ms: u64,
     /// Uncompressed unsigned fingerprint values.
     pub values: Vec<u32>,
+}
+
+/// Bounded compressed Chromaprint evidence suitable for an AcoustID lookup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompressedFingerprint {
+    /// Rounded media duration reported by fpcalc.
+    pub duration_seconds: u32,
+    /// Base64-like compressed fingerprint emitted by fpcalc.
+    pub fingerprint: String,
 }
 
 /// Bounded subprocess adapter around `fpcalc`.
@@ -52,20 +71,34 @@ impl Fpcalc {
 
 impl Fingerprinter for Fpcalc {
     fn fingerprint(&self, path: &Path) -> Result<RawFingerprint, FingerprintError> {
+        let bytes = self.execute(path, true)?;
+        parse_raw_output(&bytes)
+    }
+}
+
+impl CompressedFingerprinter for Fpcalc {
+    fn compressed_fingerprint(
+        &self,
+        path: &Path,
+    ) -> Result<CompressedFingerprint, FingerprintError> {
+        let bytes = self.execute(path, false)?;
+        parse_compressed_output(&bytes)
+    }
+}
+
+impl Fpcalc {
+    fn execute(&self, path: &Path, raw: bool) -> Result<Vec<u8>, FingerprintError> {
         if self.maximum_audio_seconds == 0 {
             return Err(FingerprintError::InvalidAudioLimit);
         }
         let mut command = Command::new(&self.executable);
+        if raw {
+            command.arg("-raw");
+        }
         command
-            .args([
-                "-raw",
-                "-json",
-                "-algorithm",
-                "2",
-                "-length",
-                &self.maximum_audio_seconds.to_string(),
-                "--",
-            ])
+            .args(["-json", "-algorithm", "2", "-length"])
+            .arg(self.maximum_audio_seconds.to_string())
+            .arg("--")
             .arg(path)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -108,7 +141,7 @@ impl Fingerprinter for Fpcalc {
                 stderr: String::from_utf8_lossy(&stderr).trim().to_owned(),
             });
         }
-        parse_output(&stdout)
+        Ok(stdout)
     }
 }
 
@@ -278,13 +311,13 @@ pub enum FingerprintReconciliationError {
 }
 
 #[derive(Deserialize)]
-struct FpcalcOutput {
+struct RawFpcalcOutput {
     duration: f64,
     fingerprint: Vec<u32>,
 }
 
-fn parse_output(bytes: &[u8]) -> Result<RawFingerprint, FingerprintError> {
-    let output: FpcalcOutput = serde_json::from_slice(bytes).map_err(FingerprintError::Json)?;
+fn parse_raw_output(bytes: &[u8]) -> Result<RawFingerprint, FingerprintError> {
+    let output: RawFpcalcOutput = serde_json::from_slice(bytes).map_err(FingerprintError::Json)?;
     if !output.duration.is_finite()
         || output.duration < 0.0
         || output.duration > u64::MAX as f64 / 1000.0
@@ -300,6 +333,42 @@ fn parse_output(bytes: &[u8]) -> Result<RawFingerprint, FingerprintError> {
     Ok(RawFingerprint {
         duration_ms: (output.duration * 1000.0).round() as u64,
         values: output.fingerprint,
+    })
+}
+
+#[derive(Deserialize)]
+struct CompressedFpcalcOutput {
+    duration: f64,
+    fingerprint: String,
+}
+
+fn parse_compressed_output(bytes: &[u8]) -> Result<CompressedFingerprint, FingerprintError> {
+    let output: CompressedFpcalcOutput =
+        serde_json::from_slice(bytes).map_err(FingerprintError::Json)?;
+    if !output.duration.is_finite()
+        || output.duration <= 0.0
+        || output.duration > f64::from(u32::MAX)
+    {
+        return Err(FingerprintError::InvalidDuration);
+    }
+    if output.fingerprint.is_empty() {
+        return Err(FingerprintError::Empty);
+    }
+    if output.fingerprint.len() > MAX_OUTPUT_BYTES as usize {
+        return Err(FingerprintError::CompressedTooLarge(
+            output.fingerprint.len(),
+        ));
+    }
+    if !output
+        .fingerprint
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(FingerprintError::InvalidCompressed);
+    }
+    Ok(CompressedFingerprint {
+        duration_seconds: output.duration.round() as u32,
+        fingerprint: output.fingerprint,
     })
 }
 
@@ -376,6 +445,12 @@ pub enum FingerprintError {
     /// Fingerprint value count exceeded its semantic bound.
     #[error("fpcalc returned {0} fingerprint values")]
     TooManyValues(usize),
+    /// Compressed output exceeded the semantic request bound.
+    #[error("fpcalc returned a compressed fingerprint of {0} bytes")]
+    CompressedTooLarge(usize),
+    /// Compressed output contained characters outside Chromaprint's URL-safe alphabet.
+    #[error("fpcalc returned an invalid compressed fingerprint")]
+    InvalidCompressed,
 }
 
 #[cfg(test)]
@@ -384,7 +459,7 @@ mod tests {
 
     #[test]
     fn parses_bounded_raw_json() -> Result<(), FingerprintError> {
-        let result = parse_output(br#"{"duration":3.25,"fingerprint":[1,2,4294967295]}"#)?;
+        let result = parse_raw_output(br#"{"duration":3.25,"fingerprint":[1,2,4294967295]}"#)?;
         assert_eq!(result.duration_ms, 3_250);
         assert_eq!(result.values, [1, 2, u32::MAX]);
         Ok(())
@@ -393,12 +468,30 @@ mod tests {
     #[test]
     fn rejects_empty_and_invalid_duration() {
         assert!(matches!(
-            parse_output(br#"{"duration":1.0,"fingerprint":[]}"#),
+            parse_raw_output(br#"{"duration":1.0,"fingerprint":[]}"#),
             Err(FingerprintError::Empty)
         ));
         assert!(matches!(
-            parse_output(br#"{"duration":-1.0,"fingerprint":[1]}"#),
+            parse_raw_output(br#"{"duration":-1.0,"fingerprint":[1]}"#),
             Err(FingerprintError::InvalidDuration)
+        ));
+    }
+
+    #[test]
+    fn parses_bounded_compressed_json() -> Result<(), FingerprintError> {
+        let result = parse_compressed_output(
+            br#"{"duration":179.6,"fingerprint":"AQADtFOiREqWJEk0_test"}"#,
+        )?;
+        assert_eq!(result.duration_seconds, 180);
+        assert_eq!(result.fingerprint, "AQADtFOiREqWJEk0_test");
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_invalid_compressed_alphabet() {
+        assert!(matches!(
+            parse_compressed_output(br#"{"duration":180,"fingerprint":"not valid+"}"#),
+            Err(FingerprintError::InvalidCompressed)
         ));
     }
 }

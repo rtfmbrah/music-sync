@@ -181,6 +181,18 @@ errors. Schema-backed exclusivity rejects overlap before provider or managed-fil
 effects. The timer may therefore alert on partial runs without preventing successful
 unrelated work from being committed.
 
+Optional AcoustID discovery search reads `ACOUSTID_CLIENT_KEY` from the same
+protected environment file. The key is required only when
+`discovery.youtube_search_fallback=true` and never belongs in tracked TOML. `doctor`
+checks presence without displaying its value. AcoustID receives a compressed
+Chromaprint and duration, not audio bytes. Defaults stage at most three serial
+YouTube candidates and fingerprint at most 900 seconds per candidate.
+`deploy/configure-acoustid-discovery.sh` reads the key on standard input, validates
+it without echoing or logging it, atomically preserves other environment secrets,
+backs up and updates the `[discovery]` policy, runs `doctor` with the protected
+environment loaded, and restarts only the timer. The key must not be placed on a
+command line because process listings and shell history could expose it.
+
 When YouTube requires authenticated anti-bot access, configure
 `service.yt_dlp_cookie_file` with an absolute Netscape-format cookie file outside the
 repository. The adapter passes only its path to yt-dlp and never reads, serializes, or

@@ -3,6 +3,10 @@
 use serde::Serialize;
 use thiserror::Error;
 
+use crate::discovery_search::{
+    DiscoverySearchBoundaries, DiscoverySearchError, DiscoverySearchReport,
+    search_and_verify_discovery,
+};
 use crate::musicbrainz::{CanonicalLookup, CanonicalMetadataProvider, MusicBrainzError};
 use crate::persistence::{Database, DatabaseError, DiscoveryAcquisitionRoute};
 use crate::provider::youtube_video_id;
@@ -12,6 +16,17 @@ pub fn route_approved_discovery(
     database: &mut Database,
     provider: &dyn CanonicalMetadataProvider,
     maximum: usize,
+) -> Result<DiscoveryRoutingReport, DiscoveryRoutingError> {
+    route_approved_discovery_with_search(database, provider, maximum, None)
+}
+
+/// Resolves approved discovery with exact URL evidence first and optional
+/// fingerprint-verified search only when no relationship exists.
+pub fn route_approved_discovery_with_search(
+    database: &mut Database,
+    provider: &dyn CanonicalMetadataProvider,
+    maximum: usize,
+    search: Option<&DiscoverySearchBoundaries<'_>>,
 ) -> Result<DiscoveryRoutingReport, DiscoveryRoutingError> {
     let candidates = database.approved_discovery_candidates(maximum)?;
     let mut report = DiscoveryRoutingReport {
@@ -65,6 +80,24 @@ pub fn route_approved_discovery(
             report.unresolved += 1;
             continue;
         };
+        if routes.is_empty()
+            && let Some(search) = search
+        {
+            let search_report =
+                search_and_verify_discovery(database, &candidate, &recording, search)?;
+            report.queued += search_report.queued;
+            report.unresolved += search_report.unresolved;
+            report.deferred += search_report.deferred;
+            report.failures.extend(search_report.failures.clone());
+            report.search.generated += search_report.generated;
+            report.search.rejected += search_report.rejected;
+            report.search.verified += search_report.verified;
+            report.search.unresolved += search_report.unresolved;
+            report.search.deferred += search_report.deferred;
+            report.search.queued += search_report.queued;
+            report.search.failures.extend(search_report.failures);
+            continue;
+        }
         if routes.len() != 1 {
             database.mark_discovery_unresolved(
                 candidate.id,
@@ -111,6 +144,8 @@ pub struct DiscoveryRoutingReport {
     pub deferred: u64,
     /// Bounded diagnostic messages for deferred provider calls.
     pub failures: Vec<String>,
+    /// Optional yt-dlp search and AcoustID verification effects.
+    pub search: DiscoverySearchReport,
 }
 
 /// Discovery routing failure.
@@ -122,6 +157,9 @@ pub enum DiscoveryRoutingError {
     /// Reserved for explicit provider propagation at single-item boundaries.
     #[error(transparent)]
     Provider(#[from] MusicBrainzError),
+    /// Optional search setup or durable-state failure.
+    #[error(transparent)]
+    Search(#[from] DiscoverySearchError),
 }
 
 #[cfg(test)]
@@ -176,6 +214,7 @@ mod tests {
             listenbrainz_user: Some("fixture".into()),
             navidrome_url: None,
             navidrome_user: None,
+            ..DiscoveryConfig::default()
         };
         database.record_discovery_candidates(
             "fixture",

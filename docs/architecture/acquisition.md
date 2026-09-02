@@ -99,6 +99,15 @@ canonical ISRC, and its duration must be within two seconds. The relationship an
 canonical values are persisted before the job is queued. Missing, ambiguous, or
 contradictory evidence cannot create or commit an artifact.
 
+Schema version 24 adds a second discovery assertion source for recommendations that
+lack a MusicBrainz provider URL. Search-generated media remains in a durable
+candidate namespace while exact bytes are validated, hashed, and corroborated by
+AcoustID. Only a verified row can create a pending acquisition job. The ordinary
+runner reloads the persisted path, revalidates its bytes and hash, and commits only
+when the assertion references the same SHA-256 and compatible canonical duration.
+A crash after verification but before queueing and the existing prepared-commit
+crash boundary are both recoverable.
+
 ## PLANNED
 
 Every attempt uses a job-specific temporary directory on a filesystem that supports

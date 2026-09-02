@@ -9,6 +9,7 @@ use std::process::ExitCode;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
+use music_sync::acoustid::AcoustId;
 use music_sync::acquisition::{
     AcquisitionRunOutcome, run_one_acquisition, run_pending_acquisitions,
 };
@@ -1148,6 +1149,11 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn Error>> {
                 Duration::from_secs(config.service.fingerprint_timeout_seconds),
                 config.service.fingerprint_audio_seconds,
             );
+            let acoustid_fingerprinter = Fpcalc::new(
+                config.service.fpcalc.clone(),
+                Duration::from_secs(config.service.fingerprint_timeout_seconds),
+                config.discovery.acoustid_fingerprint_audio_seconds,
+            );
             let musicbrainz = MusicBrainz::with_endpoint(
                 &config.service.musicbrainz_endpoint,
                 user_agent,
@@ -1197,6 +1203,21 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn Error>> {
             } else {
                 None
             };
+            let acoustid = if config.discovery.youtube_search_fallback {
+                Some(AcoustId::with_endpoint(
+                    &config.service.acoustid_endpoint,
+                    &std::env::var("ACOUSTID_CLIENT_KEY")?,
+                    timeout,
+                    if loopback(&config.service.acoustid_endpoint) {
+                        Duration::ZERO
+                    } else {
+                        Duration::from_millis(334)
+                    },
+                    !loopback(&config.service.acoustid_endpoint),
+                )?)
+            } else {
+                None
+            };
             let taste_signals = if let (Some(url), Some(user)) = (
                 config.discovery.navidrome_url.as_deref(),
                 config.discovery.navidrome_user.as_deref(),
@@ -1227,6 +1248,10 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn Error>> {
                     probe: &probe,
                     hasher: &Sha256FileHasher,
                     fingerprinter: &fingerprinter,
+                    compressed_fingerprinter: &acoustid_fingerprinter,
+                    acoustid: acoustid
+                        .as_ref()
+                        .map(|value| value as &dyn music_sync::acoustid::AcoustIdProvider),
                     canonical_metadata: &musicbrainz,
                     genres: &musicbrainz,
                     artwork: &artwork,
@@ -1987,6 +2012,30 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn Error>> {
                 println!("Artifacts missing:       {}", report.artifacts.missing);
                 println!("Artifacts corrupt:       {}", report.artifacts.corrupt);
                 println!("Fingerprints deferred:   {}", report.fingerprints_deferred);
+                println!("Discovery approved:      {}", report.discovery.approved);
+                println!("Discovery queued:        {}", report.discovery.queued);
+                println!("Discovery acquired:      {}", report.discovery.acquired);
+                println!("Discovery unresolved:    {}", report.discovery.unresolved);
+                println!(
+                    "Search candidates:       {}",
+                    report.discovery_search.generated
+                );
+                println!(
+                    "Search rejected:         {}",
+                    report.discovery_search.rejected
+                );
+                println!(
+                    "Search unresolved:       {}",
+                    report.discovery_search.unresolved
+                );
+                println!(
+                    "Search deferred:         {}",
+                    report.discovery_search.deferred
+                );
+                println!(
+                    "Search acquired:         {}",
+                    report.discovery_search.acquired
+                );
                 println!("Repairs eligible:        {}", report.repairs.eligible);
                 println!("Repairs unresolved:      {}", report.repairs.unresolved);
                 println!("Repairs verified:        {}", report.repairs.verified);

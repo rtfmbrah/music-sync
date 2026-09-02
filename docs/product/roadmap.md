@@ -71,7 +71,12 @@ in ad hoc TODO documents.
 - Growth/storage/artist budgets and tunable exploration (complete).
 - Automated verified acquisition through the P2 pipeline (complete for exact
   MusicBrainz recording-level YouTube relationships and independent staged
-  MBID/ISRC plus duration verification; isolated LXC acceptance remains).
+  MBID/ISRC plus duration verification).
+- Optional schema-24 YouTube search for recommendations without an exact provider
+  relationship: canonical text/duration/version candidate filtering, compressed
+  Chromaprint, exact non-contradictory AcoustID MBID corroboration, exact-byte staged
+  reuse, and atomic acquisition are implemented; isolated LXC and live-key
+  acceptance remain.
 
 ## P5 — Operations and deployment
 

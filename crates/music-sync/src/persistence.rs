@@ -11,8 +11,8 @@ use crate::acquisition::ValidatedStagedMedia;
 use crate::config::DiscoveryConfig;
 use crate::discovery::{DiscoveryLane, Recommendation, score as discovery_score};
 use crate::musicbrainz::{CanonicalRecording, CanonicalRelease};
-use crate::provider::SourceSnapshot;
 use crate::provider::{AddSourceResult, ConfiguredSource, SourceId};
+use crate::provider::{ProviderItem, SourceSnapshot};
 use crate::provider_metadata::ProviderDisplayMetadata;
 
 const MIGRATIONS: &[(u32, &str)] = &[
@@ -69,10 +69,14 @@ const MIGRATIONS: &[(u32, &str)] = &[
         23,
         include_str!("../migrations/0023_artist_genre_fallback.sql"),
     ),
+    (
+        24,
+        include_str!("../migrations/0024_acoustid_discovery_search.sql"),
+    ),
 ];
 
 /// Current durable schema version.
-pub const CURRENT_SCHEMA_VERSION: u32 = 23;
+pub const CURRENT_SCHEMA_VERSION: u32 = 24;
 
 /// A connection to music-sync's private application state.
 #[derive(Debug)]
@@ -348,6 +352,29 @@ impl Database {
                 )?,
                 budget_rejected: count(
                     "SELECT COUNT(*) FROM discovery_candidates WHERE state='budget_rejected'",
+                )?,
+            },
+            discovery_search: DiscoverySearchCounts {
+                generated: count(
+                    "SELECT COUNT(*) FROM discovery_search_candidates WHERE state='generated'",
+                )?,
+                rejected: count(
+                    "SELECT COUNT(*) FROM discovery_search_candidates WHERE state='rejected'",
+                )?,
+                verified: count(
+                    "SELECT COUNT(*) FROM discovery_search_candidates WHERE state='verified'",
+                )?,
+                unresolved: count(
+                    "SELECT COUNT(*) FROM discovery_search_candidates WHERE state='unresolved'",
+                )?,
+                deferred: count(
+                    "SELECT COUNT(*) FROM discovery_search_candidates WHERE state='deferred'",
+                )?,
+                queued: count(
+                    "SELECT COUNT(*) FROM discovery_search_candidates WHERE state='queued'",
+                )?,
+                acquired: count(
+                    "SELECT COUNT(*) FROM discovery_search_candidates WHERE state='acquired'",
                 )?,
             },
             playlist_outputs: count(
@@ -2429,6 +2456,304 @@ impl Database {
         Ok(self.connection.execute("UPDATE discovery_candidates SET state='unresolved',decision_reason=?2,updated_at=CURRENT_TIMESTAMP WHERE id=?1 AND state='approved'",rusqlite::params![candidate_id,reason]).map_err(DatabaseError::Sqlite)?==1)
     }
 
+    /// Persists bounded yt-dlp search results without assigning recording identity.
+    pub fn record_discovery_search_candidates(
+        &mut self,
+        discovery_candidate_id: i64,
+        query: &str,
+        candidates: &[DiscoverySearchCandidateInput],
+    ) -> Result<Vec<DiscoverySearchCandidate>, DatabaseError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(DatabaseError::Sqlite)?;
+        let approved = transaction
+            .query_row(
+                "SELECT state='approved' FROM discovery_candidates WHERE id=?1",
+                [discovery_candidate_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .optional()
+            .map_err(DatabaseError::Sqlite)?
+            .unwrap_or(false);
+        if !approved {
+            return Err(DatabaseError::DiscoveryCandidateNotApproved(
+                discovery_candidate_id,
+            ));
+        }
+        for candidate in candidates {
+            let metadata =
+                serde_json::to_string(&candidate.item.raw_metadata).map_err(DatabaseError::Json)?;
+            let ordinal = i64::try_from(candidate.ordinal)
+                .map_err(|_| DatabaseError::DiscoverySearchValueRange)?;
+            transaction.execute(
+                "INSERT INTO discovery_search_candidates(
+                     discovery_candidate_id,ordinal,provider,provider_item_id,provider_url,
+                     provider_title,provider_duration_ms,provider_metadata_json,search_query,state,message)
+                 VALUES (?1,?2,'youtube',?3,?4,?5,?6,?7,?8,?9,?10)
+                 ON CONFLICT(discovery_candidate_id,provider,provider_item_id) DO UPDATE SET
+                     ordinal=excluded.ordinal, provider_url=excluded.provider_url,
+                     provider_title=excluded.provider_title,
+                     provider_duration_ms=excluded.provider_duration_ms,
+                     provider_metadata_json=excluded.provider_metadata_json,
+                     search_query=excluded.search_query,
+                     state=CASE WHEN discovery_search_candidates.state IN
+                         ('queued','acquired','verified') THEN discovery_search_candidates.state
+                         ELSE excluded.state END,
+                     message=CASE WHEN discovery_search_candidates.state IN
+                         ('queued','acquired','verified') THEN discovery_search_candidates.message
+                         ELSE excluded.message END,
+                     updated_at=CURRENT_TIMESTAMP",
+                rusqlite::params![
+                    discovery_candidate_id,
+                    ordinal,
+                    candidate.item.provider_item_id,
+                    candidate.item.url,
+                    candidate.item.title,
+                    candidate.item.duration_ms,
+                    metadata,
+                    query,
+                    candidate.state,
+                    candidate.message,
+                ],
+            ).map_err(DatabaseError::Sqlite)?;
+        }
+        let rows =
+            {
+                let mut statement = transaction.prepare(
+                "SELECT id,provider_item_id,provider_url,provider_title,provider_duration_ms,
+                        provider_metadata_json,state
+                 FROM discovery_search_candidates
+                 WHERE discovery_candidate_id=?1 ORDER BY ordinal,id",
+            ).map_err(DatabaseError::Sqlite)?;
+                statement
+                    .query_map([discovery_candidate_id], |row| {
+                        Ok(DiscoverySearchCandidate {
+                            id: row.get(0)?,
+                            provider_item_id: row.get(1)?,
+                            provider_url: row.get(2)?,
+                            provider_title: row.get(3)?,
+                            provider_duration_ms: row.get(4)?,
+                            provider_metadata_json: row.get(5)?,
+                            state: row.get(6)?,
+                        })
+                    })
+                    .map_err(DatabaseError::Sqlite)?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(DatabaseError::Sqlite)?
+            };
+        transaction.commit().map_err(DatabaseError::Sqlite)?;
+        Ok(rows)
+    }
+
+    /// Records staged exact-byte and AcoustID evidence for one generated candidate.
+    pub fn record_discovery_search_evidence(
+        &mut self,
+        evidence: &DiscoverySearchEvidence,
+    ) -> Result<bool, DatabaseError> {
+        let staged_path = evidence
+            .staged_path
+            .to_str()
+            .ok_or_else(|| DatabaseError::NonUnicodePath(evidence.staged_path.clone()))?;
+        let bytes = i64::try_from(evidence.staged_bytes)
+            .map_err(|_| DatabaseError::ArtifactTooLarge(evidence.staged_bytes))?;
+        let provider_metadata_json =
+            serde_json::to_string(&evidence.provider_metadata).map_err(DatabaseError::Json)?;
+        Ok(self
+            .connection
+            .execute(
+                "UPDATE discovery_search_candidates SET state=?2,message=?3,staged_path=?4,
+                    staged_sha256=?5,staged_bytes=?6,fingerprint_duration_seconds=?7,
+                    acoustid_decision=?8,acoustid_score_millionths=?9,
+                    acoustid_response_json=?10,provider_metadata_json=?11,
+                    updated_at=CURRENT_TIMESTAMP
+             WHERE id=?1 AND state IN ('generated','staged','deferred')",
+                rusqlite::params![
+                    evidence.search_candidate_id,
+                    evidence.state,
+                    evidence.message,
+                    staged_path,
+                    evidence.staged_sha256,
+                    bytes,
+                    evidence.fingerprint_duration_seconds,
+                    evidence.acoustid_decision,
+                    evidence.acoustid_score_millionths,
+                    evidence.acoustid_response_json,
+                    provider_metadata_json,
+                ],
+            )
+            .map_err(DatabaseError::Sqlite)?
+            == 1)
+    }
+
+    /// Records a candidate-local failure without changing unrelated discovery work.
+    pub fn mark_discovery_search_candidate(
+        &mut self,
+        search_candidate_id: i64,
+        state: &str,
+        message: &str,
+    ) -> Result<bool, DatabaseError> {
+        Ok(self.connection.execute(
+            "UPDATE discovery_search_candidates SET state=?2,message=?3,updated_at=CURRENT_TIMESTAMP
+             WHERE id=?1 AND state IN ('generated','staged','deferred')",
+            rusqlite::params![search_candidate_id,state,message],
+        ).map_err(DatabaseError::Sqlite)? == 1)
+    }
+
+    /// Queues acquisition of the exact staged bytes previously verified by AcoustID.
+    pub fn queue_verified_discovery_search(
+        &mut self,
+        candidate: &ApprovedDiscoveryCandidate,
+        search_candidate_id: i64,
+        canonical_duration_ms: u64,
+        canonical_isrc: Option<&str>,
+        assertion_json: &str,
+    ) -> Result<i64, DatabaseError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(DatabaseError::Sqlite)?;
+        let state = transaction
+            .query_row(
+                "SELECT state FROM discovery_candidates WHERE id=?1",
+                [candidate.id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(DatabaseError::Sqlite)?;
+        if state.as_deref() != Some("approved") {
+            return Err(DatabaseError::DiscoveryCandidateNotApproved(candidate.id));
+        }
+        let search = transaction
+            .query_row(
+                "SELECT provider_item_id,provider_url,provider_title,provider_metadata_json,
+                    staged_path,staged_sha256,acoustid_decision
+             FROM discovery_search_candidates
+             WHERE id=?1 AND discovery_candidate_id=?2 AND state='verified'",
+                rusqlite::params![search_candidate_id, candidate.id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(DatabaseError::Sqlite)?
+            .ok_or(DatabaseError::DiscoverySearchNotVerified(
+                search_candidate_id,
+            ))?;
+        if search.6 != "verified" {
+            return Err(DatabaseError::DiscoverySearchNotVerified(
+                search_candidate_id,
+            ));
+        }
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO recordings(musicbrainz_recording_id,isrc) VALUES (?1,?2)",
+                rusqlite::params![candidate.recording_mbid, canonical_isrc],
+            )
+            .map_err(DatabaseError::Sqlite)?;
+        let recording_id = transaction
+            .query_row(
+                "SELECT id FROM recordings WHERE musicbrainz_recording_id=?1",
+                [&candidate.recording_mbid],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(DatabaseError::Sqlite)?;
+        transaction
+            .execute(
+                "INSERT INTO provider_items(provider,provider_item_id,original_url,source_title,
+                 source_metadata_json,availability,recording_id)
+             VALUES ('youtube',?1,?2,?3,?4,'available',?5)
+             ON CONFLICT(provider,provider_item_id) DO NOTHING",
+                rusqlite::params![search.0, search.1, search.2, search.3, recording_id],
+            )
+            .map_err(DatabaseError::Sqlite)?;
+        let provider_item = transaction.query_row(
+            "SELECT id,recording_id FROM provider_items WHERE provider='youtube' AND provider_item_id=?1",
+            [&search.0], |row| Ok((row.get::<_,i64>(0)?,row.get::<_,Option<i64>>(1)?)),
+        ).map_err(DatabaseError::Sqlite)?;
+        if provider_item.1 != Some(recording_id) {
+            return Err(DatabaseError::ProviderItemRecordingConflict);
+        }
+        transaction
+            .execute("INSERT INTO sync_runs(status) VALUES ('succeeded')", [])
+            .map_err(DatabaseError::Sqlite)?;
+        let run_id = transaction.last_insert_rowid();
+        let key = format!("acquire:youtube:{}", search.0);
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO jobs(run_id,kind,status,idempotency_key)
+             VALUES (?1,'acquire','pending',?2)",
+                rusqlite::params![run_id, key],
+            )
+            .map_err(DatabaseError::Sqlite)?;
+        let job_id = transaction
+            .query_row(
+                "SELECT id FROM jobs WHERE idempotency_key=?1",
+                [key],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(DatabaseError::Sqlite)?;
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO acquisition_jobs(job_id,provider_item_id) VALUES (?1,?2)",
+                rusqlite::params![job_id, provider_item.0],
+            )
+            .map_err(DatabaseError::Sqlite)?;
+        transaction.execute(
+            "INSERT INTO discovery_acquisition_assertions(candidate_id,provider_item_id,
+                 recording_id,relationship_source,canonical_duration_ms,canonical_isrc,assertion_json)
+             VALUES (?1,?2,?3,'acoustid_fingerprint',?4,?5,?6)",
+            rusqlite::params![candidate.id,provider_item.0,recording_id,canonical_duration_ms,canonical_isrc,assertion_json],
+        ).map_err(DatabaseError::Sqlite)?;
+        transaction
+            .execute(
+                "UPDATE discovery_search_candidates SET state='queued',acquisition_job_id=?2,
+                 updated_at=CURRENT_TIMESTAMP WHERE id=?1",
+                rusqlite::params![search_candidate_id, job_id],
+            )
+            .map_err(DatabaseError::Sqlite)?;
+        transaction.execute(
+            "UPDATE discovery_candidates SET state='queued',
+                 decision_reason='AcoustID verified searched provider candidate',updated_at=CURRENT_TIMESTAMP
+             WHERE id=?1",
+            [candidate.id],
+        ).map_err(DatabaseError::Sqlite)?;
+        transaction.commit().map_err(DatabaseError::Sqlite)?;
+        Ok(job_id)
+    }
+
+    /// Returns exact verified staging for an AcoustID discovery acquisition.
+    pub fn verified_discovery_staging(
+        &self,
+        job_id: i64,
+    ) -> Result<Option<VerifiedDiscoveryStaging>, DatabaseError> {
+        self.connection
+            .query_row(
+                "SELECT staged_path,staged_sha256,staged_bytes,provider_metadata_json
+             FROM discovery_search_candidates
+             WHERE acquisition_job_id=?1 AND state='queued' AND acoustid_decision='verified'",
+                [job_id],
+                |row| {
+                    Ok(VerifiedDiscoveryStaging {
+                        path: PathBuf::from(row.get::<_, String>(0)?),
+                        sha256: row.get(1)?,
+                        bytes: row.get(2)?,
+                        provider_metadata_json: row.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(DatabaseError::Sqlite)
+    }
+
     /// Loads active unhealthy original items in stable order for availability checks.
     pub fn repair_original_candidates(
         &self,
@@ -4181,26 +4506,41 @@ impl Database {
             .query_row(
                 "SELECT recordings.musicbrainz_recording_id,
                         discovery_acquisition_assertions.canonical_isrc,
-                        discovery_acquisition_assertions.canonical_duration_ms
+                        discovery_acquisition_assertions.canonical_duration_ms,
+                        discovery_acquisition_assertions.relationship_source
                  FROM acquisition_jobs
                  JOIN discovery_acquisition_assertions ON
                       discovery_acquisition_assertions.provider_item_id=acquisition_jobs.provider_item_id
                  JOIN recordings ON recordings.id=discovery_acquisition_assertions.recording_id
                  WHERE acquisition_jobs.job_id=?1",
                 [job_id],
-                |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, Option<u64>>(2)?)),
+                |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, Option<u64>>(2)?, row.get::<_,String>(3)?)),
             )
             .optional()
             .map_err(DatabaseError::Sqlite)?;
-        if let Some((canonical_mbid, canonical_isrc, canonical_duration)) = discovery_assertion {
-            let identity_matches = canonical_mbid
-                .as_ref()
-                .zip(validated.musicbrainz_recording_id.as_ref())
-                .is_some_and(|(left, right)| left == right)
-                || canonical_isrc
+        if let Some((canonical_mbid, canonical_isrc, canonical_duration, source)) =
+            discovery_assertion
+        {
+            let identity_matches = if source == "acoustid_fingerprint" {
+                transaction
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM discovery_search_candidates
+                     WHERE acquisition_job_id=?1 AND state='queued'
+                       AND acoustid_decision='verified' AND staged_sha256=?2)",
+                        rusqlite::params![job_id, validated.sha256],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .map_err(DatabaseError::Sqlite)?
+            } else {
+                canonical_mbid
                     .as_ref()
-                    .zip(validated.isrc.as_ref())
-                    .is_some_and(|(left, right)| left == right);
+                    .zip(validated.musicbrainz_recording_id.as_ref())
+                    .is_some_and(|(left, right)| left == right)
+                    || canonical_isrc
+                        .as_ref()
+                        .zip(validated.isrc.as_ref())
+                        .is_some_and(|(left, right)| left == right)
+            };
             let duration_matches = canonical_duration
                 .zip(validated.duration_ms)
                 .is_some_and(|(left, right)| left.abs_diff(right) <= 2_000);
@@ -4431,6 +4771,11 @@ impl Database {
                 [job_id],
             )
             .map_err(DatabaseError::Sqlite)?;
+        transaction.execute(
+            "UPDATE discovery_search_candidates SET state='acquired',updated_at=CURRENT_TIMESTAMP
+             WHERE acquisition_job_id=?1 AND state='queued'",
+            [job_id],
+        ).map_err(DatabaseError::Sqlite)?;
         transaction.execute(
             "UPDATE discovery_candidates SET state='acquired',decision_reason='verified acquisition committed',updated_at=CURRENT_TIMESTAMP WHERE id=(SELECT candidate_id FROM discovery_acquisition_assertions WHERE provider_item_id=?1)",
             [commit.9],
@@ -5215,6 +5560,8 @@ pub struct OperationalStatus {
     pub metadata_materializations: MetadataMaterializationCounts,
     /// Autonomous discovery decisions and routing counts.
     pub discovery: DiscoveryCounts,
+    /// Optional provider-search and AcoustID evidence counts.
+    pub discovery_search: DiscoverySearchCounts,
     /// Playlist outputs with committed exact-byte evidence.
     pub playlist_outputs: u64,
     /// Bounded newest-first warning/error events.
@@ -5423,6 +5770,25 @@ pub struct DiscoveryCounts {
     pub budget_rejected: u64,
 }
 
+/// Durable optional discovery-search counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct DiscoverySearchCounts {
+    /// Candidates awaiting staging.
+    pub generated: u64,
+    /// Canonical or AcoustID contradictions.
+    pub rejected: u64,
+    /// Verified candidates not yet queued.
+    pub verified: u64,
+    /// Candidates lacking public fingerprint evidence.
+    pub unresolved: u64,
+    /// Retryable provider or infrastructure failures.
+    pub deferred: u64,
+    /// Verified candidates queued for atomic acquisition.
+    pub queued: u64,
+    /// Verified candidates committed successfully.
+    pub acquired: u64,
+}
+
 /// Transactional effects of one discovery run.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct DiscoveryPersistenceReport {
@@ -5467,6 +5833,78 @@ pub struct DiscoveryAcquisitionRoute {
     pub canonical_isrc: Option<String>,
     /// Auditable bounded relationship evidence.
     pub assertion_json: String,
+}
+
+/// Candidate-generation result persisted without canonical identity trust.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DiscoverySearchCandidateInput {
+    /// Stable provider search position.
+    pub ordinal: usize,
+    /// Complete bounded provider candidate.
+    pub item: ProviderItem,
+    /// Initial durable state (`generated` or `rejected`).
+    pub state: String,
+    /// Auditable prefilter explanation.
+    pub message: String,
+}
+
+/// Durable provider candidate available for staged verification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoverySearchCandidate {
+    /// Durable search-candidate and staging namespace ID.
+    pub id: i64,
+    /// Provider-owned identity.
+    pub provider_item_id: String,
+    /// Provider URL.
+    pub provider_url: String,
+    /// Provider title used only for filtering.
+    pub provider_title: Option<String>,
+    /// Provider duration used only for filtering.
+    pub provider_duration_ms: Option<u64>,
+    /// Complete bounded provider metadata JSON.
+    pub provider_metadata_json: String,
+    /// Current durable state.
+    pub state: String,
+}
+
+/// Persistable exact-byte and AcoustID evidence for staged discovery media.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoverySearchEvidence {
+    /// Durable search candidate.
+    pub search_candidate_id: i64,
+    /// Terminal or retryable state.
+    pub state: String,
+    /// Human-readable evidence summary.
+    pub message: String,
+    /// Validated staged path.
+    pub staged_path: PathBuf,
+    /// Exact staged SHA-256.
+    pub staged_sha256: String,
+    /// Exact staged byte count.
+    pub staged_bytes: u64,
+    /// Rounded duration sent to AcoustID.
+    pub fingerprint_duration_seconds: u32,
+    /// AcoustID decision vocabulary.
+    pub acoustid_decision: String,
+    /// Score attached to the expected MBID.
+    pub acoustid_score_millionths: Option<u32>,
+    /// Complete bounded response for audit.
+    pub acoustid_response_json: String,
+    /// Complete provider metadata emitted with the exact staged download.
+    pub provider_metadata: serde_json::Value,
+}
+
+/// Previously verified staging reused by ordinary acquisition without redownload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedDiscoveryStaging {
+    /// Exact staged path verified by AcoustID.
+    pub path: PathBuf,
+    /// Exact verified SHA-256.
+    pub sha256: String,
+    /// Exact verified byte count.
+    pub bytes: u64,
+    /// Complete yt-dlp metadata persisted before verification.
+    pub provider_metadata_json: String,
 }
 
 /// One bounded persisted warning or error event.
@@ -6483,6 +6921,12 @@ pub enum DatabaseError {
     /// Discovery candidate was no longer approved when routing attempted.
     #[error("discovery candidate {0} is not approved")]
     DiscoveryCandidateNotApproved(i64),
+    /// Discovery search values exceeded SQLite representation.
+    #[error("discovery search value exceeds SQLite range")]
+    DiscoverySearchValueRange,
+    /// Search candidate had not received positive AcoustID evidence.
+    #[error("discovery search candidate {0} is not verified")]
+    DiscoverySearchNotVerified(i64),
     /// Discovery staging lacked exact canonical identity or compatible duration.
     #[error("discovery acquisition evidence does not match assertion for job {0}")]
     DiscoveryAcquisitionEvidenceMismatch(i64),
