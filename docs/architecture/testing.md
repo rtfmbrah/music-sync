@@ -73,7 +73,9 @@
   healthy-state preservation when probing fails.
 - Raw fingerprint tests cover bounded fpcalc arguments/output/deadlines, schema-v7
   persistence, repeat idempotency, automatic sync extraction, isolated failures, and
-  strict aligned/duration-aware comparison without live services.
+  strict aligned/duration-aware comparison without live services. Subprocess fixtures
+  also prove that the exact exit-3 end-of-file diagnostic may carry valid JSON while
+  malformed or empty output and every other non-zero exit remain failures.
 - Fingerprint deferral tests prove failed artifacts do not starve later work, ordinary
   repeats skip the same bound, and explicit operator retry releases only the selected
   artifact.
@@ -99,6 +101,12 @@
   direction.
 - Deployment shell scripts receive offline syntax validation; their network-dependent
   downloads are exercised explicitly outside the canonical suite.
+- CLI subprocess tests prove fatal startup diagnostics reach `logs/current.log`, a
+  repeat preserves the prior bytes under the UTC timestamp naming policy, malformed
+  Markdown endpoint values are rejected specifically, and disabled discovery does
+  not require an AcoustID secret.
+- File-log unit coverage proves an overlapping process cannot rotate the active
+  owner's `current.log`.
 - `just check` formats, lints with warnings denied, runs all tests, and checks the
   dependency boundary and deployment-script syntax without live services.
 

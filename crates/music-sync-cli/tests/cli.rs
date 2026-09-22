@@ -2469,6 +2469,86 @@ fn metadata_materialize_stream_copies_and_retains_original_bytes()
 }
 
 #[test]
+fn service_logs_startup_failures_and_rotates_previous_run() -> Result<(), Box<dyn std::error::Error>>
+{
+    let root = tempfile::tempdir()?;
+    let state = root.path().join("state");
+    let library = root.path().join("library");
+    let playlists = root.path().join("playlists");
+    fs::create_dir(&library)?;
+    fs::create_dir(&playlists)?;
+    let config = root.path().join("config.toml");
+    fs::write(
+        &config,
+        format!(
+            "state_directory = {state:?}\nlibrary_directory = {library:?}\nplaylist_directory = {playlists:?}\n[service]\nenabled = true\nuser_agent = \"fixture@example.invalid\"\nmusicbrainz_endpoint = \"[https://musicbrainz.org/ws/2](https://musicbrainz.org/ws/2)\"\n"
+        ),
+    )?;
+    let run = || {
+        Command::new(env!("CARGO_BIN_EXE_music-sync"))
+            .env_remove("RUST_LOG")
+            .args(["--json", "service", "run", "--config"])
+            .arg(&config)
+            .output()
+    };
+
+    let first = run()?;
+    assert!(!first.status.success());
+    let current = state.join("logs/current.log");
+    let first_log = fs::read_to_string(&current)?;
+    assert!(first_log.contains("persistent service logging initialized"));
+    assert!(first_log.contains("service.musicbrainz_endpoint"));
+    assert!(first_log.contains("command failed"));
+
+    let second = run()?;
+    assert!(!second.status.success());
+    let archived = fs::read_dir(state.join("logs"))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name())
+        .filter_map(|name| name.into_string().ok())
+        .filter(|name| name.ends_with("-music-sync.log"))
+        .collect::<Vec<_>>();
+    assert_eq!(archived.len(), 1);
+    assert_eq!(
+        archived[0].len(),
+        "yyyy-mm-dd-hh-mm-ss-music-sync.log".len()
+    );
+    assert!(fs::read_to_string(current)?.contains("service.musicbrainz_endpoint"));
+    Ok(())
+}
+
+#[test]
+fn disabled_discovery_does_not_require_acoustid_secret() -> Result<(), Box<dyn std::error::Error>> {
+    let root = tempfile::tempdir()?;
+    let state = root.path().join("state");
+    let library = root.path().join("library");
+    let playlists = root.path().join("playlists");
+    fs::create_dir(&library)?;
+    fs::create_dir(&playlists)?;
+    let config = root.path().join("config.toml");
+    fs::write(
+        &config,
+        format!(
+            "state_directory = {state:?}\nlibrary_directory = {library:?}\nplaylist_directory = {playlists:?}\n[discovery]\nenabled = false\nyoutube_search_fallback = true\n[service]\nenabled = true\nuser_agent = \"fixture@example.invalid\"\nyt_dlp = \"/nonexistent/yt-dlp\"\nffprobe = \"/nonexistent/ffprobe\"\nffmpeg = \"/nonexistent/ffmpeg\"\nfpcalc = \"/nonexistent/fpcalc\"\nphase_item_limit = 5\n"
+        ),
+    )?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_music-sync"))
+        .env_remove("ACOUSTID_CLIENT_KEY")
+        .args(["--json", "service", "run", "--config"])
+        .arg(&config)
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(state.join("logs/current.log").is_file());
+    Ok(())
+}
+
+#[test]
 fn library_health_reports_hash_mismatch_without_modifying_media()
 -> Result<(), Box<dyn std::error::Error>> {
     let root = tempfile::tempdir()?;

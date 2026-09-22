@@ -28,12 +28,12 @@ configured threshold without a competing above-threshold MBID. The exact verifie
 SHA-256 is persisted and the ordinary acquisition path reuses those bytes for its
 atomic no-clobber commit; it never downloads again after verification.
 
-The fallback is disabled by default and requires `ACOUSTID_CLIENT_KEY` only when
-enabled. AcoustID receives the compressed fingerprint, rounded duration, and
-metadata selector, never media bytes. Empty or low-confidence coverage is
-unresolved rather than contradictory, so catalog gaps do not classify obscure
-remixes as wrong. Provider, fingerprint, and AcoustID failures are deferred and stop
-that recommendation's candidate sequence.
+The fallback is disabled by default and requires `ACOUSTID_CLIENT_KEY` only when both
+discovery and the fallback are enabled. AcoustID receives the compressed fingerprint,
+rounded duration, and metadata selector, never media bytes. Empty or low-confidence
+coverage is unresolved rather than contradictory, so catalog gaps do not classify
+obscure remixes as wrong. Provider, fingerprint, and AcoustID failures are deferred
+and stop that recommendation's candidate sequence.
 
 ## PLANNED
 

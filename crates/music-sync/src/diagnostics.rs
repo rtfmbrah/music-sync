@@ -253,11 +253,11 @@ fn check_navidrome_secret_contract(config: &AppConfig) -> DiagnosticCheck {
 }
 
 fn check_acoustid_secret_contract(config: &AppConfig) -> DiagnosticCheck {
-    if !config.discovery.youtube_search_fallback {
+    if !config.discovery.enabled || !config.discovery.youtube_search_fallback {
         return DiagnosticCheck {
             name: "acoustid_secret".into(),
             status: CheckStatus::Pass,
-            message: "AcoustID discovery search is not configured".into(),
+            message: "AcoustID discovery search is not enabled".into(),
         };
     }
     let present = env::var("ACOUSTID_CLIENT_KEY").is_ok_and(|value| {

@@ -181,12 +181,27 @@ errors. Schema-backed exclusivity rejects overlap before provider or managed-fil
 effects. The timer may therefore alert on partial runs without preventing successful
 unrelated work from being committed.
 
+Every service invocation writes `/srv/music-sync-state/logs/current.log` for the
+confirmed production configuration. Starting the next invocation preserves a
+non-empty prior log as `yyyy-mm-dd-hh-mm-ss-music-sync.log` in the same directory;
+the timestamp is UTC. These application logs complement journald and remain readable
+when journal access is restricted. They include bounded phase summaries and fatal
+startup errors but never environment-secret values or cookie contents. No automatic
+retention deletes archives; operators must provision a retention policy appropriate
+for the state filesystem.
+
+Endpoint values in TOML are literal URLs, not Markdown. For example, use
+`musicbrainz_endpoint = "https://musicbrainz.org/ws/2"`; a value such as
+`"[https://musicbrainz.org/ws/2](https://musicbrainz.org/ws/2)"` is invalid and
+prevents the service from starting. Startup validation now identifies the exact
+field before any provider request.
+
 Optional AcoustID discovery search reads `ACOUSTID_CLIENT_KEY` from the same
-protected environment file. The key is required only when
-`discovery.youtube_search_fallback=true` and never belongs in tracked TOML. `doctor`
-checks presence without displaying its value. AcoustID receives a compressed
-Chromaprint and duration, not audio bytes. Defaults stage at most three serial
-YouTube candidates and fingerprint at most 900 seconds per candidate.
+protected environment file. The key is required only when both `discovery.enabled`
+and `discovery.youtube_search_fallback` are true, and never belongs in tracked TOML.
+`doctor` checks presence without displaying its value. AcoustID receives a compressed
+Chromaprint and duration, not audio bytes. Defaults stage at most three serial YouTube
+candidates and fingerprint at most 900 seconds per candidate.
 `deploy/configure-acoustid-discovery.sh` reads the key on standard input, validates
 it without echoing or logging it, atomically preserves other environment secrets,
 backs up and updates the `[discovery]` policy, runs `doctor` with the protected

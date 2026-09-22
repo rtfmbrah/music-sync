@@ -2,6 +2,8 @@
 
 #![forbid(unsafe_code)]
 
+mod logging;
+
 use std::error::Error;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::PathBuf;
@@ -55,7 +57,6 @@ use music_sync::sync::{
 use music_sync::tag_materialization::{FfmpegMetadataRemuxer, materialize_canonical_tags};
 use music_sync::yt_dlp::YtDlp;
 use tracing::{error, info};
-use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -887,7 +888,22 @@ enum LibraryCommand {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    initialize_logging(cli.verbose, cli.no_progress || cli.json);
+    let log_directory = cli.service_config_path().and_then(|path| {
+        AppConfig::state_directory_from_file(path)
+            .ok()
+            .map(|state| state.join("logs"))
+    });
+    let _logging_guard = match logging::initialize(
+        cli.verbose,
+        cli.no_progress || cli.json,
+        log_directory.as_deref(),
+    ) {
+        Ok(guard) => guard,
+        Err(error) => {
+            eprintln!("error: failed to initialize logging: {error}");
+            return ExitCode::from(2);
+        }
+    };
     match run(cli) {
         Ok(code) => code,
         Err(error) => {
@@ -895,6 +911,26 @@ fn main() -> ExitCode {
             eprintln!("error: {error}");
             ExitCode::from(2)
         }
+    }
+}
+
+impl Cli {
+    fn service_config_path(&self) -> Option<&std::path::Path> {
+        match &self.command {
+            Command::Service {
+                command: ServiceCommand::Run { config, .. },
+            }
+            | Command::Sync {
+                command: None,
+                config,
+            } => Some(config),
+            Command::Sync {
+                command: Some(SyncCommand::Run { config, .. }),
+                ..
+            } => Some(config),
+            _ => None,
+        }
+        .map(PathBuf::as_path)
     }
 }
 
@@ -1203,7 +1239,7 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn Error>> {
             } else {
                 None
             };
-            let acoustid = if config.discovery.youtube_search_fallback {
+            let acoustid = if config.discovery.enabled && config.discovery.youtube_search_fallback {
                 Some(AcoustId::with_endpoint(
                     &config.service.acoustid_endpoint,
                     &std::env::var("ACOUSTID_CLIENT_KEY")?,
@@ -3153,23 +3189,6 @@ fn render_adoption_apply(
         report.database.artifacts_existing
     );
     Ok(())
-}
-
-fn initialize_logging(verbosity: u8, progress_disabled: bool) {
-    let default_level = match verbosity {
-        0 if progress_disabled => "warn",
-        0 => "info",
-        1 => "info",
-        2 => "debug",
-        _ => "trace",
-    };
-    let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level));
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .with_writer(std::io::stderr)
-        .init();
 }
 
 fn render_doctor(report: &DoctorReport, json: bool) -> Result<(), serde_json::Error> {

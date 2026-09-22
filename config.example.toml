@@ -1,4 +1,6 @@
 state_directory = "/srv/music-sync-state"
+# Service logs are written below state_directory/logs. The active file is current.log;
+# non-empty prior runs are retained as UTC yyyy-mm-dd-hh-mm-ss-music-sync.log files.
 library_directory = "/srv/music"
 playlist_directory = "/srv/music/_playlists"
 
@@ -19,7 +21,8 @@ minimum_free_disk_gb = 20
 # navidrome_url = "https://music.example.invalid"
 # navidrome_user = "music-sync-readonly"
 # Optional conservative fallback for recommendations without a MusicBrainz YouTube URL.
-# Requires the ACOUSTID_CLIENT_KEY process secret. Audio bytes are never uploaded.
+# Requires the ACOUSTID_CLIENT_KEY process secret only when discovery is also enabled.
+# Audio bytes are never uploaded.
 youtube_search_fallback = false
 youtube_search_max_candidates = 3
 acoustid_minimum_score = 0.95

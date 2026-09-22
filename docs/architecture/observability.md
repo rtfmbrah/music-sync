@@ -59,6 +59,18 @@ automatically keeps stdout machine-readable and stderr quiet unless verbosity is
 explicitly raised. The same structured `tracing` events are captured by journald for
 the systemd oneshot.
 
+Every `service run`, bare `sync`, and compatibility `sync run` invocation also writes
+structured text logs to `<state_directory>/logs/current.log`. At the next invocation,
+a non-empty current log is preserved as
+`yyyy-mm-dd-hh-mm-ss-music-sync.log`, using the UTC rotation time. Archive creation is
+no-clobber; a same-second collision advances the archive timestamp until it reserves
+a free name. An advisory process lock prevents an overlapping invocation from
+rotating `current.log` away from its active owner. File output retains
+information-level phase transitions and complete bounded phase summaries even when
+JSON mode or `--no-progress` suppresses terminal progress. Fatal errors before the
+durable database run begins are therefore retained. The service never deletes
+archived logs; retention is an explicit operator policy.
+
 `maintenance backup` uses SQLite `VACUUM INTO` to create a consistent, uniquely
 named snapshot in an existing operator-provisioned directory. It never overwrites a
 snapshot and does not delete old backups; retention remains an explicit operator

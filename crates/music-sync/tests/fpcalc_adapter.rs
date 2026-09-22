@@ -71,6 +71,62 @@ fn reports_nonzero_failure() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
+fn accepts_valid_fingerprint_when_fpcalc_reports_benign_end_of_file()
+-> Result<(), Box<dyn std::error::Error>> {
+    let root = tempfile::tempdir()?;
+    let media = root.path().join("audio.opus");
+    fs::write(&media, b"fixture")?;
+    let program = executable(
+        root.path(),
+        "printf '%s' '{\"duration\":2.5,\"fingerprint\":[1,2,3]}'\nprintf '%s\\n' 'ERROR: Error decoding audio frame (End of file)' >&2\nexit 3",
+    )?;
+
+    let result = Fpcalc::new(program, Duration::from_secs(1), 60).fingerprint(&media)?;
+
+    assert_eq!(result.duration_ms, 2_500);
+    assert_eq!(result.values, [1, 2, 3]);
+    Ok(())
+}
+
+#[test]
+fn still_validates_output_after_benign_end_of_file() -> Result<(), Box<dyn std::error::Error>> {
+    let root = tempfile::tempdir()?;
+    let media = root.path().join("audio.opus");
+    fs::write(&media, b"fixture")?;
+    let program = executable(
+        root.path(),
+        "printf '%s' 'not json'\nprintf '%s\\n' 'ERROR: Error decoding audio frame (End of file)' >&2\nexit 3",
+    )?;
+
+    let result = Fpcalc::new(program, Duration::from_secs(1), 60).fingerprint(&media);
+
+    assert!(matches!(result, Err(FingerprintError::Json(_))));
+    Ok(())
+}
+
+#[test]
+fn rejects_benign_end_of_file_without_output() -> Result<(), Box<dyn std::error::Error>> {
+    let root = tempfile::tempdir()?;
+    let media = root.path().join("audio.opus");
+    fs::write(&media, b"fixture")?;
+    let program = executable(
+        root.path(),
+        "printf '%s\\n' 'ERROR: Error decoding audio frame (End of file)' >&2\nexit 3",
+    )?;
+
+    let result = Fpcalc::new(program, Duration::from_secs(1), 60).fingerprint(&media);
+
+    assert!(matches!(
+        result,
+        Err(FingerprintError::Failed {
+            code: Some(3),
+            stderr
+        }) if stderr == "ERROR: Error decoding audio frame (End of file)"
+    ));
+    Ok(())
+}
+
+#[test]
 fn kills_subprocess_after_deadline() -> Result<(), Box<dyn std::error::Error>> {
     let root = tempfile::tempdir()?;
     let media = root.path().join("audio.opus");

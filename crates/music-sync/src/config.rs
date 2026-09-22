@@ -187,6 +187,26 @@ impl Default for DiscoveryConfig {
 }
 
 impl AppConfig {
+    /// Reads only the configured state directory without validating unrelated
+    /// settings, allowing startup failures to be written to the service log.
+    pub fn state_directory_from_file(path: &Path) -> Result<PathBuf, ConfigError> {
+        #[derive(Deserialize)]
+        struct StateDirectoryConfig {
+            state_directory: PathBuf,
+        }
+
+        let input = fs::read_to_string(path).map_err(|source| ConfigError::Read {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        toml::from_str::<StateDirectoryConfig>(&input)
+            .map(|config| config.state_directory)
+            .map_err(|source| ConfigError::Parse {
+                path: path.to_path_buf(),
+                source,
+            })
+    }
+
     /// Loads and validates TOML configuration from `path`.
     pub fn from_file(path: &Path) -> Result<Self, ConfigError> {
         let input = fs::read_to_string(path).map_err(|source| ConfigError::Read {
@@ -277,6 +297,15 @@ impl AppConfig {
                     "enabled service yt-dlp pacing must be positive with maximum sleep at least minimum sleep".into(),
                 ));
             }
+            for (name, endpoint) in [
+                ("musicbrainz_endpoint", &self.service.musicbrainz_endpoint),
+                ("cover_art_endpoint", &self.service.cover_art_endpoint),
+                ("lyrics_endpoint", &self.service.lyrics_endpoint),
+                ("listenbrainz_endpoint", &self.service.listenbrainz_endpoint),
+                ("acoustid_endpoint", &self.service.acoustid_endpoint),
+            ] {
+                validate_service_endpoint(name, endpoint)?;
+            }
         }
         if self.discovery.target_new_tracks_per_day > self.discovery.max_new_tracks_per_day {
             return Err(ConfigError::Invalid(
@@ -343,6 +372,25 @@ impl AppConfig {
     }
 }
 
+fn validate_service_endpoint(name: &str, value: &str) -> Result<(), ConfigError> {
+    let valid = url::Url::parse(value).is_ok_and(|endpoint| {
+        let secure_transport = endpoint.scheme() == "https"
+            || (endpoint.scheme() == "http"
+                && matches!(endpoint.host_str(), Some("127.0.0.1" | "::1")));
+        secure_transport
+            && endpoint.host_str().is_some()
+            && endpoint.username().is_empty()
+            && endpoint.password().is_none()
+    });
+    if valid {
+        Ok(())
+    } else {
+        Err(ConfigError::Invalid(format!(
+            "service.{name} must be a valid HTTPS URL (HTTP is allowed only for loopback test fixtures)"
+        )))
+    }
+}
+
 /// Configuration loading or validation failure.
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -405,5 +453,38 @@ mod tests {
         config.service.yt_dlp_min_sleep_seconds = 20;
         config.service.yt_dlp_max_sleep_seconds = 10;
         assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));
+    }
+
+    #[test]
+    fn rejects_markdown_link_service_endpoints() -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = valid_config();
+        config.service.enabled = true;
+        config.service.user_agent = Some("fixture@example.invalid".into());
+        config.service.musicbrainz_endpoint =
+            "[https://musicbrainz.org/ws/2](https://musicbrainz.org/ws/2)".into();
+
+        let error = config
+            .validate()
+            .err()
+            .ok_or("Markdown was accepted as a URL")?;
+
+        assert!(error.to_string().contains("service.musicbrainz_endpoint"));
+        Ok(())
+    }
+
+    #[test]
+    fn reads_state_directory_before_full_validation() -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let path = root.path().join("config.toml");
+        fs::write(
+            &path,
+            "state_directory = \"state\"\nunknown_setting = true\n",
+        )?;
+
+        assert_eq!(
+            AppConfig::state_directory_from_file(&path)?,
+            PathBuf::from("state")
+        );
+        Ok(())
     }
 }

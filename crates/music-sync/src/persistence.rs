@@ -653,6 +653,8 @@ impl Database {
                 service_run_id = run_id,
                 phase,
                 status = status.as_str(),
+                summary = %summary,
+                message = message.unwrap_or(""),
                 "service phase finished"
             );
             Ok(())
@@ -688,6 +690,7 @@ impl Database {
         tracing::info!(
             service_run_id = run_id,
             status = status.as_str(),
+            summary = %summary,
             "service cycle finished"
         );
         Ok(())

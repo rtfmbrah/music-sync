@@ -35,7 +35,12 @@ exact artifact hashes. `library fingerprint` and the automatic post-acquisition 
 phase select healthy artifacts in stable bounded order, reject paths outside the
 configured library and symbolic links, invoke `fpcalc` with explicit output, time,
 and audio-length bounds, and retain prior evidence when one extraction fails.
-Repeating the same extraction bound is idempotent.
+Repeating the same extraction bound is idempotent. Some `fpcalc` releases emit a
+complete JSON fingerprint and then exit 3 with the exact diagnostic `Error decoding
+audio frame (End of file)` for otherwise decodable Opus files. The adapter accepts
+only that exact exit/diagnostic combination with non-empty output, then applies the
+same strict JSON, duration, count, and size validation as a successful invocation.
+Every other non-zero exit remains a failure.
 
 Schema version 18 durably defers an isolated artifact fingerprint failure at its
 requested extraction bound. Ordinary service cycles exclude that artifact instead

@@ -88,7 +88,8 @@ in ad hoc TODO documents.
 - Simplified operator CLI, full per-source member status trees, and immutable
   evidence-separated duplicate reporting (complete and production accepted).
 - Complete mutually exclusive service-cycle orchestration (complete); interactive
-  progress and persistent log policy remain.
+  progress remains, while persistent per-invocation file logging and no-clobber UTC
+  archive rotation are complete.
 - JSON phase summaries, hardened systemd examples, consistent state backup, and
   atomic versioned release/rollback tooling (complete).
 - Least-privilege LXC compatibility/deployment validation (complete for isolated

@@ -14,6 +14,7 @@ use crate::persistence::{ArtifactFingerprintEvidence, Database, DatabaseError};
 const MAX_OUTPUT_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_FINGERPRINT_VALUES: usize = 100_000;
 const MAX_EXECUTABLE_BUSY_RETRIES: usize = 10;
+const BENIGN_END_OF_FILE_ERROR: &str = "ERROR: Error decoding audio frame (End of file)";
 
 /// Read-only boundary for deriving perceptual audio evidence.
 pub trait Fingerprinter {
@@ -135,14 +136,19 @@ impl Fpcalc {
         };
         let stdout = join_reader(stdout_reader)?;
         let stderr = join_reader(stderr_reader)?;
-        if !status.success() {
+        let stderr = String::from_utf8_lossy(&stderr).trim().to_owned();
+        if !status.success() && !is_benign_end_of_file(status.code(), &stderr, &stdout) {
             return Err(FingerprintError::Failed {
                 code: status.code(),
-                stderr: String::from_utf8_lossy(&stderr).trim().to_owned(),
+                stderr,
             });
         }
         Ok(stdout)
     }
+}
+
+fn is_benign_end_of_file(code: Option<i32>, stderr: &str, stdout: &[u8]) -> bool {
+    code == Some(3) && stderr == BENIGN_END_OF_FILE_ERROR && !stdout.is_empty()
 }
 
 fn spawn_with_busy_retry(command: &mut Command) -> io::Result<std::process::Child> {
